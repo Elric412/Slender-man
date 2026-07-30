@@ -541,6 +541,9 @@ class StaticGame {
     return {
       state: () => this.state,
       tapes: () => this.tapes.collected,
+      look: (yaw: number, pitch: number) => { this.player.yaw = yaw; this.player.pitch = pitch; },
+      dustStats: () => this.flashlight.dustStats(),
+      player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);

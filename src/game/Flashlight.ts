@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { Player } from './Player';
+import { SeededRandom } from '../core/SeededRandom';
 
 /**
  * Battery flashlight: spotlight with real shadows + volumetric-looking beam cone
@@ -17,6 +18,8 @@ export class Flashlight {
   private flicker = 0;
   private warnedLow = false;
   private dustPos: Float32Array;
+  private dustPhase: Float32Array;  // per-mote turbulence phase offsets
+  private dustRng: SeededRandom;
   private pool: THREE.PointLight;   // warm ground bounce around the player
   private hf: import('../world/HeightField').HeightField | null = null;
 
@@ -69,13 +72,22 @@ export class Flashlight {
     this.beam.frustumCulled = false;
     scene.add(this.beam);
 
-    // dust motes floating in the beam
+    // Dust motes floating in the beam — §1a fix: WORLD-SPACE particle pool.
+    // (Bug: the Points object was re-pinned to the camera every frame with
+    // view-space coords and an eye-level respawn wrap, so motes streamed
+    // toward the player. Now they live in a camera-independent world volume
+    // 0.5–4m ahead inside the cone and drift on independent turbulence.)
+    this.dustRng = new SeededRandom(0xD057);
     const count = 90;
     this.dustPos = new Float32Array(count * 3);
+    this.dustPhase = new Float32Array(count * 3);
+    for (let i = 0; i < count * 3; i++) this.dustPhase[i] = this.dustRng.range(0, Math.PI * 2);
+    // initial scatter near the player; respawnCone() places them properly
+    // on the first active frame once the camera direction is known
     for (let i = 0; i < count; i++) {
-      this.dustPos[i * 3] = (Math.random() - 0.5) * 2;
-      this.dustPos[i * 3 + 1] = (Math.random() - 0.5) * 2;
-      this.dustPos[i * 3 + 2] = -Math.random() * 12;
+      this.dustPos[i * 3] = this.player.pos.x + this.dustRng.range(-2, 2);
+      this.dustPos[i * 3 + 1] = this.player.pos.y + this.dustRng.range(0.5, 2);
+      this.dustPos[i * 3 + 2] = this.player.pos.z + this.dustRng.range(-2, 2);
     }
     this.dustGeo = new THREE.BufferGeometry();
     this.dustGeo.setAttribute('position', new THREE.BufferAttribute(this.dustPos, 3));
@@ -146,17 +158,53 @@ export class Flashlight {
       // beam cone aligned with camera (cone opens toward -Z after bake)
       this.beam.position.copy(this.srcPos).addScaledVector(this.dir, 0.3);
       this.beam.quaternion.copy(cam.quaternion);
-      // dust drift
-      this.dust.position.copy(this.srcPos);
-      this.dust.quaternion.copy(cam.quaternion);
+      // Dust drift — world-space, camera-independent. Each mote wanders on
+      // slow ambient turbulence (per-particle phase, tiny velocity) and a
+      // gentle settle; it respawns into the cone volume 0.5–4m ahead only
+      // when it leaves that volume, so motes never stream toward the eye.
       const p = this.dustPos;
+      const src = this.srcPos, fwd = this.dir;
+      const sideX = -fwd.z, sideZ = fwd.x; // horizontal right vector
       for (let i = 0; i < p.length; i += 3) {
-        p[i] += Math.sin(time * 0.7 + i) * dt * 0.05;
-        p[i + 1] -= dt * 0.06;
-        if (p[i + 1] < -1) p[i + 1] = 1;
+        const pi = i;
+        // small independent drift: two incommensurate sine fields + settle
+        p[i]     += Math.sin(time * 0.31 + this.dustPhase[pi]) * dt * 0.045;
+        p[i + 1] += Math.sin(time * 0.23 + this.dustPhase[pi + 1]) * dt * 0.03 - dt * 0.018;
+        p[i + 2] += Math.sin(time * 0.27 + this.dustPhase[pi + 2]) * dt * 0.045;
+        // distance along the beam axis from the eye point
+        const rx = p[i] - src.x, ry = p[i + 1] - src.y, rz = p[i + 2] - src.z;
+        const d = rx * fwd.x + ry * fwd.y + rz * fwd.z;
+        if (d < 0.5 || d > 4.0) { this.respawnCone(i, src, fwd, sideX, sideZ); continue; }
+        // cone radius grows with distance (spot half-angle 0.40 rad, margin)
+        const lat2 = (rx - fwd.x * d) ** 2 + (ry - fwd.y * d) ** 2 + (rz - fwd.z * d) ** 2;
+        const maxR = d * 0.42;
+        if (lat2 > maxR * maxR) this.respawnCone(i, src, fwd, sideX, sideZ);
       }
       this.dustGeo.getAttribute('position').needsUpdate = true;
     }
+  }
+
+  /** QA/debug: raw mote world positions + a fresh forward vector (zero-copy). */
+  dustStats(): { positions: Float32Array; forward: THREE.Vector3 } {
+    this.player.camera.getWorldDirection(this.dir);
+    return { positions: this.dustPos, forward: this.dir.clone() };
+  }
+
+  /** Place a mote at a random point inside the beam cone, 0.5–4m from the eye. */
+  private respawnCone(i: number, src: THREE.Vector3, fwd: THREE.Vector3, sideX: number, sideZ: number): void {
+    const d = this.dustRng.range(0.5, 4.0);
+    // rejection-free disc sample: radius = maxR * sqrt(u), angle = 2πv
+    const maxR = d * 0.36; // slightly inside the visible cone
+    const r = maxR * Math.sqrt(this.dustRng.next());
+    const a = this.dustRng.range(0, Math.PI * 2);
+    const ca = Math.cos(a), sa = Math.sin(a);
+    // world up is (0,1,0); lateral offset = side*ca + up*sa (good enough near level beam)
+    this.dustPos[i]     = src.x + fwd.x * d + sideX * r * ca;
+    this.dustPos[i + 1] = src.y + fwd.y * d + r * sa;
+    this.dustPos[i + 2] = src.z + fwd.z * d + sideZ * r * ca;
+    this.dustPhase[i]     = this.dustRng.range(0, Math.PI * 2);
+    this.dustPhase[i + 1] = this.dustRng.range(0, Math.PI * 2);
+    this.dustPhase[i + 2] = this.dustRng.range(0, Math.PI * 2);
   }
 
   setShadowSize(size: number): void {
