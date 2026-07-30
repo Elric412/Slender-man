@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#05070a" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="manifest" href="./manifest.webmanifest" />
+<title>STATIC</title>
+<link rel="stylesheet" href="./src/style.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2305070a'/%3E%3Ctext x='8' y='23' font-size='18' fill='%239aa5ad' font-family='monospace'%3ES%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+<div id="app">
+  <canvas id="game-canvas"></canvas>
+
+  <!-- ============ LOADING ============ -->
+  <div id="loading-screen" class="screen">
+    <div class="load-inner">
+      <div class="load-logo">S T A T I C</div>
+      <div class="load-sub">PINE BRIDGE COUNTY &mdash; BACKCOUNTRY SURVEY ARCHIVE</div>
+      <div class="load-bar-wrap"><div id="load-bar" class="load-bar"></div></div>
+      <div id="load-status" class="load-status">initializing&hellip;</div>
+    </div>
+  </div>
+
+  <!-- ============ TITLE ============ -->
+  <div id="title-screen" class="screen hidden">
+    <div class="title-flicker"></div>
+    <div class="title-inner">
+      <div class="title-rec"><span class="rec-dot"></span>REC&nbsp;&nbsp;03:14:07&nbsp;&nbsp;BATT&nbsp;12%</div>
+      <div class="title-logo">S T A T I C</div>
+      <div class="title-tag">eight tapes. one forest. it already knows you're here.</div>
+      <nav class="title-menu">
+        <button id="btn-start" class="menu-btn">BEGIN RECOVERY</button>
+        <button id="btn-settings" class="menu-btn">SETTINGS</button>
+        <button id="btn-about" class="menu-btn">FIELD NOTES</button>
+      </nav>
+      <div class="title-foot">headphones strongly recommended &middot; click a button to enable audio</div>
+    </div>
+  </div>
+
+  <!-- ============ ABOUT ============ -->
+  <div id="about-screen" class="screen hidden">
+    <div class="panel">
+      <div class="panel-title">FIELD NOTES &mdash; INCIDENT 11-C</div>
+      <div class="panel-body">
+        <p>Pinebridge Station was a U.S. survey outpost, evacuated in a single night. A four-person team never signed out.</p>
+        <p>Their field recorders are still out there. Recover all <strong>eight tapes</strong>, then reach the fire-access road at the east boundary.</p>
+        <p>You have a flashlight with a finite battery &mdash; manage it. You have a body &mdash; sprint, crouch, vault, lean. You have nothing else.</p>
+        <p>Locals had a name for what the team found. They called it <em>Palebark</em>. It hears. It watches. If the picture starts to break up, it is close.</p>
+        <p class="dim">STATIC is an original work of interactive fiction. Any resemblance to existing properties is coincidental.</p>
+      </div>
+      <button class="menu-btn back-btn" data-back>BACK</button>
+    </div>
+  </div>
+
+  <!-- ============ SETTINGS ============ -->
+  <div id="settings-screen" class="screen hidden">
+    <div class="panel">
+      <div class="panel-title">SETTINGS</div>
+      <div class="panel-body settings-grid">
+        <label for="set-quality">Quality</label>
+        <select id="set-quality">
+          <option value="auto">Auto (probe)</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="ultra">Ultra</option>
+        </select>
+
+        <label for="set-volume">Master volume</label>
+        <input id="set-volume" type="range" min="0" max="100" value="80" />
+
+        <label for="set-sens">Look sensitivity</label>
+        <input id="set-sens" type="range" min="20" max="200" value="100" />
+
+        <label for="set-inverty">Invert Y</label>
+        <input id="set-inverty" type="checkbox" />
+
+        <label for="set-subtitles">Subtitles</label>
+        <input id="set-subtitles" type="checkbox" checked />
+
+        <label for="set-colorblind">Colorblind-safe UI</label>
+        <input id="set-colorblind" type="checkbox" />
+
+        <label for="set-gyro">Gyro look (mobile)</label>
+        <input id="set-gyro" type="checkbox" />
+
+        <label for="set-fov">Field of view</label>
+        <input id="set-fov" type="range" min="60" max="100" value="75" />
+      </div>
+      <button class="menu-btn back-btn" data-back>BACK</button>
+    </div>
+  </div>
+
+  <!-- ============ PAUSE ============ -->
+  <div id="pause-screen" class="screen hidden translucent">
+    <div class="panel">
+      <div class="panel-title">PAUSED &mdash; TAPE HELD</div>
+      <div class="panel-body"><p class="dim">The forest is not waiting for you. It just doesn't need to hurry.</p></div>
+      <nav class="title-menu">
+        <button id="btn-resume" class="menu-btn">RESUME</button>
+        <button id="btn-pause-settings" class="menu-btn">SETTINGS</button>
+        <button id="btn-quit" class="menu-btn">ABANDON RUN</button>
+      </nav>
+    </div>
+  </div>
+
+  <!-- ============ END ============ -->
+  <div id="end-screen" class="screen hidden">
+    <div class="end-inner">
+      <div id="end-title" class="end-title">TAPE ENDS</div>
+      <div id="end-detail" class="end-detail"></div>
+      <div id="end-stats" class="end-stats"></div>
+      <button id="btn-restart" class="menu-btn">REWIND &amp; RE-ENTER</button>
+      <button id="btn-title" class="menu-btn">MAIN MENU</button>
+    </div>
+  </div>
+
+  <!-- ============ CAPTURE FLASH ============ -->
+  <div id="capture-overlay" class="hidden"></div>
+
+  <!-- ============ HUD ============ -->
+  <div id="hud" class="hidden">
+    <div id="tape-counter" class="tape-counter hidden"><span id="tape-count">0</span> / 8 TAPES</div>
+    <div id="interact-prompt" class="interact-prompt hidden">E &mdash; RECOVER TAPE</div>
+    <div id="subtitle" class="subtitle hidden"></div>
+    <div id="viewfinder-overlay" class="viewfinder hidden">
+      <div class="vf-corner tl"></div><div class="vf-corner tr"></div>
+      <div class="vf-corner bl"></div><div class="vf-corner br"></div>
+      <div class="vf-label">&#9654; PLAY &nbsp;&nbsp;SP&nbsp;&nbsp;CAM 01&nbsp;&nbsp;<span id="vf-time">-0:04</span></div>
+      <div class="vf-scan"></div>
+    </div>
+    <div id="rotate-prompt" class="rotate-prompt hidden">ROTATE DEVICE FOR BEST EXPERIENCE</div>
+    <div id="perf-overlay" class="perf-overlay hidden"></div>
+
+    <!-- touch controls -->
+    <div id="touch-ui" class="hidden">
+      <div id="stick-zone"><div id="stick-base"><div id="stick-nub"></div></div></div>
+      <div class="touch-buttons">
+        <button id="tb-flash" class="tbtn" aria-label="flashlight">&#128294;</button>
+        <button id="tb-interact" class="tbtn" aria-label="interact">&#9995;</button>
+        <button id="tb-crouch" class="tbtn" aria-label="crouch">&#11015;</button>
+        <button id="tb-sprint" class="tbtn" aria-label="sprint">&#9193;</button>
+        <button id="tb-vf" class="tbtn" aria-label="viewfinder">&#8986;</button>
+        <button id="tb-pause" class="tbtn small" aria-label="pause">II</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="module" src="./src/main.ts"></script>
+</body>
+</html>
