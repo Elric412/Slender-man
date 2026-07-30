@@ -23,7 +23,7 @@ import { Menu } from './ui/Menu';
 
 const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchmarkable
 
-type GameState = 'loading' | 'title' | 'playing' | 'paused' | 'ending' | 'end';
+type GameState = 'loading' | 'title' | 'playing' | 'paused' | 'ending' | 'escaped' | 'taken';
 
 const frame = (): Promise<void> => new Promise(r => requestAnimationFrame(() => r()));
 
@@ -374,7 +374,7 @@ class StaticGame {
   }
 
   private finishRun(): void {
-    this.state = 'end';
+    this.state = this.endKind; // 'escaped' | 'taken' — win/lose is part of the state contract
     this.loop.paused = true;
     this.menu.showHud(false);
     this.menu.showTouchUI(false);
@@ -549,7 +549,22 @@ class StaticGame {
       start: () => this.startRun(),
       forceFear: (v: number) => { this.fear.value = v; },
       forceDetection: (v: number) => { this.entity.detection = v; },
-      entity: () => this.entitySnap,
+      // Live snapshot: reads brain fields directly so it never goes stale
+      // between frames (the cached entitySnap only refreshes once per update
+      // tick — under slow renderers QA could read a pre-change state).
+      entity: (): EntitySnapshot | null => {
+        if (!this.entitySnap) return null;
+        return {
+          state: this.entity.state,
+          detection: this.entity.detection,
+          x: this.entity.pos.x, y: this.entity.pos.y, z: this.entity.pos.z,
+          visibleToPlayer: this.entitySnap.visibleToPlayer,
+          distToPlayer: Math.hypot(
+            this.entity.pos.x - this.player.pos.x,
+            this.entity.pos.z - this.player.pos.z),
+          speed: this.entitySnap.speed,
+        };
+      },
       flashlight: (on: boolean) => { if (this.flashlight.on !== on) this.flashlight.toggle(); },
       collectAll: () => {
         for (const t of this.tapes.tapes) {
