@@ -810,7 +810,301 @@ export class RenderPipeline {
 
     this.buildComposite();
   }
-// __COMPOSITE__
+  /**
+   * The one full-res pass. Order matters: everything scene-referred (AO,
+   * in-scattering, bloom, DOF) happens in HDR *before* AgX, and everything
+   * camera/medium related (grain, scanlines, static, vignette, dither) happens
+   * after it — that's what keeps the camcorder look from bleaching the image.
+   */
+  private buildComposite(): void {
+    const V2 = () => new THREE.Vector2();
+    this.compositePass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tInput;
+      uniform sampler2D tBloom;
+      uniform sampler2D tStreak;
+      uniform sampler2D tVeil;
+      uniform sampler2D tAO;
+      uniform sampler2D tVol;
+      uniform sampler2D tDepth;
+      uniform sampler2D tExposure;
+
+      uniform vec2 uTexel;
+      uniform vec2 uClip;
+      uniform float uTime;
+      uniform float uFrame;
+      uniform float uStatic;
+      uniform float uGlimpse;
+      uniform float uDesat;
+      uniform float uWetness;
+      uniform float uViewfinder;
+      uniform float uSharpen;
+      uniform float uBloomStrength;
+      uniform float uStreakStrength;
+      uniform float uVolStrength;
+      uniform float uAoStrength;
+      uniform vec2  uDofRange;
+      uniform float uDofStrength;
+      uniform float uVignette;
+      uniform float uGrain;
+
+      void main(){
+        vec2 uv = vUv;
+        vec2 cc = uv - 0.5;
+        float s = uStatic;
+
+        // ---- camcorder optics: mild barrel + tape wobble ----
+        float barrel = 0.045 + uViewfinder * 0.05;
+        uv = 0.5 + cc * (1.0 + barrel * dot(cc, cc));
+
+        // tape-stop roll at extreme static
+        if (s > 0.985) uv.y = fract(uv.y + fract(uTime * 0.7));
+
+        // head-switching wobble: a couple of horizontal bands that shear
+        float band = smoothstep(0.92, 1.0, fract(uv.y * 3.0 - uTime * 0.35));
+        uv.x += band * (0.004 + s * 0.02) * (hash12(vec2(floor(uv.y * 180.0), floor(uTime * 24.0))) - 0.5);
+
+        float warp = s * s * 0.010;
+        uv.x += sin(uv.y * 64.0 + uTime * 13.0) * warp;
+        uv.y += sin(uv.x * 47.0 - uTime * 9.0) * warp * 0.5;
+        uv = clamp(uv, vec2(0.0005), vec2(0.9995));
+
+        // ---- chromatic aberration (lateral, grows toward the edges) ----
+        float ca = 0.0008 + s * 0.0045 + uViewfinder * 0.0012;
+        vec2 caDir = cc * ca;
+        vec3 col;
+        col.r = texture(tInput, uv + caDir).r;
+        col.g = texture(tInput, uv).g;
+        col.b = texture(tInput, uv - caDir).b;
+
+        // ---- neighbour taps: shared by sharpening and the FXAA fallback ----
+        vec3 nN = texture(tInput, uv + vec2(0.0, uTexel.y)).rgb;
+        vec3 nS = texture(tInput, uv - vec2(0.0, uTexel.y)).rgb;
+        vec3 nE = texture(tInput, uv + vec2(uTexel.x, 0.0)).rgb;
+        vec3 nW = texture(tInput, uv - vec2(uTexel.x, 0.0)).rgb;
+
+        #ifdef USE_FXAA
+        {
+          float lC = luminance(col), lN = luminance(nN), lS = luminance(nS);
+          float lE = luminance(nE), lW = luminance(nW);
+          float range = max(max(lN, lS), max(lE, max(lW, lC))) - min(min(lN, lS), min(lE, min(lW, lC)));
+          float amt = clamp((range - 0.05) * 3.5, 0.0, 0.65);
+          col = mix(col, (nN + nS + nE + nW + col) * 0.2, amt);
+        }
+        #endif
+
+        // contrast-adaptive sharpening: recovers the detail dynamic-res eats
+        {
+          vec3 blur = (nN + nS + nE + nW) * 0.25;
+          float localContrast = clamp(luminance(abs(col - blur)) * 6.0, 0.0, 1.0);
+          col += (col - blur) * uSharpen * (1.0 - localContrast * 0.4);
+          col = max(col, vec3(0.0));
+        }
+
+        // ---- depth of field: far defocus from the veil chain ----
+        float rawD = texture(tDepth, uv).x;
+        float lin = linearizeDepth(rawD, uClip);
+        #ifdef USE_DOF
+        {
+          float coc = smoothstep(uDofRange.x, uDofRange.y, lin) * uDofStrength;
+          coc = max(coc, (1.0 - smoothstep(0.10, 0.42, lin)) * 0.5 * uDofStrength); // macro near blur
+          col = mix(col, texture(tVeil, uv).rgb, clamp(coc, 0.0, 0.85));
+        }
+        #endif
+
+        // ---- ambient occlusion (scene-referred, distance-faded upstream) ----
+        #ifdef USE_AO
+          float ao = texture(tAO, uv).r;
+          col *= mix(1.0, ao, uAoStrength);
+        #endif
+
+        // ---- volumetric in-scattering ----
+        #ifdef USE_VOL
+          col += texture(tVol, uv).rgb * uVolStrength;
+        #endif
+
+        // ---- bloom + anamorphic streak, through a procedural dirty lens ----
+        #ifdef USE_BLOOM
+        {
+          float d1 = sin(uv.x * 21.0 + 1.7) * sin(uv.y * 17.0 - 0.9);
+          float d2 = sin(uv.x * 47.0 - 2.3) * sin(uv.y * 39.0 + 1.1);
+          float dirt = 0.78 + 0.30 * (d1 * 0.6 + d2 * 0.4);
+          col += texture(tBloom, uv).rgb * uBloomStrength * dirt;
+          #ifdef USE_STREAK
+            col += texture(tStreak, uv).rgb * uStreakStrength * vec3(0.72, 0.82, 1.0);
+          #endif
+        }
+        #endif
+
+        // ---- exposure (GPU eye adaptation) ----
+        col *= texture(tExposure, vec2(0.5)).r;
+
+        // ---- wet-night response: deepens contrast, cools the low end ----
+        col = mix(col, col * vec3(0.94, 0.99, 1.08) * 1.03, uWetness);
+
+        // ---- display transform ----
+        float sat = 1.0 - uDesat * (0.42 + s * 0.4);
+        col = agx(col, sat, 1.0 + s * 0.06);
+
+        // ---- filmic grade: cool shadows, warm speculars ----
+        float l = luminance(col);
+        vec3 shadowTint = col * vec3(0.90, 0.97, 1.14);
+        vec3 lightTint  = col * vec3(1.07, 1.00, 0.90);
+        col = mix(shadowTint, lightTint, smoothstep(0.22, 0.85, l));
+
+        // ---- CCD / tape artefacts ----
+        float scan = 0.93 + 0.07 * sin(uv.y * 1100.0 + uTime * 8.0);
+        col *= mix(1.0, scan, 0.18 + s * 0.55 + uViewfinder * 0.15);
+
+        float n = hash12(uv * vec2(1920.0, 1080.0) + fract(uTime) * 371.0);
+        float edge = smoothstep(0.25, 0.85, length(cc) * 1.6);
+        float noiseAmt = s * (0.09 + edge * 0.45) + uGlimpse * 0.45;
+        col = mix(col, vec3(n), clamp(noiseAmt, 0.0, 0.9));
+
+        // dropout scratches — sparse, only when the signal is bad
+        float dropRow = step(0.9975, hash12(vec2(floor(uv.y * 240.0), floor(uTime * 12.0))));
+        col = mix(col, vec3(0.75), dropRow * s * 0.5);
+
+        col += vec3(0.11, 0.12, 0.16) * uGlimpse;
+
+        // film grain, luminance-weighted so black stays black-ish but alive
+        float g = (hash12(uv * 911.0 + fract(uTime * 7.0) * 517.0) - 0.5);
+        col += g * uGrain * mix(0.6, 1.4, 1.0 - l);
+
+        // peripheral narrowing
+        float vig = smoothstep(1.28 - s * 0.34, 0.34, length(cc) * 1.9);
+        col *= mix(uVignette, 1.0, vig);
+
+        // ordered dither on the final 8-bit quantisation — no banding in the dark
+        col += (ign(gl_FragCoord.xy + uFrame) - 0.5) * (1.0 / 255.0);
+
+        fragColor = vec4(max(col, vec3(0.0)), 1.0);
+      }`, [GLSL_HASH, GLSL_DEPTH, GLSL_COLOR, GLSL_TONEMAP]), {
+      tInput: { value: null }, tBloom: { value: null }, tStreak: { value: null },
+      tVeil: { value: null }, tAO: { value: null }, tVol: { value: null },
+      tDepth: { value: null }, tExposure: { value: null },
+      uTexel: { value: V2() }, uClip: { value: new THREE.Vector2(0.08, 900) },
+      uTime: { value: 0 }, uFrame: { value: 0 },
+      uStatic: { value: 0 }, uGlimpse: { value: 0 }, uDesat: { value: 0.25 },
+      uWetness: { value: 0 }, uViewfinder: { value: 0 },
+      uSharpen: { value: 0.3 }, uBloomStrength: { value: 0.42 },
+      uStreakStrength: { value: 0.16 }, uVolStrength: { value: 1.0 },
+      uAoStrength: { value: 0.8 },
+      uDofRange: { value: new THREE.Vector2(26, 90) }, uDofStrength: { value: 0.7 },
+      uVignette: { value: 0.34 }, uGrain: { value: 0.026 },
+    }, {
+      USE_BLOOM: 1, USE_AO: 1, USE_VOL: 1, USE_DOF: 1, USE_STREAK: 1,
+    });
+  }
+
+  // ======================================================================
+  // render targets
+  // ======================================================================
+  private makeRT(w: number, h: number, opts: {
+    depthTexture?: THREE.DepthTexture; type?: THREE.TextureDataType;
+    filter?: THREE.MagnificationTextureFilter;
+  } = {}): THREE.WebGLRenderTarget {
+    const filter = opts.filter ?? THREE.LinearFilter;
+    return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+      minFilter: filter, magFilter: filter,
+      format: THREE.RGBAFormat, type: opts.type ?? THREE.HalfFloatType,
+      depthBuffer: !!opts.depthTexture,
+      depthTexture: opts.depthTexture,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
+  }
+
+  resize(canvasW: number, canvasH: number): void {
+    this.cw = Math.max(2, canvasW); this.ch = Math.max(2, canvasH);
+    const w = Math.max(2, Math.floor(this.cw * this.renderScale));
+    const h = Math.max(2, Math.floor(this.ch * this.renderScale));
+    if (w === this.w && h === this.h && this.sceneRT) return;
+    this.w = w; this.h = h;
+    this.disposeTargets();
+
+    this.depthTex = new THREE.DepthTexture(w, h);
+    this.depthTex.format = THREE.DepthFormat;
+    this.depthTex.type = THREE.UnsignedIntType;
+    this.depthTex.minFilter = THREE.NearestFilter;
+    this.depthTex.magFilter = THREE.NearestFilter;
+
+    this.sceneRT = this.makeRT(w, h, { depthTexture: this.depthTex });
+
+    const hw = Math.max(2, w >> 1), hh = Math.max(2, h >> 1);
+    if (this.enabled.ao) {
+      this.aoRT = this.makeRT(hw, hh);
+      this.aoHistA = this.makeRT(hw, hh);
+      this.aoHistB = this.makeRT(hw, hh);
+    }
+    if (this.enabled.volumetric) {
+      const div = this.spec.volumetric >= 2 ? 2 : 4;
+      const vw = Math.max(2, Math.floor(w / div)), vh = Math.max(2, Math.floor(h / div));
+      this.volRT = this.makeRT(vw, vh);
+      this.volHistA = this.makeRT(vw, vh);
+      this.volHistB = this.makeRT(vw, vh);
+    }
+    if (this.enabled.taa) {
+      this.taaA = this.makeRT(w, h);
+      this.taaB = this.makeRT(w, h);
+    }
+    this.motionRT = this.makeRT(w, h);
+
+    const qw = Math.max(2, w >> 2), qh = Math.max(2, h >> 2);
+    this.veilA = this.makeRT(qw, qh);
+    this.veilB = this.makeRT(qw, qh);
+
+    const mips = 4;
+    for (let i = 0; i < mips; i++) {
+      const mw = Math.max(2, w >> (i + 1)), mh = Math.max(2, h >> (i + 1));
+      this.bloomDown.push(this.makeRT(mw, mh));
+      this.bloomUp.push(this.makeRT(mw, mh));
+    }
+    this.streakRT = this.makeRT(Math.max(2, w >> 3), Math.max(2, h >> 3));
+
+    this.expA = this.makeRT(1, 1, { filter: THREE.NearestFilter });
+    this.expB = this.makeRT(1, 1, { filter: THREE.NearestFilter });
+
+    this.invalidateHistory();
+  }
+
+  private disposeTargets(): void {
+    const kill = (rt: THREE.WebGLRenderTarget | null | undefined) => rt?.dispose();
+    kill(this.sceneRT);
+    kill(this.aoRT); kill(this.aoHistA); kill(this.aoHistB);
+    kill(this.volRT); kill(this.volHistA); kill(this.volHistB);
+    kill(this.taaA); kill(this.taaB); kill(this.motionRT);
+    kill(this.veilA); kill(this.veilB); kill(this.streakRT);
+    kill(this.expA); kill(this.expB);
+    for (const rt of this.bloomDown) rt.dispose();
+    for (const rt of this.bloomUp) rt.dispose();
+    this.bloomDown.length = 0; this.bloomUp.length = 0;
+    this.aoRT = this.aoHistA = this.aoHistB = null;
+    this.volRT = this.volHistA = this.volHistB = null;
+    this.taaA = this.taaB = null;
+  }
+
+  setQuality(spec: QualitySpec): void {
+    this.spec = spec;
+    this.applySpecFlags(spec);
+    this.renderScale = Math.min(spec.renderScale, spec.tier === 'low' ? 0.85 : 1.0);
+    this.maxScale = Math.min(1.0, spec.tier === 'low' ? 0.85 : 1.0);
+    this.aoPass.define('AO_DIRS', spec.aoQuality >= 2 ? 4 : 3);
+    this.aoPass.define('AO_STEPS', spec.aoQuality >= 2 ? 4 : 3);
+    this.volPass.define('VOL_STEPS', spec.volumetric >= 2 ? 16 : 10);
+    this.volPass.define('VOL_SPOT_SHADOW', spec.volumetric >= 2 ? 1 : 0);
+    this.volPass.define('VOL_MOON_SHADOW', spec.volumetric >= 2 ? 1 : 0);
+    this.compositePass.define('USE_AO', this.enabled.ao);
+    this.compositePass.define('USE_VOL', this.enabled.volumetric);
+    this.compositePass.define('USE_BLOOM', this.enabled.bloom);
+    this.compositePass.define('USE_DOF', this.enabled.dof);
+    this.compositePass.define('USE_STREAK', spec.tier === 'high' || spec.tier === 'ultra');
+    this.compositePass.define('USE_FXAA', !spec.taa);
+    this.compositePass.u.uSharpen.value = spec.sharpen;
+    this.motionPass.define('MB_TAPS', spec.tier === 'ultra' ? 7 : 5);
+    // force reallocation for the new target set
+    this.w = this.h = 0;
+    this.resize(this.cw, this.ch);
+  }
 // __RENDER__
 // __RENDER__
 }
