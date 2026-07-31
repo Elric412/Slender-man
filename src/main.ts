@@ -477,6 +477,7 @@ class StaticGame {
     this.windDir.z = Math.sin(wTime * 0.7) * 0.8 + 0.2;
     updateWind({ strength: wind, dirX: this.windDir.x, dirZ: this.windDir.z, time });
     this.map.update(time, wind);
+    this.map.veg.setDrawDistance(this.player.pos.x, this.player.pos.z, this.spec.drawDistance);
     this.effects.update(dt, time, this.player.pos.x, this.player.eyeY, this.player.pos.z);
     this.sky.update(time);
 
@@ -515,6 +516,7 @@ class StaticGame {
       this.menu.setPerf(
         `FPS ${st.fps.toFixed(0)}  avg ${(st.avg * 1000).toFixed(1)}ms\n` +
         `p95 ${(st.p95 * 1000).toFixed(1)}ms  worst ${(st.worst * 1000).toFixed(1)}ms\n` +
+        `upd ${st.updateMs.toFixed(2)}ms  ren ${st.renderMs.toFixed(2)}ms\n` +
         `scale ${this.pipeline.renderScale.toFixed(2)}  det ${snap.detection.toFixed(2)}\n` +
         `state ${snap.state}  dist ${snap.distToPlayer.toFixed(0)}m`);
     }
@@ -545,6 +547,7 @@ class StaticGame {
       dustStats: () => this.flashlight.dustStats(),
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
+      gpuStats: () => this.pipeline ? { ...this.pipeline.gpuStats } : null,
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
         this.pipeline.invalidateHistory();

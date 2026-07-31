@@ -376,9 +376,14 @@ export class RenderPipeline {
     }
   }
 
+  /** §1b instrumentation: GPU-side draw stats from the last frame. */
+  readonly gpuStats = { calls: 0, triangles: 0 };
+
   render(scene: THREE.Scene, camera: THREE.PerspectiveCamera, statics: StaticState, dt: number): void {
     const r = this.renderer;
     if (!this.sceneRT) this.resize(this.cw, this.ch);
+    r.info.autoReset = false;
+    r.info.reset();
 
     // ---- TAA jitter ----
     if (this.enabled.taa && this.taaA) {
@@ -396,12 +401,16 @@ export class RenderPipeline {
     r.setRenderTarget(this.sceneRT);
     r.render(scene, camera);
 
-    // ---- normals prepass (view-space) ----
-    const oldOverride = scene.overrideMaterial;
-    scene.overrideMaterial = this.normalMat;
-    r.setRenderTarget(this.normalRT);
-    r.render(scene, camera);
-    scene.overrideMaterial = oldOverride;
+    // ---- normals prepass (view-space) — only when AO will consume it ----
+    // tNormal is sampled exclusively by the AO pass; on tiers with AO off
+    // this full-scene re-render's output is never read, so skip it entirely.
+    if (this.enabled.ao) {
+      const oldOverride = scene.overrideMaterial;
+      scene.overrideMaterial = this.normalMat;
+      r.setRenderTarget(this.normalRT);
+      r.render(scene, camera);
+      scene.overrideMaterial = oldOverride;
+    }
 
     // ---- AO ----
     if (this.enabled.ao && this.aoRT && this.aoPass) {
@@ -494,6 +503,8 @@ export class RenderPipeline {
     }
 
     camera.clearViewOffset();
+    this.gpuStats.calls = r.info.render.calls;
+    this.gpuStats.triangles = r.info.render.triangles;
   }
 
   /** Set the exposure adaptation goal each frame (e.g. higher when the flashlight is on). */
