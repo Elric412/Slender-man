@@ -1,39 +1,143 @@
 import * as THREE from 'three';
 import { QualitySpec } from '../core/Config';
+import {
+  GLSL_HASH, GLSL_DEPTH, GLSL_COLOR, GLSL_TONEMAP, GLSL_PHASE,
+  GLSL_UNPACK_DEPTH, GLSL_CATMULL_ROM, POST_VERT, buildFrag,
+} from './ShaderChunks';
 
 /**
- * Custom render graph — no EffectComposer.
- * Passes: scene(HDR, w/ depth+normals prepass targets) → AO → bloom chain →
- * TAA (Halton jitter + history) → composite (exposure, grade, static overlay, vignette) → screen.
+ * ============================================================================
+ * STATIC — deferred-ish forward render graph (no EffectComposer, WebGL2 only)
+ * ============================================================================
+ *
+ * Frame graph (arrows = texture dependencies):
+ *
+ *   scene (HDR RGBA16F + depth)
+ *     ├─ HBAO            half-res, depth-only normals ──┐ temporal + bilateral
+ *     ├─ VOLUMETRICS     half/quarter-res raymarch,     │ shadow-mapped beam
+ *     │                  HG phase, height fog          │ temporal reprojection
+ *     ├─ TAA             depth-reprojected history,      │ YCoCg variance clip,
+ *     │                  Catmull-Rom resample           │ Halton(2,3) jitter
+ *     ├─ MOTION BLUR     per-pixel velocity from depth   │
+ *     ├─ VEIL CHAIN      quarter-res blur → DOF + glare  │
+ *     ├─ BLOOM           4-mip Karis down / tent up      │
+ *     ├─ STREAK          anamorphic horizontal smear     │
+ *     ├─ EXPOSURE        1×1 GPU eye-adaptation (no readback)
+ *     └─ COMPOSITE       CAS sharpen, DOF, bloom, AO, inscatter, AgX,
+ *                        camcorder grade, grain, dither → backbuffer
+ *
+ * Design rules that keep this affordable in a browser:
+ *  1. **No normal prepass.** View normals are reconstructed from depth, so AO
+ *     costs one half-res pass instead of a second full scene draw.
+ *  2. **Everything expensive is temporal.** AO and volumetrics march few samples
+ *     with per-pixel/per-frame interleaved-gradient dithering and accumulate
+ *     across frames with depth-rejected reprojection.
+ *  3. **One composite.** Grading, tonemap, sharpening, DOF, vignette, static and
+ *     dither all happen in a single full-res pass — bandwidth is the enemy.
+ *  4. **Every stage is switchable per quality tier** and can be degraded at
+ *     runtime by the dynamic-resolution controller.
  */
 
-const BLIT_VERT = /* glsl */`
-varying vec2 vUv;
-void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+const HALTON_BASES: [number, number] = [2, 3];
 
-// Halton sequence for TAA jitter
 function halton(i: number, base: number): number {
   let f = 1, r = 0;
   while (i > 0) { f /= base; r += f * (i % base); i = Math.floor(i / base); }
   return r;
 }
 
-class FSQuad {
-  readonly mesh: THREE.Mesh;
-  readonly scene = new THREE.Scene();
-  readonly cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  private mat: THREE.ShaderMaterial;
-  constructor(frag: string, uniforms: Record<string, THREE.IUniform>) {
-    this.mat = new THREE.ShaderMaterial({ vertexShader: BLIT_VERT, fragmentShader: frag, uniforms, depthTest: false, depthWrite: false });
-    this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.mat);
+/** A fullscreen shader pass. GLSL3 so we get textureLod / explicit outputs. */
+class Pass {
+  readonly material: THREE.ShaderMaterial;
+  private static geo: THREE.BufferGeometry | null = null;
+  private static cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private mesh: THREE.Mesh;
+  private scene = new THREE.Scene();
+
+  constructor(frag: string, uniforms: Record<string, THREE.IUniform>, defines: Record<string, string | number> = {}) {
+    if (!Pass.geo) Pass.geo = new THREE.PlaneGeometry(2, 2);
+    this.material = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: POST_VERT,
+      fragmentShader: frag,
+      uniforms, defines,
+      depthTest: false, depthWrite: false,
+    });
+    this.mesh = new THREE.Mesh(Pass.geo, this.material);
     this.mesh.frustumCulled = false;
     this.scene.add(this.mesh);
   }
+
+  get u(): Record<string, THREE.IUniform> { return this.material.uniforms; }
+
+  define(name: string, value: string | number | boolean): void {
+    const defs = this.material.defines as Record<string, unknown>;
+    const v = typeof value === 'boolean' ? (value ? 1 : 0) : value;
+    if (defs[name] === v) return;
+    defs[name] = v;
+    this.material.needsUpdate = true;
+  }
+
   render(r: THREE.WebGLRenderer, target: THREE.WebGLRenderTarget | null): void {
     r.setRenderTarget(target);
-    r.render(this.scene, this.cam);
+    r.render(this.scene, Pass.cam);
   }
-  dispose(): void { this.mesh.geometry.dispose(); this.mat.dispose(); }
+
+  dispose(): void { this.material.dispose(); }
+}
+
+/**
+ * Optional real GPU timing via EXT_disjoint_timer_query_webgl2. CPU frame time
+ * lies on GPU-bound scenes; this tells us which half of the pipeline to blame.
+ */
+class GpuTimer {
+  private ext: {
+    TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number;
+    beginQueryEXT?: unknown;
+  } | null = null;
+  private gl: WebGL2RenderingContext | null = null;
+  private pending: WebGLQuery[] = [];
+  private active: WebGLQuery | null = null;
+  lastMs = 0;
+
+  constructor(renderer: THREE.WebGLRenderer) {
+    try {
+      const gl = renderer.getContext() as WebGL2RenderingContext;
+      const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+      if (ext) { this.gl = gl; this.ext = ext as unknown as GpuTimer['ext']; }
+    } catch { /* timing is a luxury */ }
+  }
+
+  begin(): void {
+    if (!this.gl || !this.ext || this.active) return;
+    const q = this.gl.createQuery();
+    if (!q) return;
+    this.gl.beginQuery(this.ext.TIME_ELAPSED_EXT, q);
+    this.active = q;
+  }
+
+  end(): void {
+    if (!this.gl || !this.ext || !this.active) return;
+    this.gl.endQuery(this.ext.TIME_ELAPSED_EXT);
+    this.pending.push(this.active);
+    this.active = null;
+    // drain: only ever read fully-resolved queries so we never stall
+    const gl = this.gl;
+    while (this.pending.length) {
+      const q = this.pending[0];
+      const available = gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE) as boolean;
+      const disjoint = gl.getParameter(this.ext.GPU_DISJOINT_EXT) as boolean;
+      if (!available) break;
+      if (!disjoint) {
+        const ns = gl.getQueryParameter(q, gl.QUERY_RESULT) as number;
+        this.lastMs = this.lastMs * 0.8 + (ns / 1e6) * 0.2;
+      }
+      gl.deleteQuery(q);
+      this.pending.shift();
+      if (this.pending.length > 4) continue;
+      break;
+    }
+  }
 }
 
 export interface StaticState {
@@ -41,11 +145,34 @@ export interface StaticState {
   glimpse: number;      // 0..1 single-frame glimpse flash
   desat: number;
   time: number;
+  /** 0..1 camcorder viewfinder weight (extra CA + scanlines + tape wobble) */
+  viewfinder?: number;
+  /** 0..1 surface wetness — drives specular veil + puddle glint in the grade */
+  wetness?: number;
+}
+
+/** Everything the volumetric pass needs to know about the hero light. */
+export interface BeamParams {
+  light: THREE.SpotLight | null;
+  /** extra multiplier applied to in-scattering (flicker / battery sag) */
+  intensity: number;
+}
+
+export interface FogParams {
+  /** in-scattering coefficient at ground level */
+  density: number;
+  /** height (world Y) where density starts falling off */
+  baseHeight: number;
+  /** e-folding distance of the height falloff, metres */
+  falloff: number;
+  /** 0..1 how much the fog is stirred by animated noise */
+  turbulence: number;
 }
 
 export class RenderPipeline {
   private renderer: THREE.WebGLRenderer;
   private spec: QualitySpec;
+  private timer: GpuTimer;
 
   private w = 2; private h = 2;      // render (scaled) size
   private cw = 2; private ch = 2;    // canvas (output) size
@@ -53,471 +180,637 @@ export class RenderPipeline {
   private minScale = 0.55;
   private maxScale: number;
 
-  // targets
+  // ---- targets ----
   private sceneRT!: THREE.WebGLRenderTarget;
-  private depthRT!: THREE.DepthTexture;
-  private normalRT!: THREE.WebGLRenderTarget;
-  private aoRT!: THREE.WebGLRenderTarget | null;
-  private bloomA!: THREE.WebGLRenderTarget;
-  private bloomB!: THREE.WebGLRenderTarget;
-  private taaA!: THREE.WebGLRenderTarget | null;
-  private taaB!: THREE.WebGLRenderTarget | null;
-
-  // normal material override
-  private normalMat = new THREE.MeshNormalMaterial();
-
-  // passes
-  private aoPass!: FSQuad | null;
-  private bloomBright!: FSQuad;
-  private bloomBlur!: FSQuad;
-  private taaPass!: FSQuad | null;
-  private motionPass!: FSQuad;
-  private compositePass!: FSQuad;
-
-  // motion-blur state
-  private mbPrev = new THREE.Matrix4();
-  private mbPrevValid = false;
-  private mbCurr = new THREE.Matrix4();
+  private depthTex!: THREE.DepthTexture;
+  private aoRT: THREE.WebGLRenderTarget | null = null;
+  private aoHistA: THREE.WebGLRenderTarget | null = null;
+  private aoHistB: THREE.WebGLRenderTarget | null = null;
+  private volRT: THREE.WebGLRenderTarget | null = null;
+  private volHistA: THREE.WebGLRenderTarget | null = null;
+  private volHistB: THREE.WebGLRenderTarget | null = null;
+  private taaA: THREE.WebGLRenderTarget | null = null;
+  private taaB: THREE.WebGLRenderTarget | null = null;
   private motionRT!: THREE.WebGLRenderTarget;
+  private veilA!: THREE.WebGLRenderTarget;
+  private veilB!: THREE.WebGLRenderTarget;
+  private bloomDown: THREE.WebGLRenderTarget[] = [];
+  private bloomUp: THREE.WebGLRenderTarget[] = [];
+  private streakRT: THREE.WebGLRenderTarget | null = null;
+  private expA!: THREE.WebGLRenderTarget;
+  private expB!: THREE.WebGLRenderTarget;
+
+  // ---- passes ----
+  private aoPass!: Pass;
+  private aoResolve!: Pass;
+  private volPass!: Pass;
+  private volResolve!: Pass;
+  private taaPass!: Pass;
+  private motionPass!: Pass;
+  private downPass!: Pass;
+  private blurPass!: Pass;
+  private brightPass!: Pass;
+  private bloomDownPass!: Pass;
+  private bloomUpPass!: Pass;
+  private streakPass!: Pass;
+  private exposurePass!: Pass;
+  private compositePass!: Pass;
+
+  // ---- camera / temporal state ----
+  private frameIndex = 0;
+  private jitter = new THREE.Vector2();
+  private projNoJitter = new THREE.Matrix4();
+  private viewProj = new THREE.Matrix4();
+  private prevViewProj = new THREE.Matrix4();
+  private invViewProjJit = new THREE.Matrix4();
+  private invProjJit = new THREE.Matrix4();
+  private viewMatrix = new THREE.Matrix4();
+  private camWorld = new THREE.Matrix4();
+  private historyValid = false;
+  private aoHistoryValid = false;
+  private volHistoryValid = false;
+
+  // ---- exposure / dynamics ----
+  private exposureComp = 1.0;
   private mbStrength = 0;
   private lastYaw = 0;
   private lastPitch = 0;
+  private focusDistance = 12;
 
-  // TAA state
-  private jitterIdx = 0;
-  private prevViewProj = new THREE.Matrix4();
-  private taaHistoryValid = false;
-  private jitter = new THREE.Vector2();
-
-  // exposure (reactive-only metering — no pixel readback; robust across platforms)
-  private exposure = 1.0;
-  private exposureTarget = 1.0;
-
-  // dynamic res
+  // ---- adaptive quality ----
   private frameCostEma = 16.6;
   private lastAdjust = 0;
+  /** 1 = full feature set, drops toward 0.5 when we can't hold frame time */
+  private effortBias = 1;
 
-  enabled = { taa: true, ao: true, bloom: true };
+  enabled = { taa: true, ao: true, bloom: true, volumetric: true, dof: true, motionBlur: true };
+
+  private beam: BeamParams = { light: null, intensity: 1 };
+  private moon: THREE.DirectionalLight | null = null;
+  private fog: FogParams = { density: 0.022, baseHeight: 0, falloff: 9, turbulence: 0.55 };
+
+  readonly gpuStats = { calls: 0, triangles: 0, gpuMs: 0, passes: 0 };
 
   constructor(renderer: THREE.WebGLRenderer, spec: QualitySpec) {
     this.renderer = renderer;
     this.spec = spec;
     this.renderScale = spec.renderScale;
     this.maxScale = Math.min(1.0, spec.tier === 'low' ? 0.85 : 1.0);
-    this.enabled.taa = spec.taa;
-    this.enabled.ao = spec.ao;
-    this.enabled.bloom = spec.bloom;
+    this.applySpecFlags(spec);
+    this.timer = new GpuTimer(renderer);
     this.buildPasses();
   }
 
-  private rtType(): THREE.TextureDataType {
-    // half float with fallback
-    return THREE.HalfFloatType;
-  }
-
-  private makeRT(w: number, h: number, opts: { depth?: boolean; type?: THREE.TextureDataType; depthTexture?: THREE.DepthTexture } = {}): THREE.WebGLRenderTarget {
-    const rt = new THREE.WebGLRenderTarget(w, h, {
-      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
-      format: THREE.RGBAFormat, type: opts.type ?? this.rtType(),
-      depthBuffer: opts.depth ?? false,
-      depthTexture: opts.depthTexture,
-      stencilBuffer: false,
-    });
-    return rt;
-  }
-
-  private buildPasses(): void {
-    // ---- AO pass (depth+normal based SAO-lite) ----
-    this.aoPass = new FSQuad(/* glsl */`
-      varying vec2 vUv;
-      uniform sampler2D tDepth; uniform sampler2D tNormal;
-      uniform vec2 uTexel; uniform vec2 uClip; uniform float uIntensity;
-      float linDepth(vec2 uv){
-        float z = texture2D(tDepth, uv).x;
-        float zn = z * 2.0 - 1.0;
-        return (2.0 * uClip.x * uClip.y) / (uClip.y + uClip.x - zn * (uClip.y - uClip.x));
-      }
-      void main(){
-        float d0 = linDepth(vUv);
-        vec3 n0 = normalize(texture2D(tNormal, vUv).xyz * 2.0 - 1.0);
-        float occ = 0.0;
-        const int N = 6;
-        vec2 offs[6];
-        offs[0]=vec2(1.0,0.0); offs[1]=vec2(-1.0,0.0); offs[2]=vec2(0.0,1.0);
-        offs[3]=vec2(0.0,-1.0); offs[4]=vec2(0.7,0.7); offs[5]=vec2(-0.7,0.7);
-        float radius = 6.0;
-        for (int i=0;i<N;i++){
-          vec2 uv2 = vUv + offs[i] * uTexel * radius;
-          float d1 = linDepth(uv2);
-          vec3 n1 = texture2D(tNormal, uv2).xyz * 2.0 - 1.0;
-          float dd = d0 - d1;
-          float w = clamp(1.0 - abs(dd) * 0.15, 0.0, 1.0);
-          occ += clamp(dd * 0.4, 0.0, 1.0) * w * clamp(dot(n0, n1), 0.3, 1.0);
-        }
-        float ao = 1.0 - clamp(occ / float(N), 0.0, 1.0) * uIntensity;
-        // fade AO with distance
-        ao = mix(ao, 1.0, clamp(d0 / 60.0, 0.0, 1.0));
-        gl_FragColor = vec4(vec3(ao), 1.0);
-      }`, {
-      tDepth: { value: null }, tNormal: { value: null },
-      uTexel: { value: new THREE.Vector2() }, uClip: { value: new THREE.Vector2(0.1, 400) },
-      uIntensity: { value: 0.85 },
-    });
-
-    // ---- bloom bright ----
-    this.bloomBright = new FSQuad(/* glsl */`
-      varying vec2 vUv; uniform sampler2D tInput; uniform float uThresh;
-      void main(){
-        vec3 c = texture2D(tInput, vUv).rgb;
-        float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-        gl_FragColor = vec4(c * smoothstep(uThresh, uThresh + 0.9, l), 1.0);
-      }`, { tInput: { value: null }, uThresh: { value: 1.05 } });
-
-    // ---- bloom blur (separable gaussian) ----
-    this.bloomBlur = new FSQuad(/* glsl */`
-      varying vec2 vUv; uniform sampler2D tInput; uniform vec2 uDir;
-      void main(){
-        vec3 s = texture2D(tInput, vUv).rgb * 0.227;
-        s += texture2D(tInput, vUv + uDir * 1.384).rgb * 0.316;
-        s += texture2D(tInput, vUv - uDir * 1.384).rgb * 0.316;
-        s += texture2D(tInput, vUv + uDir * 3.230).rgb * 0.070;
-        s += texture2D(tInput, vUv - uDir * 3.230).rgb * 0.070;
-        gl_FragColor = vec4(s, 1.0);
-      }`, { tInput: { value: null }, uDir: { value: new THREE.Vector2() } });
-
-    // ---- motion blur: reproject previous composite toward current frame ----
-    this.motionPass = new FSQuad(/* glsl */`
-      varying vec2 vUv;
-      uniform sampler2D tCurrent; uniform sampler2D tPrev;
-      uniform mat4 uReproj; uniform float uAmount; uniform vec2 uTexel;
-      void main(){
-        vec3 cur = texture2D(tCurrent, vUv).rgb;
-        vec4 clip = uReproj * vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
-        vec2 prevUv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
-        vec2 delta = clamp(prevUv - vUv, vec2(-0.04), vec2(0.04));
-        vec3 acc = cur;
-        const int N = 4;
-        for (int i = 1; i <= N; i++) {
-          acc += texture2D(tCurrent, vUv + delta * (float(i) / float(N))).rgb;
-        }
-        acc /= float(N + 1);
-        // screen-edge guard: don't smear outside
-        float edge = step(0.0, prevUv.x) * step(prevUv.x, 1.0) * step(0.0, prevUv.y) * step(prevUv.y, 1.0);
-        gl_FragColor = vec4(mix(cur, acc, uAmount * edge), 1.0);
-      }`, {
-      tCurrent: { value: null }, tPrev: { value: null },
-      uReproj: { value: new THREE.Matrix4() }, uAmount: { value: 0 },
-      uTexel: { value: new THREE.Vector2() },
-    });
-
-    // ---- TAA (history blend w/ clamp) ----
-    this.taaPass = new FSQuad(/* glsl */`
-      varying vec2 vUv;
-      uniform sampler2D tCurrent; uniform sampler2D tHistory; uniform sampler2D tDepth;
-      uniform float uBlend; uniform vec2 uTexel;
-      void main(){
-        vec3 cur = texture2D(tCurrent, vUv).rgb;
-        vec3 lo = cur, hi = cur;
-        for (int x=-1;x<=1;x++) for (int y=-1;y<=1;y++){
-          vec3 c = texture2D(tCurrent, vUv + vec2(float(x),float(y)) * uTexel).rgb;
-          lo = min(lo, c); hi = max(hi, c);
-        }
-        vec3 hist = texture2D(tHistory, vUv).rgb;
-        hist = clamp(hist, lo, hi);
-        float d = texture2D(tDepth, vUv).x;
-        float blend = uBlend * (1.0 - step(0.9999, 1.0 - d) * 0.5); // sky re-accumulates faster
-        gl_FragColor = vec4(mix(cur, hist, blend), 1.0);
-      }`, {
-      tCurrent: { value: null }, tHistory: { value: null }, tDepth: { value: null },
-      uBlend: { value: 0.88 }, uTexel: { value: new THREE.Vector2() },
-    });
-
-    // ---- composite: exposure + grade + static overlay + vignette + tape-stop ----
-    this.compositePass = new FSQuad(/* glsl */`
-      varying vec2 vUv;
-      uniform sampler2D tInput; uniform sampler2D tBloom; uniform sampler2D tAO;
-      uniform float uExposure; uniform float uTime;
-      uniform float uStatic; uniform float uGlimpse; uniform float uDesat;
-      uniform vec2 uJitter;
-
-      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-
-      vec3 aces(vec3 x){
-        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
-      }
-
-      void main(){
-        vec2 uv = vUv;
-        float s = uStatic;
-
-        // tape-stop: bottom-to-top roll
-        if (s > 0.985) {
-          float roll = fract(uTime * 0.7);
-          uv.y = fract(uv.y + roll);
-        }
-
-        // warp at high static
-        float warp = s * s * 0.012;
-        uv.x += sin(uv.y * 60.0 + uTime * 13.0) * warp;
-        uv.y += sin(uv.x * 45.0 - uTime * 9.0) * warp * 0.5;
-
-        // chromatic aberration scaled by static
-        float ca = 0.0012 + s * 0.006;
-        vec2 dir = (uv - 0.5) * ca;
-        vec3 col;
-        col.r = texture2D(tInput, uv + dir).r;
-        col.g = texture2D(tInput, uv).g;
-        col.b = texture2D(tInput, uv - dir).b;
-
-        vec3 bloom = texture2D(tBloom, uv).rgb;
-        col += bloom * 0.8;
-
-        float ao = texture2D(tAO, uv).r;
-        col *= ao;
-
-        col *= uExposure;
-
-        // fear desaturation + cool grade
-        float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
-        col = mix(col, vec3(lum), uDesat * (0.35 + s * 0.45));
-        col = aces(col);
-        // cool shadows / warm highlights grade
-        col = pow(col, vec3(1.06, 1.0, 0.94));
-        col *= vec3(0.96, 1.0, 1.08);
-
-        // scanlines
-        float scan = 0.92 + 0.08 * sin(uv.y * 900.0 + uTime * 8.0);
-        col *= mix(1.0, scan, 0.25 + s * 0.6);
-
-        // analog static noise (edge-weighted)
-        float n = hash(uv * vec2(1920.0, 1080.0) + fract(uTime) * 371.0);
-        float edge = smoothstep(0.25, 0.85, length(uv - 0.5) * 1.6);
-        float noiseAmt = s * (0.10 + edge * 0.5) + uGlimpse * 0.5;
-        col = mix(col, vec3(n), clamp(noiseAmt, 0.0, 0.9));
-
-        // film grain — always on, keeps dark areas alive
-        float grain = (hash(uv * 911.0 + fract(uTime * 7.0) * 517.0) - 0.5) * 0.028;
-        col += grain;
-
-        // glimpse flash: brief brightness spike
-        col += vec3(0.12, 0.13, 0.16) * uGlimpse;
-
-        // peripheral narrowing (vignette tightens with static)
-        float vig = smoothstep(1.25 - s * 0.35, 0.35, length(uv - 0.5) * 1.9);
-        col *= mix(0.35, 1.0, vig);
-
-        gl_FragColor = vec4(col, 1.0);
-      }`, {
-      tInput: { value: null }, tBloom: { value: null }, tAO: { value: null },
-      uExposure: { value: 1.0 }, uTime: { value: 0 },
-      uStatic: { value: 0 }, uGlimpse: { value: 0 }, uDesat: { value: 0.25 },
-      uJitter: { value: new THREE.Vector2() },
-    });
-  }
-
-  resize(canvasW: number, canvasH: number): void {
-    this.cw = Math.max(2, canvasW); this.ch = Math.max(2, canvasH);
-    const w = Math.max(2, Math.floor(this.cw * this.renderScale));
-    const h = Math.max(2, Math.floor(this.ch * this.renderScale));
-    if (w === this.w && h === this.h && this.sceneRT) return;
-    this.w = w; this.h = h;
-    this.disposeTargets();
-
-    this.depthRT = new THREE.DepthTexture(w, h);
-    this.depthRT.format = THREE.DepthFormat;
-    this.depthRT.type = THREE.UnsignedIntType;
-
-    this.sceneRT = this.makeRT(w, h, { depth: true, depthTexture: this.depthRT });
-    this.normalRT = this.makeRT(w, h, { type: THREE.UnsignedByteType });
-    this.aoRT = this.enabled.ao ? this.makeRT(Math.floor(w / 2), Math.floor(h / 2), { type: THREE.UnsignedByteType }) : null;
-
-    const bw = Math.max(2, Math.floor(w / 4)), bh = Math.max(2, Math.floor(h / 4));
-    this.bloomA = this.makeRT(bw, bh);
-    this.bloomB = this.makeRT(bw, bh);
-
-    if (this.enabled.taa) {
-      this.taaA = this.makeRT(w, h);
-      this.taaB = this.makeRT(w, h);
-    }
-    this.motionRT = this.makeRT(w, h);
-    this.taaHistoryValid = false;
-    this.mbPrevValid = false;
-  }
-
-  private disposeTargets(): void {
-    this.sceneRT?.dispose(); this.normalRT?.dispose(); this.aoRT?.dispose();
-    this.bloomA?.dispose(); this.bloomB?.dispose();
-    this.taaA?.dispose(); this.taaB?.dispose();
-    this.motionRT?.dispose();
-  }
-
-  setQuality(spec: QualitySpec): void {
-    this.spec = spec;
+  private applySpecFlags(spec: QualitySpec): void {
     this.enabled.taa = spec.taa;
-    this.enabled.ao = spec.ao;
+    this.enabled.ao = spec.aoQuality > 0;
     this.enabled.bloom = spec.bloom;
-    this.renderScale = Math.min(this.renderScale, spec.tier === 'low' ? 0.85 : 1.0);
-    this.maxScale = Math.min(1.0, spec.tier === 'low' ? 0.85 : 1.0);
-    this.resize(this.cw, this.ch); // force re-alloc
+    this.enabled.volumetric = spec.volumetric > 0;
+    this.enabled.dof = spec.dof;
+    this.enabled.motionBlur = spec.motionBlur;
   }
 
-  /** dynamic resolution: conservative with hysteresis */
-  adaptResolution(frameMs: number, now: number): void {
-    this.frameCostEma = this.frameCostEma * 0.95 + frameMs * 0.05;
-    if (now - this.lastAdjust < 1.5) return;
-    if (this.frameCostEma > 19 && this.renderScale > this.minScale) {
-      this.renderScale = Math.max(this.minScale, this.renderScale - 0.1);
-      this.lastAdjust = now;
-      this.resize(this.cw, this.ch);
-    } else if (this.frameCostEma < 12 && this.renderScale < this.maxScale) {
-      this.renderScale = Math.min(this.maxScale, this.renderScale + 0.05);
-      this.lastAdjust = now;
-      this.resize(this.cw, this.ch);
-    }
+  // ======================================================================
+  // configuration hooks used by the game layer
+  // ======================================================================
+
+  /** Hand the pipeline the flashlight so volumetrics can shadow-march it. */
+  setBeam(light: THREE.SpotLight | null, intensity = 1): void {
+    this.beam.light = light;
+    this.beam.intensity = intensity;
   }
 
-  /** §1b instrumentation: GPU-side draw stats from the last frame. */
-  readonly gpuStats = { calls: 0, triangles: 0 };
+  setMoon(light: THREE.DirectionalLight | null): void { this.moon = light; }
 
-  render(scene: THREE.Scene, camera: THREE.PerspectiveCamera, statics: StaticState, dt: number): void {
-    const r = this.renderer;
-    if (!this.sceneRT) this.resize(this.cw, this.ch);
-    r.info.autoReset = false;
-    r.info.reset();
+  setFog(p: Partial<FogParams>): void { Object.assign(this.fog, p); }
 
-    // ---- TAA jitter ----
-    if (this.enabled.taa && this.taaA) {
-      this.jitterIdx = (this.jitterIdx + 1) % 8;
-      const jx = halton(this.jitterIdx + 1, 2) - 0.5;
-      const jy = halton(this.jitterIdx + 1, 3) - 0.5;
-      this.jitter.set(jx / this.w, jy / this.h);
-      camera.setViewOffset(this.w, this.h, jx, jy, this.w, this.h);
-    } else {
-      camera.clearViewOffset();
-    }
-    camera.updateMatrixWorld();
-
-    // ---- main scene pass (HDR) ----
-    r.setRenderTarget(this.sceneRT);
-    r.render(scene, camera);
-
-    // ---- normals prepass (view-space) — only when AO will consume it ----
-    // tNormal is sampled exclusively by the AO pass; on tiers with AO off
-    // this full-scene re-render's output is never read, so skip it entirely.
-    if (this.enabled.ao) {
-      const oldOverride = scene.overrideMaterial;
-      scene.overrideMaterial = this.normalMat;
-      r.setRenderTarget(this.normalRT);
-      r.render(scene, camera);
-      scene.overrideMaterial = oldOverride;
-    }
-
-    // ---- AO ----
-    if (this.enabled.ao && this.aoRT && this.aoPass) {
-      const u = this.aoPass.mesh.material as THREE.ShaderMaterial;
-      u.uniforms.tDepth.value = this.depthRT;
-      u.uniforms.tNormal.value = this.normalRT.texture;
-      (u.uniforms.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
-      (u.uniforms.uClip.value as THREE.Vector2).set(camera.near, camera.far);
-      this.aoPass.render(r, this.aoRT);
-    }
-
-    // ---- TAA resolve ----
-    let srcTex: THREE.Texture = this.sceneRT.texture;
-    if (this.enabled.taa && this.taaA && this.taaB && this.taaPass) {
-      const u = this.taaPass.mesh.material as THREE.ShaderMaterial;
-      u.uniforms.tCurrent.value = this.sceneRT.texture;
-      u.uniforms.tHistory.value = this.taaHistoryValid ? this.taaA.texture : this.sceneRT.texture;
-      u.uniforms.tDepth.value = this.depthRT;
-      (u.uniforms.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
-      this.taaPass.render(r, this.taaB);
-      const tmp = this.taaA; this.taaA = this.taaB; this.taaB = tmp;
-      this.taaHistoryValid = true;
-      srcTex = this.taaA.texture;
-    }
-
-    // ---- restrained motion blur (fast turns + fear sway only) ----
-    {
-      // rotational velocity drives blur amount — ordinary walking stays crisp
-      const dYaw = camera.rotation.y - this.lastYaw;
-      const dPitch = camera.rotation.x - this.lastPitch;
-      this.lastYaw = camera.rotation.y; this.lastPitch = camera.rotation.x;
-      const turnRate = Math.abs(dYaw) + Math.abs(dPitch) * 0.6;
-      const target = Math.min(0.55, turnRate * 26 + statics.level * 0.12);
-      this.mbStrength += (target - this.mbStrength) * Math.min(1, dt * 8);
-      if (this.mbStrength > 0.02) {
-        const u = this.motionPass.mesh.material as THREE.ShaderMaterial;
-        u.uniforms.tCurrent.value = srcTex;
-        u.uniforms.tPrev.value = this.motionRT.texture;
-        // reprojection: current NDC → previous NDC via inverse VP × prev VP
-        this.mbCurr.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-        const reproj = u.uniforms.uReproj.value as THREE.Matrix4;
-        if (this.mbPrevValid) {
-          reproj.copy(this.mbCurr).invert().multiply(this.mbPrev);
-        } else reproj.identity();
-        u.uniforms.uAmount.value = this.mbStrength;
-        (u.uniforms.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
-        this.motionPass.render(r, this.motionRT);
-        srcTex = this.motionRT.texture;
-      } else {
-        // keep previous frame fresh for reprojection
-        this.renderer.setRenderTarget(this.motionRT);
-        this.renderer.clear();
-      }
-      this.mbPrev.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-      this.mbPrevValid = true;
-    }
-
-    // ---- bloom ----
-    if (this.enabled.bloom) {
-      let u = this.bloomBright.mesh.material as THREE.ShaderMaterial;
-      u.uniforms.tInput.value = srcTex;
-      this.bloomBright.render(r, this.bloomA);
-      u = this.bloomBlur.mesh.material as THREE.ShaderMaterial;
-      u.uniforms.tInput.value = this.bloomA.texture;
-      (u.uniforms.uDir.value as THREE.Vector2).set(1 / this.bloomA.width, 0);
-      this.bloomBlur.render(r, this.bloomB);
-      u.uniforms.tInput.value = this.bloomB.texture;
-      (u.uniforms.uDir.value as THREE.Vector2).set(0, 1 / this.bloomA.height);
-      this.bloomBlur.render(r, this.bloomA);
-    }
-
-    // ---- exposure adaptation (separate brighten/darken speeds, like eyes) ----
-    {
-      const speed = this.exposureTarget > this.exposure ? 0.55 : 1.8;
-      this.exposure += (this.exposureTarget - this.exposure) * Math.min(1, speed * dt);
-    }
-
-    // ---- composite to screen ----
-    {
-      const u = this.compositePass.mesh.material as THREE.ShaderMaterial;
-      u.uniforms.tInput.value = srcTex;
-      u.uniforms.tBloom.value = this.enabled.bloom ? this.bloomA.texture : null;
-      u.uniforms.tAO.value = this.enabled.ao && this.aoRT ? this.aoRT.texture : null;
-      u.uniforms.uExposure.value = this.exposure;
-      u.uniforms.uTime.value = statics.time;
-      u.uniforms.uStatic.value = statics.level;
-      u.uniforms.uGlimpse.value = statics.glimpse;
-      u.uniforms.uDesat.value = statics.desat;
-      this.compositePass.render(r, null);
-    }
-
-    camera.clearViewOffset();
-    this.gpuStats.calls = r.info.render.calls;
-    this.gpuStats.triangles = r.info.render.triangles;
-  }
-
-  /** Set the exposure adaptation goal each frame (e.g. higher when the flashlight is on). */
+  /** Exposure compensation goal (stops-ish multiplier around the auto value). */
   setExposureGoal(goal: number): void {
-    this.exposureTarget = THREE.MathUtils.clamp(goal, 0.35, 2.6);
+    this.exposureComp = THREE.MathUtils.clamp(goal, 0.35, 2.6);
   }
 
-  invalidateHistory(): void { this.taaHistoryValid = false; this.jitterIdx = 0; this.mbPrevValid = false; this.mbStrength = 0; }
+  get gpuMs(): number { return this.timer.lastMs; }
+  get effort(): number { return this.effortBias; }
 
-  dispose(): void {
-    this.disposeTargets();
-    this.aoPass?.dispose(); this.bloomBright.dispose(); this.bloomBlur.dispose();
-    this.taaPass?.dispose(); this.motionPass.dispose(); this.compositePass.dispose();
-    this.normalMat.dispose();
+  invalidateHistory(): void {
+    this.historyValid = false;
+    this.aoHistoryValid = false;
+    this.volHistoryValid = false;
+    this.frameIndex = 0;
+    this.mbStrength = 0;
   }
+
+  // ======================================================================
+  // pass construction
+  // ======================================================================
+  private buildPasses(): void {
+    const V2 = () => new THREE.Vector2();
+
+    // ------------------------------------------------------------------ HBAO
+    // Horizon-based AO from depth alone. Normals are rebuilt with the
+    // "closest neighbour" trick (Drobot) so silhouettes don't smear, and the
+    // sampling ring is rotated per pixel/frame by interleaved gradient noise —
+    // the temporal resolve turns 9 taps into a ~100-tap-looking result.
+    this.aoPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tDepth;
+      uniform mat4 uInvProj;
+      uniform vec2 uClip;
+      uniform vec2 uTexel;        // full-res texel size
+      uniform float uRadius;      // world-space radius (m)
+      uniform float uIntensity;
+      uniform float uProjScaleUV; // 0.5 / tan(fovY/2)
+      uniform float uFrame;
+
+      vec3 vp(vec2 uv){ return viewPosFromDepth(uv, texture(tDepth, uv).x, uInvProj); }
+
+      void main(){
+        float d = texture(tDepth, vUv).x;
+        if (d >= 0.999999) { fragColor = vec4(1.0, 1.0, 0.0, 1.0); return; }
+        vec3 p = viewPosFromDepth(vUv, d, uInvProj);
+        float viewDist = -p.z;
+
+        vec3 pr = vp(vUv + vec2(uTexel.x, 0.0));
+        vec3 pl = vp(vUv - vec2(uTexel.x, 0.0));
+        vec3 pu = vp(vUv + vec2(0.0, uTexel.y));
+        vec3 pd = vp(vUv - vec2(0.0, uTexel.y));
+        vec3 dx = abs(pr.z - p.z) < abs(pl.z - p.z) ? (pr - p) : (p - pl);
+        vec3 dy = abs(pu.z - p.z) < abs(pd.z - p.z) ? (pu - p) : (p - pd);
+        vec3 n = normalize(cross(dx, dy));
+
+        float radiusUV = clamp(uRadius * uProjScaleUV / max(viewDist, 0.2), uTexel.x * 2.0, 0.09);
+        float rot = ignT(gl_FragCoord.xy, uFrame) * 6.28318531;
+        float occ = 0.0;
+
+        for (int i = 0; i < AO_DIRS; i++){
+          float a = rot + float(i) * (6.28318531 / float(AO_DIRS));
+          vec2 dir = vec2(cos(a), sin(a));
+          float top = 0.0;
+          for (int s = 0; s < AO_STEPS; s++){
+            float t = (float(s) + 0.7) / float(AO_STEPS);
+            vec3 q = vp(vUv + dir * radiusUV * t);
+            vec3 v = q - p;
+            float len = length(v) + 1e-5;
+            float falloff = clamp(1.0 - len / uRadius, 0.0, 1.0);
+            top = max(top, (dot(n, v) / len - 0.10) * falloff);
+          }
+          occ += top;
+        }
+        float ao = clamp(1.0 - occ / float(AO_DIRS) * uIntensity, 0.0, 1.0);
+        // AO is a contact cue: let it die off with distance so the forest
+        // interior doesn't turn into a grey wash under fog.
+        ao = mix(ao, 1.0, smoothstep(28.0, 70.0, viewDist));
+        fragColor = vec4(ao, viewDist / uClip.y, 0.0, 1.0);
+      }`, [GLSL_HASH, GLSL_DEPTH]), {
+      tDepth: { value: null }, uInvProj: { value: new THREE.Matrix4() },
+      uClip: { value: V2() }, uTexel: { value: V2() },
+      uRadius: { value: 0.85 }, uIntensity: { value: 1.15 },
+      uProjScaleUV: { value: 0.8 }, uFrame: { value: 0 },
+    }, { AO_DIRS: 3, AO_STEPS: 3 });
+
+    // ---- AO temporal + bilateral resolve --------------------------------
+    this.aoResolve = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tAO;
+      uniform sampler2D tHistory;
+      uniform sampler2D tDepth;
+      uniform mat4 uInvViewProj;
+      uniform mat4 uPrevViewProj;
+      uniform vec2 uTexel;      // half-res texel
+      uniform float uBlend;
+      uniform float uValid;
+
+      void main(){
+        vec2 c = texture(tAO, vUv).rg;
+        float depth = c.g;
+        // 3x3 depth-weighted blur — cheap, keeps creases sharp
+        float sum = 0.0, wsum = 0.0;
+        for (int y = -1; y <= 1; y++){
+          for (int x = -1; x <= 1; x++){
+            vec2 o = vec2(float(x), float(y)) * uTexel;
+            vec2 s = texture(tAO, vUv + o).rg;
+            float w = exp(-abs(s.g - depth) * 220.0);
+            sum += s.r * w; wsum += w;
+          }
+        }
+        float cur = wsum > 0.0 ? sum / wsum : c.r;
+
+        float ao = cur;
+        if (uValid > 0.5) {
+          float d = texture(tDepth, vUv).x;
+          vec4 wp = uInvViewProj * vec4(vUv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+          wp /= wp.w;
+          vec4 pc = uPrevViewProj * wp;
+          vec2 puv = pc.xy / pc.w * 0.5 + 0.5;
+          if (all(greaterThan(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)))) {
+            vec2 hs = texture(tHistory, puv).rg;
+            float rel = abs(hs.g - depth) / max(depth, 1e-4);
+            float trust = uBlend * (1.0 - smoothstep(0.01, 0.06, rel));
+            ao = mix(cur, hs.r, trust);
+          }
+        }
+        fragColor = vec4(ao, depth, 0.0, 1.0);
+      }`), {
+      tAO: { value: null }, tHistory: { value: null }, tDepth: { value: null },
+      uInvViewProj: { value: new THREE.Matrix4() }, uPrevViewProj: { value: new THREE.Matrix4() },
+      uTexel: { value: V2() }, uBlend: { value: 0.9 }, uValid: { value: 0 },
+    });
+
+    // ---------------------------------------------------------- VOLUMETRICS
+    // Ray-marched single-scattering. The flashlight is marched against its own
+    // shadow map, so trees carve real shafts out of the beam; the moon term
+    // does the same for canopy god-rays. Height fog + animated wisps give the
+    // medium structure so the beam isn't a clean geometric cone.
+    this.volPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tDepth;
+      uniform mat4 uInvProj;
+      uniform mat4 uCamWorld;
+      uniform vec3 uCamPos;
+      uniform float uFrame;
+      uniform float uTime;
+      uniform float uMaxDist;
+
+      uniform float uFogDensity;
+      uniform float uFogBase;
+      uniform float uFogFalloff;
+      uniform float uTurb;
+      uniform float uExtinction;
+
+      uniform vec3 uSpotPos;
+      uniform vec3 uSpotDir;
+      uniform vec3 uSpotColor;
+      uniform vec2 uSpotCos;      // (coneCos, penumbraCos)
+      uniform float uSpotRange;
+      uniform float uSpotIntensity;
+
+      uniform vec3 uMoonDir;      // direction light travels
+      uniform vec3 uMoonColor;
+      uniform float uMoonIntensity;
+
+      #if VOL_SPOT_SHADOW
+        uniform sampler2D tSpotShadow;
+        uniform mat4 uSpotShadowMatrix;
+        uniform float uSpotShadowBias;
+      #endif
+      #if VOL_MOON_SHADOW
+        uniform sampler2D tMoonShadow;
+        uniform mat4 uMoonShadowMatrix;
+        uniform float uMoonShadowBias;
+      #endif
+
+      float shadowLookup(sampler2D map, mat4 mtx, vec3 wp, float bias){
+        vec4 sc = mtx * vec4(wp, 1.0);
+        sc.xyz /= max(sc.w, 1e-5);
+        if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z > 1.0) return 1.0;
+        float sd = unpackRGBAToDepth(texture(map, sc.xy));
+        return step(sc.z - bias, sd);
+      }
+
+      void main(){
+        float d = texture(tDepth, vUv).x;
+        vec3 pView = viewPosFromDepth(vUv, min(d, 0.999999), uInvProj);
+        float sceneDist = length(pView);
+        vec3 rd = normalize((uCamWorld * vec4(normalize(pView), 0.0)).xyz);
+        float maxT = min(d >= 0.999999 ? uMaxDist : sceneDist, uMaxDist);
+
+        float jitter = ignT(gl_FragCoord.xy, uFrame);
+        float stepLen = maxT / float(VOL_STEPS);
+        vec3 acc = vec3(0.0);
+        float trans = 1.0;
+
+        for (int i = 0; i < VOL_STEPS; i++){
+          float t = (float(i) + jitter) * stepLen;
+          vec3 wp = uCamPos + rd * t;
+
+          float dens = uFogDensity * exp(-max(wp.y - uFogBase, 0.0) / uFogFalloff);
+          dens *= 1.0 + uTurb * (
+              sin(wp.x * 0.31 + uTime * 0.21) * sin(wp.z * 0.27 - uTime * 0.17)
+            + 0.5 * sin(wp.y * 0.9 + uTime * 0.11));
+          dens = max(dens, 0.0);
+          float sigma = dens * stepLen;
+          if (sigma < 1e-6) continue;
+
+          vec3 inl = vec3(0.0);
+
+          // ---- hero light ----
+          if (uSpotIntensity > 0.0) {
+            vec3 L = uSpotPos - wp;
+            float dist2 = max(dot(L, L), 0.04);
+            float dist = sqrt(dist2);
+            vec3 Ln = L / dist;
+            float cosA = dot(-Ln, uSpotDir);
+            if (cosA > uSpotCos.x) {
+              float atten = smoothstep(uSpotCos.x, uSpotCos.y, cosA) / dist2;
+              atten *= max(1.0 - dist / uSpotRange, 0.0);
+              #if VOL_SPOT_SHADOW
+                atten *= shadowLookup(tSpotShadow, uSpotShadowMatrix, wp, uSpotShadowBias);
+              #endif
+              inl += uSpotColor * (atten * henyeyGreenstein(dot(rd, -Ln), 0.62) * uSpotIntensity);
+            }
+          }
+
+          // ---- moonlight shafts ----
+          if (uMoonIntensity > 0.0) {
+            float lit = 1.0;
+            #if VOL_MOON_SHADOW
+              lit = shadowLookup(tMoonShadow, uMoonShadowMatrix, wp, uMoonShadowBias);
+            #endif
+            inl += uMoonColor * (uMoonIntensity * lit * henyeyGreenstein(dot(rd, -uMoonDir), 0.28));
+          }
+
+          acc += inl * sigma * trans;
+          trans *= exp(-sigma * uExtinction);
+        }
+        fragColor = vec4(acc, 1.0 - trans);
+      }`, [GLSL_HASH, GLSL_DEPTH, GLSL_PHASE, GLSL_UNPACK_DEPTH]), {
+      tDepth: { value: null }, uInvProj: { value: new THREE.Matrix4() },
+      uCamWorld: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() },
+      uFrame: { value: 0 }, uTime: { value: 0 }, uMaxDist: { value: 42 },
+      uFogDensity: { value: 0.022 }, uFogBase: { value: 0 }, uFogFalloff: { value: 9 },
+      uTurb: { value: 0.5 }, uExtinction: { value: 1.1 },
+      uSpotPos: { value: new THREE.Vector3() }, uSpotDir: { value: new THREE.Vector3(0, 0, -1) },
+      uSpotColor: { value: new THREE.Color(1, 0.86, 0.66) },
+      uSpotCos: { value: new THREE.Vector2(0.92, 0.96) },
+      uSpotRange: { value: 55 }, uSpotIntensity: { value: 0 },
+      uMoonDir: { value: new THREE.Vector3(0, -1, 0) },
+      uMoonColor: { value: new THREE.Color(0.58, 0.66, 0.85) },
+      uMoonIntensity: { value: 0.02 },
+      tSpotShadow: { value: null }, uSpotShadowMatrix: { value: new THREE.Matrix4() },
+      uSpotShadowBias: { value: 0.0018 },
+      tMoonShadow: { value: null }, uMoonShadowMatrix: { value: new THREE.Matrix4() },
+      uMoonShadowBias: { value: 0.0025 },
+    }, { VOL_STEPS: 16, VOL_SPOT_SHADOW: 1, VOL_MOON_SHADOW: 0 });
+
+    // ---- volumetric temporal resolve ------------------------------------
+    this.volResolve = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tVol;
+      uniform sampler2D tHistory;
+      uniform sampler2D tDepth;
+      uniform mat4 uInvViewProj;
+      uniform mat4 uPrevViewProj;
+      uniform vec2 uTexel;
+      uniform float uBlend;
+      uniform float uValid;
+
+      void main(){
+        vec4 cur = texture(tVol, vUv);
+        // small cross blur first: the dither pattern lives at 1px, this eats it
+        cur = (cur * 2.0
+             + texture(tVol, vUv + vec2(uTexel.x, 0.0))
+             + texture(tVol, vUv - vec2(uTexel.x, 0.0))
+             + texture(tVol, vUv + vec2(0.0, uTexel.y))
+             + texture(tVol, vUv - vec2(0.0, uTexel.y))) / 6.0;
+
+        vec4 outc = cur;
+        if (uValid > 0.5) {
+          float d = texture(tDepth, vUv).x;
+          vec4 wp = uInvViewProj * vec4(vUv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+          wp /= wp.w;
+          vec4 pc = uPrevViewProj * wp;
+          vec2 puv = pc.xy / pc.w * 0.5 + 0.5;
+          if (all(greaterThan(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)))) {
+            vec4 hist = texture(tHistory, puv);
+            // clamp history to a generous local range: stops beam ghosting
+            // when the light whips around, keeps the smoothing everywhere else
+            vec4 lo = min(cur * 0.4, cur - 0.02);
+            vec4 hi = max(cur * 2.6, cur + 0.02);
+            hist = clamp(hist, lo, hi);
+            outc = mix(cur, hist, uBlend);
+          }
+        }
+        fragColor = outc;
+      }`), {
+      tVol: { value: null }, tHistory: { value: null }, tDepth: { value: null },
+      uInvViewProj: { value: new THREE.Matrix4() }, uPrevViewProj: { value: new THREE.Matrix4() },
+      uTexel: { value: V2() }, uBlend: { value: 0.82 }, uValid: { value: 0 },
+    });
+
+    // ------------------------------------------------------------------ TAA
+    this.taaPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tCurrent;
+      uniform sampler2D tHistory;
+      uniform sampler2D tDepth;
+      uniform mat4 uInvViewProjJit;
+      uniform mat4 uPrevViewProj;
+      uniform vec2 uTexSize;
+      uniform vec2 uTexel;
+      uniform float uBlend;
+      uniform float uValid;
+
+      void main(){
+        vec3 cur = texture(tCurrent, vUv).rgb;
+        if (uValid < 0.5) { fragColor = vec4(cur, 1.0); return; }
+
+        // ---- neighbourhood statistics in YCoCg (variance clipping) ----
+        vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+        for (int y = -1; y <= 1; y++){
+          for (int x = -1; x <= 1; x++){
+            vec3 c = rgbToYCoCg(texture(tCurrent, vUv + vec2(float(x), float(y)) * uTexel).rgb);
+            m1 += c; m2 += c * c;
+          }
+        }
+        vec3 mu = m1 / 9.0;
+        vec3 sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
+        vec3 lo = mu - 1.35 * sigma;
+        vec3 hi = mu + 1.35 * sigma;
+
+        // ---- reproject through the depth buffer ----
+        float d = texture(tDepth, vUv).x;
+        vec4 wp = uInvViewProjJit * vec4(vUv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        wp /= wp.w;
+        vec4 pc = uPrevViewProj * wp;
+        vec2 puv = pc.xy / max(pc.w, 1e-5) * 0.5 + 0.5;
+        if (any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) {
+          fragColor = vec4(cur, 1.0); return;
+        }
+
+        vec3 hist = sampleCatmullRom(tHistory, puv, uTexSize);
+        hist = yCoCgToRgb(clamp(rgbToYCoCg(hist), lo, hi));
+
+        // fast screen-space motion → trust the new frame more (less smearing)
+        float vel = length((puv - vUv) * uTexSize);
+        float blend = uBlend * exp(-vel * 0.06);
+        fragColor = vec4(mix(cur, hist, blend), 1.0);
+      }`, [GLSL_COLOR, GLSL_CATMULL_ROM]), {
+      tCurrent: { value: null }, tHistory: { value: null }, tDepth: { value: null },
+      uInvViewProjJit: { value: new THREE.Matrix4() }, uPrevViewProj: { value: new THREE.Matrix4() },
+      uTexSize: { value: V2() }, uTexel: { value: V2() },
+      uBlend: { value: 0.9 }, uValid: { value: 0 },
+    });
+
+    // --------------------------------------------------------- MOTION BLUR
+    this.motionPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tCurrent;
+      uniform sampler2D tDepth;
+      uniform mat4 uInvViewProjJit;
+      uniform mat4 uPrevViewProj;
+      uniform float uAmount;
+      void main(){
+        vec3 cur = texture(tCurrent, vUv).rgb;
+        float d = texture(tDepth, vUv).x;
+        vec4 wp = uInvViewProjJit * vec4(vUv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        wp /= wp.w;
+        vec4 pc = uPrevViewProj * wp;
+        vec2 puv = pc.xy / max(pc.w, 1e-5) * 0.5 + 0.5;
+        vec2 vel = clamp((puv - vUv) * uAmount, vec2(-0.03), vec2(0.03));
+        vec3 acc = cur;
+        for (int i = 1; i <= MB_TAPS; i++){
+          acc += texture(tCurrent, vUv + vel * (float(i) / float(MB_TAPS))).rgb;
+        }
+        fragColor = vec4(acc / float(MB_TAPS + 1), 1.0);
+      }`, [GLSL_DEPTH]), {
+      tCurrent: { value: null }, tDepth: { value: null },
+      uInvViewProjJit: { value: new THREE.Matrix4() },
+      uPrevViewProj: { value: new THREE.Matrix4() },
+      uAmount: { value: 0 },
+    }, { MB_TAPS: 5 });
+
+    // ------------------------------------------------- VEIL CHAIN (DOF/glare)
+    this.downPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tInput; uniform vec2 uTexel;
+      void main(){
+        vec3 s = texture(tInput, vUv + vec2( uTexel.x,  uTexel.y)).rgb
+               + texture(tInput, vUv + vec2(-uTexel.x,  uTexel.y)).rgb
+               + texture(tInput, vUv + vec2( uTexel.x, -uTexel.y)).rgb
+               + texture(tInput, vUv + vec2(-uTexel.x, -uTexel.y)).rgb;
+        fragColor = vec4(s * 0.25, 1.0);
+      }`), { tInput: { value: null }, uTexel: { value: V2() } });
+
+    this.blurPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tInput; uniform vec2 uDir;
+      void main(){
+        vec3 s = texture(tInput, vUv).rgb * 0.2270270270;
+        s += texture(tInput, vUv + uDir * 1.3846153846).rgb * 0.3162162162;
+        s += texture(tInput, vUv - uDir * 1.3846153846).rgb * 0.3162162162;
+        s += texture(tInput, vUv + uDir * 3.2307692308).rgb * 0.0702702703;
+        s += texture(tInput, vUv - uDir * 3.2307692308).rgb * 0.0702702703;
+        fragColor = vec4(s, 1.0);
+      }`), { tInput: { value: null }, uDir: { value: V2() } });
+
+    // ---------------------------------------------------------------- BLOOM
+    this.brightPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tInput; uniform vec2 uTexel;
+      uniform float uThreshold; uniform float uKnee;
+      vec3 prefilter(vec3 c){
+        float l = max(max(c.r, c.g), c.b);
+        float soft = clamp(l - uThreshold + uKnee, 0.0, 2.0 * uKnee);
+        soft = soft * soft / (4.0 * uKnee + 1e-4);
+        float contrib = max(soft, l - uThreshold) / max(l, 1e-4);
+        return c * contrib;
+      }
+      void main(){
+        // 4-tap Karis average — stops single fireflies from popping
+        vec3 a = texture(tInput, vUv + vec2( uTexel.x,  uTexel.y)).rgb;
+        vec3 b = texture(tInput, vUv + vec2(-uTexel.x,  uTexel.y)).rgb;
+        vec3 c = texture(tInput, vUv + vec2( uTexel.x, -uTexel.y)).rgb;
+        vec3 e = texture(tInput, vUv + vec2(-uTexel.x, -uTexel.y)).rgb;
+        float wa = 1.0 / (luminance(a) + 1.0), wb = 1.0 / (luminance(b) + 1.0);
+        float wc = 1.0 / (luminance(c) + 1.0), we = 1.0 / (luminance(e) + 1.0);
+        vec3 col = (a * wa + b * wb + c * wc + e * we) / max(wa + wb + wc + we, 1e-4);
+        fragColor = vec4(prefilter(col), 1.0);
+      }`, [GLSL_COLOR]), {
+      tInput: { value: null }, uTexel: { value: V2() },
+      uThreshold: { value: 0.85 }, uKnee: { value: 0.5 },
+    });
+
+    // COD-style 13-tap downsample
+    this.bloomDownPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tInput; uniform vec2 uTexel;
+      void main(){
+        vec2 t = uTexel;
+        vec3 a = texture(tInput, vUv + vec2(-2.0, 2.0) * t).rgb;
+        vec3 b = texture(tInput, vUv + vec2( 0.0, 2.0) * t).rgb;
+        vec3 c = texture(tInput, vUv + vec2( 2.0, 2.0) * t).rgb;
+        vec3 d = texture(tInput, vUv + vec2(-2.0, 0.0) * t).rgb;
+        vec3 e = texture(tInput, vUv).rgb;
+        vec3 f = texture(tInput, vUv + vec2( 2.0, 0.0) * t).rgb;
+        vec3 g = texture(tInput, vUv + vec2(-2.0,-2.0) * t).rgb;
+        vec3 h = texture(tInput, vUv + vec2( 0.0,-2.0) * t).rgb;
+        vec3 i = texture(tInput, vUv + vec2( 2.0,-2.0) * t).rgb;
+        vec3 j = texture(tInput, vUv + vec2(-1.0, 1.0) * t).rgb;
+        vec3 k = texture(tInput, vUv + vec2( 1.0, 1.0) * t).rgb;
+        vec3 l = texture(tInput, vUv + vec2(-1.0,-1.0) * t).rgb;
+        vec3 m = texture(tInput, vUv + vec2( 1.0,-1.0) * t).rgb;
+        vec3 col = e * 0.125;
+        col += (a + c + g + i) * 0.03125;
+        col += (b + d + f + h) * 0.0625;
+        col += (j + k + l + m) * 0.125;
+        fragColor = vec4(col, 1.0);
+      }`), { tInput: { value: null }, uTexel: { value: V2() } });
+
+    // 9-tap tent upsample + additive accumulation of the finer mip
+    this.bloomUpPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tLower;   // coarser mip (already accumulated)
+      uniform sampler2D tSame;    // this mip from the down chain
+      uniform vec2 uTexel;        // texel of tLower
+      uniform float uScatter;
+      void main(){
+        vec2 t = uTexel;
+        vec3 s = texture(tLower, vUv + vec2(-1.0,  1.0) * t).rgb * 1.0;
+        s += texture(tLower, vUv + vec2( 0.0,  1.0) * t).rgb * 2.0;
+        s += texture(tLower, vUv + vec2( 1.0,  1.0) * t).rgb * 1.0;
+        s += texture(tLower, vUv + vec2(-1.0,  0.0) * t).rgb * 2.0;
+        s += texture(tLower, vUv).rgb * 4.0;
+        s += texture(tLower, vUv + vec2( 1.0,  0.0) * t).rgb * 2.0;
+        s += texture(tLower, vUv + vec2(-1.0, -1.0) * t).rgb * 1.0;
+        s += texture(tLower, vUv + vec2( 0.0, -1.0) * t).rgb * 2.0;
+        s += texture(tLower, vUv + vec2( 1.0, -1.0) * t).rgb * 1.0;
+        s /= 16.0;
+        fragColor = vec4(texture(tSame, vUv).rgb + s * uScatter, 1.0);
+      }`), {
+      tLower: { value: null }, tSame: { value: null },
+      uTexel: { value: V2() }, uScatter: { value: 0.85 },
+    });
+
+    // -------------------------------------------------- ANAMORPHIC STREAK
+    this.streakPass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tInput; uniform vec2 uTexel;
+      void main(){
+        vec3 s = vec3(0.0);
+        float wsum = 0.0;
+        for (int i = -8; i <= 8; i++){
+          float w = 1.0 - abs(float(i)) / 9.0;
+          s += texture(tInput, vUv + vec2(uTexel.x * float(i) * 2.0, 0.0)).rgb * w;
+          wsum += w;
+        }
+        fragColor = vec4(s / wsum, 1.0);
+      }`), { tInput: { value: null }, uTexel: { value: V2() } });
+
+    // -------------------------------------------------------- AUTO EXPOSURE
+    // 1x1 target, 36 weighted taps of the quarter-res veil buffer, EMA'd
+    // against its own previous value. No readPixels, no CPU sync, no stalls.
+    this.exposurePass = new Pass(buildFrag(/* glsl */`
+      uniform sampler2D tSmall;
+      uniform sampler2D tPrev;
+      uniform float uDt;
+      uniform float uComp;
+      uniform float uValid;
+      void main(){
+        float sum = 0.0, n = 0.0;
+        for (int y = 0; y < 6; y++){
+          for (int x = 0; x < 6; x++){
+            vec2 uv = (vec2(float(x), float(y)) + 0.5) / 6.0;
+            float w = 1.0 - 0.55 * length(uv - 0.5) * 2.0;
+            sum += log(max(luminance(texture(tSmall, uv).rgb), 2e-4)) * w;
+            n += w;
+          }
+        }
+        float avg = exp(sum / max(n, 1e-4));
+        // deliberately narrow: STATIC must stay dark. This is eye adaptation,
+        // not an exposure meter trying to make the forest legible.
+        float autoE = clamp(0.055 / max(avg, 1e-4), 0.6, 1.55);
+        float target = uComp * pow(autoE, 0.65);
+        float prev = texture(tPrev, vec2(0.5)).r;
+        if (uValid < 0.5) prev = target;
+        float rate = target > prev ? 0.5 : 1.7;   // dilating is slow, closing fast
+        float e = mix(prev, target, clamp(uDt * rate, 0.0, 1.0));
+        fragColor = vec4(e, avg, 0.0, 1.0);
+      }`, [GLSL_COLOR]), {
+      tSmall: { value: null }, tPrev: { value: null },
+      uDt: { value: 0.016 }, uComp: { value: 1 }, uValid: { value: 0 },
+    });
+
+    this.buildComposite();
+  }
+// __COMPOSITE__
+// __RENDER__
+// __RENDER__
 }
