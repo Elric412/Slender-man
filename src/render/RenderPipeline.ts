@@ -449,11 +449,13 @@ export class RenderPipeline {
         uniform sampler2D tSpotShadow;
         uniform mat4 uSpotShadowMatrix;
         uniform float uSpotShadowBias;
+        uniform float uSpotShadowValid;   // 0 until three has allocated the map
       #endif
       #if VOL_MOON_SHADOW
         uniform sampler2D tMoonShadow;
         uniform mat4 uMoonShadowMatrix;
         uniform float uMoonShadowBias;
+        uniform float uMoonShadowValid;
       #endif
 
       float shadowLookup(sampler2D map, mat4 mtx, vec3 wp, float bias){
@@ -501,7 +503,7 @@ export class RenderPipeline {
               float atten = smoothstep(uSpotCos.x, uSpotCos.y, cosA) / dist2;
               atten *= max(1.0 - dist / uSpotRange, 0.0);
               #if VOL_SPOT_SHADOW
-                atten *= shadowLookup(tSpotShadow, uSpotShadowMatrix, wp, uSpotShadowBias);
+                atten *= mix(1.0, shadowLookup(tSpotShadow, uSpotShadowMatrix, wp, uSpotShadowBias), uSpotShadowValid);
               #endif
               inl += uSpotColor * (atten * henyeyGreenstein(dot(rd, -Ln), 0.62) * uSpotIntensity);
             }
@@ -511,7 +513,7 @@ export class RenderPipeline {
           if (uMoonIntensity > 0.0) {
             float lit = 1.0;
             #if VOL_MOON_SHADOW
-              lit = shadowLookup(tMoonShadow, uMoonShadowMatrix, wp, uMoonShadowBias);
+              lit = mix(1.0, shadowLookup(tMoonShadow, uMoonShadowMatrix, wp, uMoonShadowBias), uMoonShadowValid);
             #endif
             inl += uMoonColor * (uMoonIntensity * lit * henyeyGreenstein(dot(rd, -uMoonDir), 0.28));
           }
@@ -534,9 +536,9 @@ export class RenderPipeline {
       uMoonColor: { value: new THREE.Color(0.58, 0.66, 0.85) },
       uMoonIntensity: { value: 0.02 },
       tSpotShadow: { value: null }, uSpotShadowMatrix: { value: new THREE.Matrix4() },
-      uSpotShadowBias: { value: 0.0018 },
+      uSpotShadowBias: { value: 0.0018 }, uSpotShadowValid: { value: 0 },
       tMoonShadow: { value: null }, uMoonShadowMatrix: { value: new THREE.Matrix4() },
-      uMoonShadowBias: { value: 0.0025 },
+      uMoonShadowBias: { value: 0.0025 }, uMoonShadowValid: { value: 0 },
     }, { VOL_STEPS: 16, VOL_SPOT_SHADOW: 1, VOL_MOON_SHADOW: 0 });
 
     // ---- volumetric temporal resolve ------------------------------------
@@ -1106,5 +1108,346 @@ export class RenderPipeline {
     this.resize(this.cw, this.ch);
   }
 // __RENDER__
-// __RENDER__
+  // ======================================================================
+  // frame
+  // ======================================================================
+  private tmpA = new THREE.Vector3();
+  private tmpB = new THREE.Vector3();
+
+  render(scene: THREE.Scene, camera: THREE.PerspectiveCamera, statics: StaticState, dt: number): void {
+    const r = this.renderer;
+    if (!this.sceneRT) this.resize(this.cw, this.ch);
+    r.info.autoReset = false;
+    r.info.reset();
+    this.timer.begin();
+    this.frameIndex++;
+    const frameMod = this.frameIndex % 64;
+
+    // ---- matrices: capture the *unjittered* transform first so TAA and
+    //      motion blur reproject against a stable reference ----------------
+    camera.clearViewOffset();
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld();
+    this.projNoJitter.copy(camera.projectionMatrix);
+    this.viewMatrix.copy(camera.matrixWorldInverse);
+    this.camWorld.copy(camera.matrixWorld);
+    this.viewProj.multiplyMatrices(this.projNoJitter, this.viewMatrix);
+
+    let jx = 0, jy = 0;
+    if (this.enabled.taa) {
+      const idx = (this.frameIndex % 8) + 1;
+      jx = halton(idx, HALTON_BASES[0]) - 0.5;
+      jy = halton(idx, HALTON_BASES[1]) - 0.5;
+      camera.setViewOffset(this.w, this.h, jx, jy, this.w, this.h);
+      camera.updateProjectionMatrix();
+    }
+    this.jitter.set(jx, jy);
+    this.invProjJit.copy(camera.projectionMatrix).invert();
+    this.invViewProjJit.multiplyMatrices(camera.projectionMatrix, this.viewMatrix).invert();
+    const projScaleUV = 0.5 / Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5);
+
+    // ---- 1. main scene (HDR + depth) ------------------------------------
+    r.setRenderTarget(this.sceneRT);
+    r.render(scene, camera);
+    let passes = 1;
+
+    // ---- 2. HBAO --------------------------------------------------------
+    let aoTex: THREE.Texture | null = null;
+    if (this.enabled.ao && this.aoRT && this.aoHistA && this.aoHistB) {
+      const u = this.aoPass.u;
+      u.tDepth.value = this.depthTex;
+      (u.uInvProj.value as THREE.Matrix4).copy(this.invProjJit);
+      (u.uClip.value as THREE.Vector2).set(camera.near, camera.far);
+      (u.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
+      u.uProjScaleUV.value = projScaleUV;
+      u.uFrame.value = frameMod;
+      u.uIntensity.value = 1.1 * this.effortBias;
+      this.aoPass.render(r, this.aoRT);
+
+      const ur = this.aoResolve.u;
+      ur.tAO.value = this.aoRT.texture;
+      ur.tHistory.value = this.aoHistA.texture;
+      ur.tDepth.value = this.depthTex;
+      (ur.uInvViewProj.value as THREE.Matrix4).copy(this.invViewProjJit);
+      (ur.uPrevViewProj.value as THREE.Matrix4).copy(this.prevViewProj);
+      (ur.uTexel.value as THREE.Vector2).set(1 / this.aoRT.width, 1 / this.aoRT.height);
+      ur.uValid.value = this.aoHistoryValid && this.historyValid ? 1 : 0;
+      this.aoResolve.render(r, this.aoHistB);
+      const t = this.aoHistA; this.aoHistA = this.aoHistB; this.aoHistB = t;
+      this.aoHistoryValid = true;
+      aoTex = this.aoHistA.texture;
+      passes += 2;
+    }
+
+    // ---- 3. volumetrics -------------------------------------------------
+    let volTex: THREE.Texture | null = null;
+    if (this.enabled.volumetric && this.volRT && this.volHistA && this.volHistB) {
+      const u = this.volPass.u;
+      u.tDepth.value = this.depthTex;
+      (u.uInvProj.value as THREE.Matrix4).copy(this.invProjJit);
+      (u.uCamWorld.value as THREE.Matrix4).copy(this.camWorld);
+      camera.getWorldPosition(this.tmpA);
+      (u.uCamPos.value as THREE.Vector3).copy(this.tmpA);
+      u.uFrame.value = frameMod;
+      u.uTime.value = statics.time;
+      u.uFogDensity.value = this.fog.density;
+      u.uFogBase.value = this.fog.baseHeight;
+      u.uFogFalloff.value = this.fog.falloff;
+      u.uTurb.value = this.fog.turbulence;
+
+      // hero light
+      const sl = this.beam.light;
+      let spotI = 0;
+      if (sl && sl.intensity > 0 && this.beam.intensity > 0) {
+        sl.getWorldPosition(this.tmpA);
+        (u.uSpotPos.value as THREE.Vector3).copy(this.tmpA);
+        sl.target.getWorldPosition(this.tmpB);
+        (u.uSpotDir.value as THREE.Vector3).copy(this.tmpB).sub(this.tmpA).normalize();
+        (u.uSpotColor.value as THREE.Color).copy(sl.color);
+        (u.uSpotCos.value as THREE.Vector2).set(
+          Math.cos(sl.angle),
+          Math.cos(sl.angle * (1 - sl.penumbra)));
+        u.uSpotRange.value = sl.distance > 0 ? sl.distance : 60;
+        // three's intensity is candela-like; this factor puts single-scattering
+        // in the same ballpark as the surface lighting it belongs to
+        spotI = sl.intensity * 0.00055 * this.beam.intensity;
+        const smap = sl.shadow.map;
+        if (smap && this.spec.volumetric >= 2) {
+          u.tSpotShadow.value = smap.texture;
+          (u.uSpotShadowMatrix.value as THREE.Matrix4).copy(sl.shadow.matrix);
+          u.uSpotShadowValid.value = 1;
+        } else {
+          u.uSpotShadowValid.value = 0;
+        }
+      }
+      u.uSpotIntensity.value = spotI;
+
+      // moonlight
+      const mn = this.moon;
+      if (mn && mn.intensity > 0) {
+        mn.getWorldPosition(this.tmpA);
+        mn.target.getWorldPosition(this.tmpB);
+        (u.uMoonDir.value as THREE.Vector3).copy(this.tmpB).sub(this.tmpA).normalize();
+        (u.uMoonColor.value as THREE.Color).copy(mn.color);
+        u.uMoonIntensity.value = mn.intensity * 0.055;
+        const msmap = mn.shadow.map;
+        if (msmap && this.spec.volumetric >= 2) {
+          u.tMoonShadow.value = msmap.texture;
+          (u.uMoonShadowMatrix.value as THREE.Matrix4).copy(mn.shadow.matrix);
+          u.uMoonShadowValid.value = 1;
+        } else {
+          u.uMoonShadowValid.value = 0;
+        }
+      } else {
+        u.uMoonIntensity.value = 0;
+      }
+      this.volPass.render(r, this.volRT);
+
+      const ur = this.volResolve.u;
+      ur.tVol.value = this.volRT.texture;
+      ur.tHistory.value = this.volHistA.texture;
+      ur.tDepth.value = this.depthTex;
+      (ur.uInvViewProj.value as THREE.Matrix4).copy(this.invViewProjJit);
+      (ur.uPrevViewProj.value as THREE.Matrix4).copy(this.prevViewProj);
+      (ur.uTexel.value as THREE.Vector2).set(1 / this.volRT.width, 1 / this.volRT.height);
+      ur.uValid.value = this.volHistoryValid && this.historyValid ? 1 : 0;
+      this.volResolve.render(r, this.volHistB);
+      const t = this.volHistA; this.volHistA = this.volHistB; this.volHistB = t;
+      this.volHistoryValid = true;
+      volTex = this.volHistA.texture;
+      passes += 2;
+    }
+
+    // ---- 4. TAA ---------------------------------------------------------
+    let srcTex: THREE.Texture = this.sceneRT.texture;
+    if (this.enabled.taa && this.taaA && this.taaB) {
+      const u = this.taaPass.u;
+      u.tCurrent.value = this.sceneRT.texture;
+      u.tHistory.value = this.taaA.texture;
+      u.tDepth.value = this.depthTex;
+      (u.uInvViewProjJit.value as THREE.Matrix4).copy(this.invViewProjJit);
+      (u.uPrevViewProj.value as THREE.Matrix4).copy(this.prevViewProj);
+      (u.uTexSize.value as THREE.Vector2).set(this.w, this.h);
+      (u.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
+      u.uValid.value = this.historyValid ? 1 : 0;
+      this.taaPass.render(r, this.taaB);
+      const t = this.taaA; this.taaA = this.taaB; this.taaB = t;
+      srcTex = this.taaA.texture;
+      passes++;
+    }
+
+    // ---- 5. motion blur (rotation-led; walking stays crisp) -------------
+    if (this.enabled.motionBlur) {
+      const dYaw = camera.rotation.y - this.lastYaw;
+      const dPitch = camera.rotation.x - this.lastPitch;
+      this.lastYaw = camera.rotation.y; this.lastPitch = camera.rotation.x;
+      const turnRate = Math.abs(dYaw) + Math.abs(dPitch) * 0.6;
+      const target = Math.min(1.0, turnRate * 22 + statics.level * 0.18);
+      this.mbStrength += (target - this.mbStrength) * Math.min(1, dt * 9);
+      if (this.mbStrength > 0.04 && this.historyValid) {
+        const u = this.motionPass.u;
+        u.tCurrent.value = srcTex;
+        u.tDepth.value = this.depthTex;
+        (u.uInvViewProjJit.value as THREE.Matrix4).copy(this.invViewProjJit);
+        (u.uPrevViewProj.value as THREE.Matrix4).copy(this.prevViewProj);
+        u.uAmount.value = 0.6 * this.mbStrength;
+        this.motionPass.render(r, this.motionRT);
+        srcTex = this.motionRT.texture;
+        passes++;
+      }
+    }
+
+    // ---- 6. veil chain (DOF source + veiling glare + exposure metering) --
+    {
+      const u = this.downPass.u;
+      u.tInput.value = srcTex;
+      (u.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
+      this.downPass.render(r, this.veilA);
+      const b = this.blurPass.u;
+      b.tInput.value = this.veilA.texture;
+      (b.uDir.value as THREE.Vector2).set(1 / this.veilA.width, 0);
+      this.blurPass.render(r, this.veilB);
+      b.tInput.value = this.veilB.texture;
+      (b.uDir.value as THREE.Vector2).set(0, 1 / this.veilA.height);
+      this.blurPass.render(r, this.veilA);
+      passes += 3;
+    }
+
+    // ---- 7. bloom (Karis bright-pass → 4-mip down → tent up) ------------
+    if (this.enabled.bloom && this.bloomDown.length) {
+      const bp = this.brightPass.u;
+      bp.tInput.value = srcTex;
+      (bp.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
+      this.brightPass.render(r, this.bloomDown[0]);
+      for (let i = 1; i < this.bloomDown.length; i++) {
+        const u = this.bloomDownPass.u;
+        u.tInput.value = this.bloomDown[i - 1].texture;
+        (u.uTexel.value as THREE.Vector2).set(
+          1 / this.bloomDown[i - 1].width, 1 / this.bloomDown[i - 1].height);
+        this.bloomDownPass.render(r, this.bloomDown[i]);
+      }
+      const last = this.bloomDown.length - 1;
+      for (let i = last - 1; i >= 0; i--) {
+        const u = this.bloomUpPass.u;
+        const lower = i === last - 1 ? this.bloomDown[last] : this.bloomUp[i + 1];
+        u.tLower.value = lower.texture;
+        u.tSame.value = this.bloomDown[i].texture;
+        (u.uTexel.value as THREE.Vector2).set(1 / lower.width, 1 / lower.height);
+        this.bloomUpPass.render(r, this.bloomUp[i]);
+      }
+      passes += this.bloomDown.length * 2;
+
+      if (this.streakRT && this.bloomDown.length > 2) {
+        const u = this.streakPass.u;
+        u.tInput.value = this.bloomDown[2].texture;
+        (u.uTexel.value as THREE.Vector2).set(1 / this.bloomDown[2].width, 0);
+        this.streakPass.render(r, this.streakRT);
+        passes++;
+      }
+    }
+
+    // ---- 8. exposure (1×1, GPU-side eye adaptation) ----------------------
+    {
+      const u = this.exposurePass.u;
+      u.tSmall.value = this.veilA.texture;
+      u.tPrev.value = this.expA.texture;
+      u.uDt.value = Math.min(dt, 0.1);
+      u.uComp.value = this.exposureComp;
+      u.uValid.value = this.historyValid ? 1 : 0;
+      this.exposurePass.render(r, this.expB);
+      const t = this.expA; this.expA = this.expB; this.expB = t;
+      passes++;
+    }
+
+    // ---- 9. composite to the backbuffer ---------------------------------
+    {
+      const u = this.compositePass.u;
+      u.tInput.value = srcTex;
+      u.tBloom.value = this.enabled.bloom && this.bloomUp.length ? this.bloomUp[0].texture : null;
+      u.tStreak.value = this.streakRT ? this.streakRT.texture : null;
+      u.tVeil.value = this.veilA.texture;
+      u.tAO.value = aoTex;
+      u.tVol.value = volTex;
+      u.tDepth.value = this.depthTex;
+      u.tExposure.value = this.expA.texture;
+      (u.uTexel.value as THREE.Vector2).set(1 / this.w, 1 / this.h);
+      (u.uClip.value as THREE.Vector2).set(camera.near, camera.far);
+      u.uTime.value = statics.time;
+      u.uFrame.value = frameMod;
+      u.uStatic.value = statics.level;
+      u.uGlimpse.value = statics.glimpse;
+      u.uDesat.value = statics.desat;
+      u.uWetness.value = statics.wetness ?? 0;
+      u.uViewfinder.value = statics.viewfinder ?? 0;
+      this.compositePass.render(r, null);
+      passes++;
+    }
+
+    // ---- bookkeeping ----------------------------------------------------
+    this.prevViewProj.copy(this.viewProj);
+    this.historyValid = true;
+    camera.clearViewOffset();
+    camera.updateProjectionMatrix();
+    this.timer.end();
+    this.gpuStats.calls = r.info.render.calls;
+    this.gpuStats.triangles = r.info.render.triangles;
+    this.gpuStats.gpuMs = this.timer.lastMs;
+    this.gpuStats.passes = passes;
+  }
+
+  /**
+   * Dynamic resolution + feature effort. Two knobs, both hysteretic: pixels
+   * first (cheap, invisible-ish thanks to CAS), then sample counts.
+   */
+  adaptResolution(frameMs: number, now: number): void {
+    this.frameCostEma = this.frameCostEma * 0.94 + frameMs * 0.06;
+    if (now - this.lastAdjust < 1.2) return;
+    const over = this.frameCostEma > 19.5;
+    const under = this.frameCostEma < 12.5;
+    if (over) {
+      if (this.renderScale > this.minScale) {
+        this.renderScale = Math.max(this.minScale, this.renderScale - 0.1);
+        this.resize(this.cw, this.ch);
+      } else if (this.effortBias > 0.5) {
+        this.effortBias = Math.max(0.5, this.effortBias - 0.25);
+        this.volPass.define('VOL_STEPS', this.effortBias < 0.75 ? 8 : (this.spec.volumetric >= 2 ? 12 : 10));
+      }
+      this.lastAdjust = now;
+    } else if (under) {
+      if (this.effortBias < 1) {
+        this.effortBias = Math.min(1, this.effortBias + 0.25);
+        this.volPass.define('VOL_STEPS', this.spec.volumetric >= 2 ? 16 : 10);
+      } else if (this.renderScale < this.maxScale) {
+        this.renderScale = Math.min(this.maxScale, this.renderScale + 0.05);
+        this.resize(this.cw, this.ch);
+      }
+      this.lastAdjust = now;
+    }
+  }
+
+  /** Tuning hooks used by the game director (weather, fear, viewfinder). */
+  setGrade(opts: {
+    bloom?: number; streak?: number; volumetric?: number; ao?: number;
+    grain?: number; vignette?: number; dofRange?: [number, number]; dof?: number;
+  }): void {
+    const u = this.compositePass.u;
+    if (opts.bloom !== undefined) u.uBloomStrength.value = opts.bloom;
+    if (opts.streak !== undefined) u.uStreakStrength.value = opts.streak;
+    if (opts.volumetric !== undefined) u.uVolStrength.value = opts.volumetric;
+    if (opts.ao !== undefined) u.uAoStrength.value = opts.ao;
+    if (opts.grain !== undefined) u.uGrain.value = opts.grain;
+    if (opts.vignette !== undefined) u.uVignette.value = opts.vignette;
+    if (opts.dof !== undefined) u.uDofStrength.value = opts.dof;
+    if (opts.dofRange) (u.uDofRange.value as THREE.Vector2).set(opts.dofRange[0], opts.dofRange[1]);
+  }
+
+  dispose(): void {
+    this.disposeTargets();
+    this.aoPass.dispose(); this.aoResolve.dispose();
+    this.volPass.dispose(); this.volResolve.dispose();
+    this.taaPass.dispose(); this.motionPass.dispose();
+    this.downPass.dispose(); this.blurPass.dispose();
+    this.brightPass.dispose(); this.bloomDownPass.dispose(); this.bloomUpPass.dispose();
+    this.streakPass.dispose(); this.exposurePass.dispose(); this.compositePass.dispose();
+  }
 }
