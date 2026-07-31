@@ -515,6 +515,7 @@ class StaticGame {
       this.menu.setPerf(
         `FPS ${st.fps.toFixed(0)}  avg ${(st.avg * 1000).toFixed(1)}ms\n` +
         `p95 ${(st.p95 * 1000).toFixed(1)}ms  worst ${(st.worst * 1000).toFixed(1)}ms\n` +
+        `upd ${st.updateMs.toFixed(2)}ms  ren ${st.renderMs.toFixed(2)}ms\n` +
         `scale ${this.pipeline.renderScale.toFixed(2)}  det ${snap.detection.toFixed(2)}\n` +
         `state ${snap.state}  dist ${snap.distToPlayer.toFixed(0)}m`);
     }
