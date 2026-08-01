@@ -47,7 +47,7 @@ export class EnvironmentProbe {
     const prevTarget = this.renderer.getRenderTarget();
     this.cubeCam.update(this.renderer, this.probeScene);
     const prev = this.texture;
-    this.texture = this.pmrem.fromCubemap(this.cubeRT).texture;
+    this.texture = this.pmrem.fromCubemap(this.cubeRT.texture).texture;
     prev?.dispose();
     this.renderer.setRenderTarget(prevTarget);
     return this.texture;
