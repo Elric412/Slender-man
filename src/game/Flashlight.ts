@@ -35,7 +35,10 @@ export class Flashlight {
     this.light.shadow.camera.near = 0.3;
     this.light.shadow.camera.far = 60;
     this.light.shadow.bias = -0.002;
-    this.light.shadow.normalBias = 0.02;
+    this.light.shadow.normalBias = 0.08; // §1c: raise from 0.02 — kills crawl
+    // §1c: freeze the shadow camera's up vector (light-space roll) so the
+    // shadow texel grid doesn't rotate/swim as the player looks around.
+    this.light.shadow.camera.up.set(0, 0, 1);
     this.light.target = this.target;
     scene.add(this.light, this.target);
 

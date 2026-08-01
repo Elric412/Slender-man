@@ -71,16 +71,27 @@ export class MapGenerator {
     this.group.add(mesh);
 
     // puddles — low-roughness dark discs that catch moon/flashlight
+    // §1c: raise the standoff 0.02 → 0.035, skip sloped spots (a flat disc
+    // intersects terrain on any gradient → z-fight shimmer while moving),
+    // and bias the puddle toward the camera via polygonOffset so it always
+    // wins the near-plane depth tie against the ground it rests on.
     const pr = this.rng.fork(31337);
     const puddleGeo = new THREE.CircleGeometry(1, 12);
     puddleGeo.rotateX(-Math.PI / 2);
+    this.mats.mudPuddle.polygonOffset = true;
+    this.mats.mudPuddle.polygonOffsetFactor = -2;
+    this.mats.mudPuddle.polygonOffsetUnits = -2;
     for (let i = 0; i < 40; i++) {
       const x = pr.range(-size / 2 + 20, size / 2 - 20);
       const z = pr.range(-size / 2 + 20, size / 2 - 20);
       const trailD = this.hf.trailDist(x, z);
       if (trailD > 14 || this.hf.inLake(x, z)) continue;
+      // slope check: flat discs need near-level ground
+      const h0 = this.hf.heightAt(x, z);
+      const slope = Math.abs(this.hf.heightAt(x + 1.2, z) - h0) + Math.abs(this.hf.heightAt(x, z + 1.2) - h0);
+      if (slope > 0.5) continue;
       const p = new THREE.Mesh(puddleGeo, this.mats.mudPuddle);
-      p.position.set(x, this.hf.heightAt(x, z) + 0.02, z);
+      p.position.set(x, h0 + 0.035, z);
       p.scale.set(pr.range(0.6, 2.2), 1, pr.range(0.6, 2.2));
       p.receiveShadow = true;
       this.group.add(p);
