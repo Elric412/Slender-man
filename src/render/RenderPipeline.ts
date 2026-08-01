@@ -259,6 +259,7 @@ export class RenderPipeline {
     this.applySpecFlags(spec);
     this.timer = new GpuTimer(renderer);
     this.buildPasses();
+    this.syncDefines();
   }
 
   private applySpecFlags(spec: QualitySpec): void {
@@ -704,8 +705,8 @@ export class RenderPipeline {
         vec3 b = texture(tInput, vUv + vec2(-uTexel.x,  uTexel.y)).rgb;
         vec3 c = texture(tInput, vUv + vec2( uTexel.x, -uTexel.y)).rgb;
         vec3 e = texture(tInput, vUv + vec2(-uTexel.x, -uTexel.y)).rgb;
-        float wa = 1.0 / (luma(a) + 1.0), wb = 1.0 / (luma(b) + 1.0);
-        float wc = 1.0 / (luma(c) + 1.0), we = 1.0 / (luma(e) + 1.0);
+        float wa = 1.0 / (luminance(a) + 1.0), wb = 1.0 / (luminance(b) + 1.0);
+        float wc = 1.0 / (luminance(c) + 1.0), we = 1.0 / (luminance(e) + 1.0);
         vec3 col = (a * wa + b * wb + c * wc + e * we) / max(wa + wb + wc + we, 1e-4);
         fragColor = vec4(prefilter(col), 1.0);
       }`, [GLSL_COLOR]), {
@@ -791,7 +792,7 @@ export class RenderPipeline {
           for (int x = 0; x < 6; x++){
             vec2 uv = (vec2(float(x), float(y)) + 0.5) / 6.0;
             float w = 1.0 - 0.55 * length(uv - 0.5) * 2.0;
-            sum += log(max(luma(texture(tSmall, uv).rgb), 2e-4)) * w;
+            sum += log(max(luminance(texture(tSmall, uv).rgb), 2e-4)) * w;
             n += w;
           }
         }
@@ -886,8 +887,8 @@ export class RenderPipeline {
 
         #ifdef USE_FXAA
         {
-          float lC = luma(col), lN = luma(nN), lS = luma(nS);
-          float lE = luma(nE), lW = luma(nW);
+          float lC = luminance(col), lN = luminance(nN), lS = luminance(nS);
+          float lE = luminance(nE), lW = luminance(nW);
           float range = max(max(lN, lS), max(lE, max(lW, lC))) - min(min(lN, lS), min(lE, min(lW, lC)));
           float amt = clamp((range - 0.05) * 3.5, 0.0, 0.65);
           col = mix(col, (nN + nS + nE + nW + col) * 0.2, amt);
@@ -897,7 +898,7 @@ export class RenderPipeline {
         // contrast-adaptive sharpening: recovers the detail dynamic-res eats
         {
           vec3 blur = (nN + nS + nE + nW) * 0.25;
-          float localContrast = clamp(luma(abs(col - blur)) * 6.0, 0.0, 1.0);
+          float localContrast = clamp(luminance(abs(col - blur)) * 6.0, 0.0, 1.0);
           col += (col - blur) * uSharpen * (1.0 - localContrast * 0.4);
           col = max(col, vec3(0.0));
         }
@@ -948,7 +949,7 @@ export class RenderPipeline {
         col = agx(col, sat, 1.0 + s * 0.06);
 
         // ---- filmic grade: cool shadows, warm speculars ----
-        float l = luma(col);
+        float l = luminance(col);
         vec3 shadowTint = col * vec3(0.90, 0.97, 1.14);
         vec3 lightTint  = col * vec3(1.07, 1.00, 0.90);
         col = mix(shadowTint, lightTint, smoothstep(0.22, 0.85, l));
@@ -1085,11 +1086,9 @@ export class RenderPipeline {
     this.taaA = this.taaB = null;
   }
 
-  setQuality(spec: QualitySpec): void {
-    this.spec = spec;
-    this.applySpecFlags(spec);
-    this.renderScale = Math.min(spec.renderScale, spec.tier === 'low' ? 0.85 : 1.0);
-    this.maxScale = Math.min(1.0, spec.tier === 'low' ? 0.85 : 1.0);
+  /** Push the active quality spec into shader `#define`s. */
+  private syncDefines(): void {
+    const spec = this.spec;
     this.aoPass.define('AO_DIRS', spec.aoQuality >= 2 ? 4 : 3);
     this.aoPass.define('AO_STEPS', spec.aoQuality >= 2 ? 4 : 3);
     this.volPass.define('VOL_STEPS', spec.volumetric >= 2 ? 16 : 10);
@@ -1103,11 +1102,19 @@ export class RenderPipeline {
     this.compositePass.define('USE_FXAA', !spec.taa);
     this.compositePass.u.uSharpen.value = spec.sharpen;
     this.motionPass.define('MB_TAPS', spec.tier === 'ultra' ? 7 : 5);
+  }
+
+  setQuality(spec: QualitySpec): void {
+    this.spec = spec;
+    this.applySpecFlags(spec);
+    this.renderScale = Math.min(spec.renderScale, spec.tier === 'low' ? 0.85 : 1.0);
+    this.maxScale = Math.min(1.0, spec.tier === 'low' ? 0.85 : 1.0);
+    this.syncDefines();
     // force reallocation for the new target set
     this.w = this.h = 0;
     this.resize(this.cw, this.ch);
   }
-// __RENDER__
+
   // ======================================================================
   // frame
   // ======================================================================
