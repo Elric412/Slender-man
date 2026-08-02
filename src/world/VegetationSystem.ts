@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { SeededRandom } from '../core/SeededRandom';
-import { MaterialLibrary } from './MaterialLibrary';
+import { MaterialLibrary, applyShaderPatch, registerShaderPatch, cloneMaterial } from './MaterialLibrary';
 import { HeightField } from './HeightField';
 
 /**
@@ -18,8 +18,24 @@ const windUniforms = {
   uWindDir: { value: new THREE.Vector2(0.8, 0.6) },
 };
 
+/**
+ * Vertex-shader wind sway, registered as a *named, composable* patch.
+ *
+ * Two things this buys over assigning `onBeforeCompile` directly:
+ *  1. **It composes.** Materials also carry detail-normal / wetness / macro
+ *     patches from the material library; a raw assignment would clobber them.
+ *  2. **It doesn't collide in the program cache.** three's default
+ *     `customProgramCacheKey` is `onBeforeCompile.toString()`, which is
+ *     *identical* for every amplitude — so a 0.12 trunk and a 0.55 canopy would
+ *     silently share one compiled program. The key encodes the amplitude.
+ *
+ * Wind is a two-octave travelling wave in world space (so neighbouring trees
+ * move in sympathy rather than in lockstep), scaled by a height factor so
+ * trunks pivot at the base and canopies whip.
+ */
 export function patchWindMaterial(mat: THREE.Material, ampMul: number): void {
-  mat.onBeforeCompile = (shader) => {
+  const amp = ampMul.toFixed(2);
+  const key = registerShaderPatch(`wind:${amp}`, () => (shader) => {
     shader.uniforms.uWindTime = windUniforms.uWindTime;
     shader.uniforms.uWindStrength = windUniforms.uWindStrength;
     shader.uniforms.uWindDir = windUniforms.uWindDir;
@@ -37,9 +53,10 @@ export function patchWindMaterial(mat: THREE.Material, ampMul: number): void {
         float sway = sin(uWindTime * 1.1 + wpos.x * 0.15 + wpos.z * 0.11)
                    + 0.5 * sin(uWindTime * 2.3 + wpos.z * 0.23);
         float hFactor = clamp(position.y * 0.22, 0.0, 1.4);
-        transformed.xz += uWindDir * sway * uWindStrength * ${ampMul.toFixed(2)} * hFactor;
+        transformed.xz += uWindDir * sway * uWindStrength * ${amp} * hFactor;
       }`);
-  };
+  });
+  applyShaderPatch(mat, key);
 }
 
 export function updateWind(w: WindState): void {
@@ -154,9 +171,10 @@ export class VegetationSystem {
     // Materials are shared per archetype (not cloned per chunk) to keep program
     // count and texture binds identical to before; only instance buffers split.
     for (let a = 0; a < 5; a++) {
-      const trunkMat = archetypes[a].mat.clone();
+      const trunkMat = cloneMaterial(archetypes[a].mat);
       patchWindMaterial(trunkMat, 0.12);
-      const folMat = (a === 2 || a === 3 ? this.mats.foliageDead : a === 4 ? this.mats.foliageDead.clone() : this.mats.foliage).clone();
+      // archetypes 2/3 are dead husks and 4 is birch (retinted below)
+      const folMat = cloneMaterial(a >= 2 ? this.mats.foliageDead : this.mats.foliage);
       if (a === 4) folMat.color = new THREE.Color(0x7d8a62); // pale sage birch leaves
       patchWindMaterial(folMat, 0.55);
       const folGeo = foliageGeos[a];
@@ -335,14 +353,14 @@ export class VegetationSystem {
     card.translate(0, 0.45, 0);
     const card2 = card.clone().rotateY(Math.PI / 2);
     const fernGeo = mergeGeos([card, card2]);
-    const fernMat = this.mats.foliageDead.clone();
+    const fernMat = cloneMaterial(this.mats.foliageDead);
     patchWindMaterial(fernMat, 0.4);
 
     // dead grass tufts — thin vertical quads for ground texture at close range
     const tuftCard = new THREE.PlaneGeometry(0.5, 0.42);
     tuftCard.translate(0, 0.2, 0);
     const tuftGeo = mergeGeos([tuftCard, tuftCard.clone().rotateY(Math.PI / 2)]);
-    const tuftMat = this.mats.foliageDead.clone();
+    const tuftMat = cloneMaterial(this.mats.foliageDead);
     tuftMat.color = new THREE.Color(0x6e6242);
     patchWindMaterial(tuftMat, 0.3);
 

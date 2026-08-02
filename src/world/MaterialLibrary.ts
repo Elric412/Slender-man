@@ -142,7 +142,7 @@ class PeriodicNoise {
     for (let o = 0; o < octaves; o++) {
       const n = 1 - Math.abs(this.value(x * f, y * f, Math.max(1, Math.round(period * f))) * 2 - 1);
       sum += n * n * amp;
-      norm += amp; amp *= gain; f *= lac2;
+      norm += amp; amp *= gain; f *= 2;
     }
     return sum / norm;
   }
@@ -173,7 +173,7 @@ class PeriodicNoise {
     return this.fbm(x + wx * amount, y + wy * amount, period, octaves);
   }
 }
-const lac2 = 2;
+
 
 // ============================================================================
 // texture assembly
@@ -181,7 +181,7 @@ const lac2 = 2;
 
 interface SurfaceBuffers {
   size: number;
-  albedo: Uint8Array;   // RGBA
+  albedo: Uint8Array<ArrayBuffer>;   // RGBA
   height: Float32Array; // 0..1
   ao: Float32Array;     // 0..1
   rough: Float32Array;  // 0..1
@@ -203,7 +203,7 @@ function allocSurface(size: number): SurfaceBuffers {
 }
 
 function dataTexture(
-  data: Uint8Array, size: number,
+  data: Uint8Array<ArrayBuffer>, size: number,
   opts: { srgb?: boolean; repeat?: number | [number, number]; anisotropy?: number },
 ): THREE.DataTexture {
   const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
@@ -220,7 +220,7 @@ function dataTexture(
 }
 
 /** Sobel-ish height → tangent-space normal, wrapping at the edges. */
-function heightToNormalData(height: Float32Array, size: number, strength: number): Uint8Array {
+function heightToNormalData(height: Float32Array, size: number, strength: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(size * size * 4);
   const at = (x: number, y: number) => height[(((y % size) + size) % size) * size + (((x % size) + size) % size)];
   for (let y = 0; y < size; y++) {
@@ -263,7 +263,7 @@ function bakeCavityAO(height: Float32Array, ao: Float32Array, size: number, radi
   }
 }
 
-function packORM(s: SurfaceBuffers): Uint8Array {
+function packORM(s: SurfaceBuffers): Uint8Array<ArrayBuffer> {
   const n = s.size * s.size;
   const out = new Uint8Array(n * 4);
   for (let i = 0; i < n; i++) {
@@ -370,24 +370,31 @@ function translucencyPatch(amount: number): string {
         #if NUM_SPOT_LIGHTS > 0
         #pragma unroll_loop_start
         for (int i = 0; i < NUM_SPOT_LIGHTS; i++) {
-          vec3 lVec = spotLights[i].position - geometryPosition;
-          float lDist = length(lVec);
-          vec3 L = lVec / max(lDist, 1e-4);
-          float atten = getSpotAttenuation(spotLights[i].coneCos, spotLights[i].penumbraCos, dot(L, spotLights[i].direction))
-                      * getDistanceAttenuation(lDist, spotLights[i].distance, spotLights[i].decay);
-          float back = clamp(-dot(geometryNormal, L), 0.0, 1.0);
-          float wrapd = clamp((dot(geometryNormal, L) + 0.6) / 1.6, 0.0, 1.0);
-          reflectedLight.directDiffuse += spotLights[i].color * atten *
-            (back * 0.75 + wrapd * 0.20) * transAmt * diffuseColor.rgb;
+          // NOTE: three's unroller *strips* the for-header and its braces and
+          // pastes the body N times, so every iteration must open its own scope
+          // or the second copy redefines lVec/L/atten and the shader won't link.
+          {
+            vec3 lVec = spotLights[i].position - geometryPosition;
+            float lDist = length(lVec);
+            vec3 L = lVec / max(lDist, 1e-4);
+            float atten = getSpotAttenuation(spotLights[i].coneCos, spotLights[i].penumbraCos, dot(L, spotLights[i].direction))
+                        * getDistanceAttenuation(lDist, spotLights[i].distance, spotLights[i].decay);
+            float back = clamp(-dot(geometryNormal, L), 0.0, 1.0);
+            float wrapd = clamp((dot(geometryNormal, L) + 0.6) / 1.6, 0.0, 1.0);
+            reflectedLight.directDiffuse += spotLights[i].color * atten *
+              (back * 0.75 + wrapd * 0.20) * transAmt * diffuseColor.rgb;
+          }
         }
         #pragma unroll_loop_end
         #endif
         #if NUM_DIR_LIGHTS > 0
         #pragma unroll_loop_start
         for (int i = 0; i < NUM_DIR_LIGHTS; i++) {
-          vec3 L = directionalLights[i].direction;
-          float back = clamp(-dot(geometryNormal, L), 0.0, 1.0);
-          reflectedLight.directDiffuse += directionalLights[i].color * back * 0.35 * transAmt * diffuseColor.rgb;
+          {
+            vec3 L = directionalLights[i].direction;
+            float back = clamp(-dot(geometryNormal, L), 0.0, 1.0);
+            reflectedLight.directDiffuse += directionalLights[i].color * back * 0.35 * transAmt * diffuseColor.rgb;
+          }
         }
         #pragma unroll_loop_end
         #endif
