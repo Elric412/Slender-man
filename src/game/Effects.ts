@@ -1,28 +1,46 @@
 import * as THREE from 'three';
 import { HeightField } from '../world/HeightField';
 import { SeededRandom } from '../core/SeededRandom';
+import { SoftPoints, RainStreaks } from '../render/Particles';
 
 /**
- * Atmosphere extras: ground fog wisps (drifting, height-falloff), fireflies,
- * and light rain streaks. All pooled, zero per-frame allocation.
+ * Atmosphere extras: ground fog wisps (drifting, height-falloff), fireflies and
+ * rain. All pooled, zero per-frame allocation.
+ *
+ * Both particle systems used to be `THREE.PointsMaterial` with
+ * `sizeAttenuation`, which draws *hard-edged squares* whose pixel size explodes
+ * as a particle nears the eye — the same defect that turned flashlight dust
+ * into white blocks. Fireflies now go through `SoftPoints` (clamped
+ * `gl_PointSize`, radial falloff, near fade) and rain became `RainStreaks`
+ * (line segments whose length tracks fall speed), which reads as motion instead
+ * of confetti and costs one draw call.
  */
 export class Effects {
   private fogMat!: THREE.ShaderMaterial;
   private fogChunks: THREE.Mesh[] = [];
-  private fireflies!: THREE.Points;
+  private fogGeo!: THREE.PlaneGeometry;
+  private fireflies!: SoftPoints;
   private ffPos!: Float32Array;
   private ffBase!: Float32Array;
-  private rain: THREE.Points | null = null;
-  private rainPos: Float32Array | null = null;
-  private rainVel: Float32Array | null = null;
+  private ffPhase!: Float32Array;
+  private rain: RainStreaks | null = null;
   rainOn = false;
   private rng = new SeededRandom(0xEF6C7);
-  private count: number;
+  private rainBudget: number;
+  private projH = 1080;
+  private projFov = Math.PI / 3;
 
   constructor(private scene: THREE.Scene, private hf: HeightField, fogWispCount: number, particleBudget: number) {
-    this.count = fogWispCount;
+    this.rainBudget = THREE.MathUtils.clamp(Math.round(particleBudget * 0.8), 160, 900);
     this.buildFog(fogWispCount);
     this.buildFireflies(Math.min(220, particleBudget));
+  }
+
+  /** Keep sprite sizing physically correct across resize / FOV change. */
+  setProjection(renderHeightPx: number, fovYRadians: number): void {
+    this.projH = renderHeightPx;
+    this.projFov = fovYRadians;
+    this.fireflies?.setProjection(renderHeightPx, fovYRadians);
   }
 
   private buildFog(count: number): void {
@@ -42,16 +60,18 @@ export class Effects {
         void main(){
           vec2 c = vUv - 0.5;
           float r = length(c) * 2.0;
+          // two octaves drifting against each other so the sheet churns
           float n = noise(vUv * 5.0 + uTime * 0.05) * 0.6 + noise(vUv * 11.0 - uTime * 0.03) * 0.4;
           float a = smoothstep(1.0, 0.15, r) * n * 0.14;
-          gl_FragColor = vec4(vec3(0.55, 0.62, 0.72), a);
+          if (a < 0.002) discard;
+          gl_FragColor = vec4(vec3(0.55, 0.62, 0.72) * a, a);   // premultiplied
         }`,
     });
-    const geo = new THREE.PlaneGeometry(26, 26);
-    geo.rotateX(-Math.PI / 2);
+    this.fogGeo = new THREE.PlaneGeometry(26, 26);
+    this.fogGeo.rotateX(-Math.PI / 2);
     const size = this.hf.layout.size;
     for (let i = 0; i < count; i++) {
-      const m = new THREE.Mesh(geo, this.fogMat);
+      const m = new THREE.Mesh(this.fogGeo, this.fogMat);
       const x = this.rng.range(-size / 2 + 30, size / 2 - 30);
       const z = this.rng.range(-size / 2 + 30, size / 2 - 30);
       m.position.set(x, this.hf.heightAt(x, z) + this.rng.range(0.4, 1.4), z);
@@ -65,45 +85,41 @@ export class Effects {
   private buildFireflies(count: number): void {
     this.ffPos = new Float32Array(count * 3);
     this.ffBase = new Float32Array(count * 3);
+    this.ffPhase = new Float32Array(count);
     const size = this.hf.layout.size;
     for (let i = 0; i < count; i++) {
       const x = this.rng.range(-size / 2 + 20, size / 2 - 20);
       const z = this.rng.range(-size / 2 + 20, size / 2 - 20);
-      this.ffBase[i * 3] = x; this.ffBase[i * 3 + 1] = this.hf.heightAt(x, z) + this.rng.range(0.5, 2.5); this.ffBase[i * 3 + 2] = z;
+      this.ffBase[i * 3] = x;
+      this.ffBase[i * 3 + 1] = this.hf.heightAt(x, z) + this.rng.range(0.5, 2.5);
+      this.ffBase[i * 3 + 2] = z;
+      this.ffPhase[i] = this.rng.range(0, Math.PI * 2);
     }
     this.ffPos.set(this.ffBase);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(this.ffPos, 3));
-    const mat = new THREE.PointsMaterial({
-      color: 0xb8d97a, size: 0.05, transparent: true, opacity: 0.8,
-      blending: THREE.AdditiveBlending, depthWrite: false });
-    this.fireflies = new THREE.Points(geo, mat);
-    this.fireflies.frustumCulled = false;
-    this.scene.add(this.fireflies);
+    this.fireflies = new SoftPoints(geo, {
+      color: 0xb8d97a,
+      worldSize: 0.035,
+      pixelRange: [1.0, 3.5],   // <- the blob clamp
+      nearFade: [0.8, 3.0],
+      farFade: [45, 80],
+      opacity: 0.7,
+      falloff: 1.4,
+      additive: true,
+    });
+    this.fireflies.setProjection(this.projH, this.projFov);
+    this.scene.add(this.fireflies.points);
   }
 
   setRain(on: boolean): void {
     if (on === this.rainOn) return;
     this.rainOn = on;
     if (on && !this.rain) {
-      const count = 500;
-      this.rainPos = new Float32Array(count * 3);
-      this.rainVel = new Float32Array(count);
-      for (let i = 0; i < count; i++) {
-        this.rainPos[i * 3] = (this.rng.next() - 0.5) * 30;
-        this.rainPos[i * 3 + 1] = this.rng.next() * 14;
-        this.rainPos[i * 3 + 2] = (this.rng.next() - 0.5) * 30;
-        this.rainVel[i] = 9 + this.rng.next() * 4;
-      }
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(this.rainPos, 3));
-      const mat = new THREE.PointsMaterial({
-        color: 0x9fb4c8, size: 0.06, transparent: true, opacity: 0.4, depthWrite: false });
-      this.rain = new THREE.Points(geo, mat);
-      this.rain.frustumCulled = false;
-      this.scene.add(this.rain);
+      this.rain = new RainStreaks(this.rainBudget, 16, 14);
+      this.scene.add(this.rain.lines);
     }
-    if (this.rain) this.rain.visible = on;
+    if (this.rain) this.rain.lines.visible = on;
   }
 
   update(dt: number, time: number, camX: number, camY: number, camZ: number): void {
@@ -117,30 +133,32 @@ export class Effects {
       const dx = m.position.x - camX, dz = m.position.z - camZ;
       m.visible = (dx * dx + dz * dz) < 130 * 130;
     }
-    // fireflies wander around base positions
-    if (this.fireflies.visible) {
+
+    // Fireflies wander around fixed base positions, pulsing out of phase.
+    if (this.fireflies.points.visible) {
       const p = this.ffPos, b = this.ffBase;
-      for (let i = 0; i < p.length; i += 3) {
-        p[i] = b[i] + Math.sin(time * 0.6 + i) * 1.2;
-        p[i + 1] = b[i + 1] + Math.sin(time * 0.9 + i * 1.7) * 0.5;
-        p[i + 2] = b[i + 2] + Math.cos(time * 0.5 + i * 0.9) * 1.2;
+      for (let i = 0, k = 0; i < p.length; i += 3, k++) {
+        const ph = this.ffPhase[k];
+        p[i] = b[i] + Math.sin(time * 0.6 + ph) * 1.2;
+        p[i + 1] = b[i + 1] + Math.sin(time * 0.9 + ph * 1.7) * 0.5;
+        p[i + 2] = b[i + 2] + Math.cos(time * 0.5 + ph * 0.9) * 1.2;
       }
-      (this.fireflies.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
-      const fm = this.fireflies.material as THREE.PointsMaterial;
-      fm.opacity = 0.45 + Math.sin(time * 2.3) * 0.25;
+      (this.fireflies.points.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+      this.fireflies.fade = 0.55 + Math.sin(time * 2.3) * 0.3;
     }
-    // rain follows camera
-    if (this.rain && this.rain.visible && this.rainPos && this.rainVel) {
-      const p = this.rainPos;
-      for (let i = 0; i < this.rainVel.length; i++) {
-        p[i * 3 + 1] -= this.rainVel[i] * dt;
-        if (p[i * 3 + 1] < 0) {
-          p[i * 3] = camX + (this.rng.next() - 0.5) * 30;
-          p[i * 3 + 1] = 12 + this.rng.next() * 3;
-          p[i * 3 + 2] = camZ + (this.rng.next() - 0.5) * 30;
-        }
-      }
-      (this.rain.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+
+    if (this.rain && this.rain.lines.visible) {
+      this.rain.update(dt, camX, camY, camZ, 1.6, 0.9);
     }
+  }
+
+  dispose(): void {
+    for (const m of this.fogChunks) this.scene.remove(m);
+    this.fogChunks.length = 0;
+    this.fogGeo.dispose();
+    this.fogMat.dispose();
+    this.scene.remove(this.fireflies.points);
+    this.fireflies.dispose();
+    if (this.rain) { this.scene.remove(this.rain.lines); this.rain.dispose(); }
   }
 }
