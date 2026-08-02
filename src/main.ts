@@ -1,8 +1,7 @@
 import * as THREE from 'three';
 import { GameLoop } from './core/GameLoop';
 import { Input } from './core/Input';
-import { loadSettings, probeQuality, QUALITY_SPECS, QualitySpec, Settings } from './core/Config';
-import { SeededRandom } from './core/SeededRandom';
+import { loadSettings, probeQuality, probeRenderer, QUALITY_SPECS, QualitySpec, Settings } from './core/Config';
 import { HeightField } from './world/HeightField';
 import { MaterialLibrary } from './world/MaterialLibrary';
 import { MapGenerator } from './world/MapGenerator';
@@ -11,6 +10,7 @@ import { CollisionWorld } from './physics/Collision';
 import { NavWorld } from './ai/NavWorld';
 import { EntityBrain, EntitySnapshot } from './ai/EntityBrain';
 import { RenderPipeline, StaticState } from './render/RenderPipeline';
+import { EnvironmentProbe } from './render/EnvironmentProbe';
 import { Sky } from './render/Sky';
 import { Player } from './game/Player';
 import { Flashlight } from './game/Flashlight';
@@ -27,11 +27,24 @@ type GameState = 'loading' | 'title' | 'playing' | 'paused' | 'ending' | 'escape
 
 const frame = (): Promise<void> => new Promise(r => requestAnimationFrame(() => r()));
 
+/**
+ * Weather director state. Rain doesn't just spawn particles — it drives a
+ * *coupled* look change: surfaces wet down (albedo darkens, roughness
+ * collapses, up-facing planes glaze over), fog thickens and drops, volumetric
+ * in-scatter rises, bloom widens on the wet specular, and the exposure goal
+ * dips because everything reflects less diffuse light back at you.
+ */
+interface Weather {
+  rain: number;      // 0..1 rainfall intensity (target)
+  wetness: number;   // 0..1 accumulated surface wetness (lags rain heavily)
+}
+
 class StaticGame {
   private canvas: HTMLCanvasElement;
   private renderer!: THREE.WebGLRenderer;
   private scene!: THREE.Scene;
   private pipeline!: RenderPipeline;
+  private probe: EnvironmentProbe | null = null;
   private loop = new GameLoop();
   private menu: Menu;
   private settings: Settings;
@@ -60,7 +73,10 @@ class StaticGame {
   private runSeed = WORLD_SEED;
   private runTime = 0;
   private entitySnap: EntitySnapshot | null = null;
-  private staticState: StaticState = { level: 0, glimpse: 0, desat: 0.2, time: 0 };
+  private staticState: StaticState = {
+    level: 0, glimpse: 0, desat: 0.2, time: 0, viewfinder: 0, wetness: 0,
+  };
+  private weather: Weather = { rain: 0, wetness: 0 };
   private windDir = { x: 0.8, z: 0.6 };
   private rainTriggered = false;
   private flinchCooldown = 0;
@@ -70,6 +86,7 @@ class StaticGame {
   private perfVisible = false;
   private endKind: 'escaped' | 'taken' = 'taken';
   private started = false;
+  private vfWeight = 0;
 
   constructor() {
     this.canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
@@ -88,21 +105,31 @@ class StaticGame {
       canvas: this.canvas, antialias: false, powerPreference: 'high-performance',
       stencil: false,
     });
-    this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // grading happens in composite
+    // Everything upstream of the composite stays in scene-referred linear; the
+    // AgX display transform and the grade happen once, at the very end.
+    this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.autoUpdate = true;
     this.renderer.autoClear = true;
     this.handleResize();
+    if (import.meta.env.DEV) console.info('[STATIC] GPU:', probeRenderer());
     await frame();
 
     p(0.08, 'surveying terrain…');
     this.hf = new HeightField(WORLD_SEED);
     await frame();
 
-    p(0.16, 'growing materials…');
-    this.mats = new MaterialLibrary(WORLD_SEED);
-    await frame();
+    // Procedural PBR synthesis is the single heaviest boot stage. It yields a
+    // frame between each surface so the loading bar animates instead of
+    // freezing (and mobile Safari doesn't kill the tab for jank).
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    this.mats = await MaterialLibrary.create(WORLD_SEED, {
+      size: this.spec.textureSize,
+      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
+      onProgress: (f, label) => p(0.10 + f * 0.20, `synthesising ${label}…`),
+    });
 
     p(0.30, 'planting the forest…');
     this.col = new CollisionWorld(this.hf);
@@ -117,26 +144,35 @@ class StaticGame {
     this.buildScene();
     await frame();
 
-    p(0.66, 'waking the entity…');
+    p(0.62, 'measuring the sky…');
+    this.captureEnvironment();
+    await frame();
+
+    p(0.68, 'waking the entity…');
     this.entity = new EntityBrain(this.nav, this.col, this.hf, WORLD_SEED);
     this.rig = new PalebarkRig(this.mats);
     this.scene.add(this.rig.group);
     this.wireEntity();
     await frame();
 
-    p(0.74, 'charging flashlight…');
+    p(0.76, 'charging flashlight…');
     this.player = new Player(this.col, this.hf, this.mats);
     this.player.baseFov = this.settings.fov;
     this.scene.add(this.player.camera);
-    this.flashlight = new Flashlight(this.scene, this.player, Math.min(this.spec.shadowMapSize, 1024), this.hf);
+    this.flashlight = new Flashlight(
+      this.scene, this.player, Math.min(this.spec.shadowMapSize, 1024), this.hf,
+      this.spec.dustCount);
     this.wirePlayer();
     this.tapes = new TapeSystem(this.map, this.mats, this.scene, this.runSeed);
     this.effects = new Effects(this.scene, this.hf, this.spec.fogWisps, this.spec.particleCount);
     await frame();
 
-    p(0.82, 'warming shader pipelines…');
+    p(0.84, 'warming shader pipelines…');
     this.pipeline = new RenderPipeline(this.renderer, this.spec);
     this.pipeline.resize(this.renderer.domElement.width, this.renderer.domElement.height);
+    this.pipeline.setMoon(this.moon);
+    this.syncProjection();
+    this.applyWeatherLook(0, true);
     await this.warmup();
     await frame();
 
@@ -175,11 +211,49 @@ class StaticGame {
     this.moon.target = this.moonTarget;
     this.scene.add(this.moon, this.moonTarget);
 
-    // faint sky/ground bounce so shadows aren't pure black
+    // Faint sky/ground bounce. With an env probe active this drops right down —
+    // the IBL already supplies directional ambient, and doubling up flattens
+    // everything out.
     this.hemi = new THREE.HemisphereLight(0x141c2a, 0x05060a, 0.32);
     this.scene.add(this.hemi);
 
     this.scene.add(this.map.group);
+  }
+
+  /**
+   * Render the procedural sky into a PMREM probe and use it as `scene.environment`.
+   *
+   * This is what gives wet bark, puddles, the lens and the entity's skin a real
+   * specular response instead of a dead flat ambient. Cost is a handful of tiny
+   * draws once at boot.
+   */
+  private captureEnvironment(): void {
+    if (!this.spec.envProbe) {
+      this.hemi.intensity = 0.32;
+      return;
+    }
+    try {
+      this.probe = new EnvironmentProbe(this.renderer, this.spec.tier === 'ultra' ? 256 : 128);
+      this.sky.update(0);
+      this.scene.environment = this.probe.capture(this.sky.mesh);
+      this.scene.environmentIntensity = 0.55;
+      // the probe carries the ambient now — back the hemisphere fill way off
+      this.hemi.intensity = 0.12;
+      this.mats.setEnvIntensity(1);
+    } catch (err) {
+      console.warn('[STATIC] env probe unavailable, falling back to hemisphere fill', err);
+      this.probe = null;
+      this.hemi.intensity = 0.32;
+    }
+  }
+
+  /** Keep point-sprite sizing physically correct after resize / FOV change. */
+  private syncProjection(): void {
+    if (!this.player || !this.pipeline) return;
+    const h = this.renderer.domElement.height * this.pipeline.renderScale;
+    const fovY = THREE.MathUtils.degToRad(this.player.camera.fov);
+    this.flashlight?.setProjection(h, fovY);
+    this.effects?.setProjection?.(h, fovY);
   }
 
   /** compile every shader permutation up-front: flashlight on, rain, entity — no first-encounter hitch */
@@ -192,17 +266,24 @@ class StaticGame {
     }, 0);
     this.flashlight.on = true;
     this.flashlight.update(0.016, 0);
+    this.pipeline.setBeam(this.flashlight.light, 1);
     this.effects.setRain(true);
     this.tapes.spawnAll(this.runSeed);
     await frame();
     this.renderer.compile(this.scene, this.player.camera);
     await frame();
-    // one full pipeline render at tiny scale to compile post passes
+    // Two full pipeline renders: the first compiles every post program, the
+    // second exercises the temporal paths (TAA / AO / volumetric history) so
+    // their programs are hot too.
+    this.pipeline.render(this.scene, this.player.camera, this.staticState, 0.016);
+    await frame();
     this.pipeline.render(this.scene, this.player.camera, this.staticState, 0.016);
     await frame();
     this.effects.setRain(false);
     this.flashlight.on = false;
     this.flashlight.update(0.016, 0);
+    this.pipeline.setBeam(null, 0);
+    this.pipeline.invalidateHistory();
   }
 
   // ================================================================ wiring
@@ -276,6 +357,7 @@ class StaticGame {
       this.moon.shadow.mapSize.set(spec.shadowMapSize, spec.shadowMapSize);
       if (this.moon.shadow.map) { this.moon.shadow.map.dispose(); this.moon.shadow.map = null as unknown as THREE.WebGLRenderTarget; }
       this.flashlight.setShadowSize(Math.min(spec.shadowMapSize, 1024));
+      this.flashlight.setDustBudget(spec.dustCount);
       this.handleResize();
     } else {
       this.spec = spec;
@@ -292,6 +374,7 @@ class StaticGame {
       this.player.camera.aspect = w / h;
       this.player.camera.updateProjectionMatrix();
     }
+    this.syncProjection();
   }
 
   // ================================================================ state transitions
@@ -312,12 +395,17 @@ class StaticGame {
     this.runSeed = (WORLD_SEED ^ ((Date.now() & 0xffff) * 2654435761)) >>> 0;
     this.runTime = 0;
     this.rainTriggered = false;
+    this.weather.rain = 0;
+    this.weather.wetness = 0;
+    this.vfWeight = 0;
+    this.applyWeatherLook(0, true);
     this.subtitleQueue.length = 0;
     this.subtitleTimer = 0;
     this.fear.reset();
     this.player.reset(this.hf.layout.spawn.x, this.hf.layout.spawn.z);
     this.flashlight.battery = 1;
     if (this.flashlight.on) this.flashlight.toggle();
+    this.flashlight.warp();
     this.entity.respawnFar(this.player.pos);
     this.tapes.spawnAll(this.runSeed);
     this.tapes.onPickup = (zoneId, x, z) => this.onTapePickup(zoneId, x, z);
@@ -353,6 +441,7 @@ class StaticGame {
     this.loop.paused = false;
     this.menu.show('none');
     this.input.requestPointerLock();
+    this.pipeline.invalidateHistory();
   }
 
   private async capture(): Promise<void> {
@@ -395,6 +484,7 @@ class StaticGame {
     // weather turn partway through the run
     if (!this.rainTriggered && this.tapes.collected >= 3) {
       this.rainTriggered = true;
+      this.weather.rain = 1;
       this.effects.setRain(true);
       this.audio.setRain(true);
     }
@@ -417,13 +507,59 @@ class StaticGame {
     }
   }
 
-  // ================================================================ frame update
-  private staticInputFrame = {
-    moveX: 0, moveZ: 0, lookDX: 0, lookDY: 0, sprint: false, crouch: false,
-    vaultQueued: false, interactQueued: false, flashQueued: false, vfHeld: false,
-    lean: 0, pauseQueued: false,
-  };
+  // ================================================================ look director
+  /**
+   * Push the weather/fear state into every renderer knob at once.
+   *
+   * Wetness is deliberately *slow*: rain starts instantly but surfaces take
+   * ~25 s to fully glaze, and dry off over a couple of minutes. That lag is
+   * most of what sells rain as a physical event rather than a particle toggle.
+   */
+  private applyWeatherLook(dt: number, immediate = false): void {
+    const w = this.weather;
+    if (immediate) {
+      w.wetness = w.rain;
+    } else {
+      const rate = w.rain > w.wetness ? 1 / 25 : 1 / 130;   // wet fast-ish, dry slow
+      w.wetness += (w.rain - w.wetness) * Math.min(1, rate * dt * 8);
+    }
+    const wet = THREE.MathUtils.clamp(w.wetness, 0, 1);
 
+    this.mats?.setWetness(wet);
+    this.staticState.wetness = wet;
+
+    // Fog thickens and hugs the ground as the air saturates.
+    this.pipeline?.setFog({
+      density: 0.020 + wet * 0.016 + this.fear.value * 0.004,
+      baseHeight: 1.2 - wet * 0.5,
+      falloff: 9 - wet * 2.5,
+      turbulence: 0.55 + this.fear.value * 0.35,
+    });
+
+    // Grade: rain hazes highlights (more bloom, more in-scatter), fear crushes
+    // the vignette in and lifts grain.
+    const fear = this.fear.value;
+    this.pipeline?.setGrade({
+      bloom: 0.55 + wet * 0.28,
+      streak: 0.22 + wet * 0.18,
+      volumetric: 0.9 + wet * 0.45,
+      ao: 0.85 + fear * 0.2,
+      grain: 0.035 + fear * 0.09 + this.vfWeight * 0.05,
+      vignette: 0.30 + fear * 0.28 + this.vfWeight * 0.12,
+      dof: this.spec.dof ? 0.35 + this.vfWeight * 0.4 : 0,
+      dofRange: [2.4, 34 - wet * 8],
+    });
+
+    // Scene fog colour warms slightly under rain (sodium spill from the road).
+    if (this.scene.fog instanceof THREE.FogExp2) {
+      this.scene.fog.density = 0.0155 + wet * 0.004;
+    }
+    if (this.scene.environmentIntensity !== undefined) {
+      this.scene.environmentIntensity = 0.55 - wet * 0.18;
+    }
+  }
+
+  // ================================================================ frame update
   private update(dt: number, time: number): void {
     if (!this.started) { this.started = true; }
     if (this.state !== 'playing') return;
@@ -471,7 +607,7 @@ class StaticGame {
     }
 
     // ---- environment ----
-    const wind = 0.32 + this.fear.value * 0.85 + (this.rainTriggered ? 0.18 : 0);
+    const wind = 0.32 + this.fear.value * 0.85 + this.weather.wetness * 0.18;
     const wTime = time * 0.05;
     this.windDir.x = Math.cos(wTime) * 0.8 + 0.2;
     this.windDir.z = Math.sin(wTime * 0.7) * 0.8 + 0.2;
@@ -483,7 +619,7 @@ class StaticGame {
 
     // ---- moon follows player (stabilized shadow window w/ texel snapping) ----
     const dim = this.sky.moonDimAt(time);
-    this.moon.intensity = 0.55 * dim;
+    this.moon.intensity = 0.55 * dim * (1 - this.weather.wetness * 0.45); // cloud cover
     const texel = (60 * 2) / this.moon.shadow.mapSize.x;
     const sx = Math.round(this.player.pos.x / texel) * texel;
     const sz = Math.round(this.player.pos.z / texel) * texel;
@@ -504,8 +640,20 @@ class StaticGame {
       time,
     });
 
-    // ---- exposure goal: eyes adapt to flashlight / rain gloom ----
-    this.pipeline.setExposureGoal((this.flashlight.on ? 1.3 : 0.94) - (this.rainTriggered ? 0.06 : 0));
+    // ---- renderer hand-off: beam, weather, exposure ----
+    this.vfWeight += ((inp.vfHeld ? 1 : 0) - this.vfWeight) * Math.min(1, dt * 9);
+    this.pipeline.setBeam(
+      this.flashlight.beamStrength > 0.002 ? this.flashlight.light : null,
+      this.flashlight.beamStrength);
+    this.applyWeatherLook(dt);
+
+    // Eyes adapt: a lit beam raises the target, rain gloom lowers it, and the
+    // viewfinder's electronic gain pushes it up again.
+    this.pipeline.setExposureGoal(
+      0.94
+      + this.flashlight.beamStrength * 0.36
+      - this.weather.wetness * 0.08
+      + this.vfWeight * 0.10);
 
     // ---- HUD ----
     this.menu.update(dt);
@@ -513,19 +661,23 @@ class StaticGame {
     this.menu.setViewfinder(inp.vfHeld, 4);
     if (this.perfVisible) {
       const st = this.loop.stats();
+      const g = this.pipeline.gpuStats;
       this.menu.setPerf(
         `FPS ${st.fps.toFixed(0)}  avg ${(st.avg * 1000).toFixed(1)}ms\n` +
         `p95 ${(st.p95 * 1000).toFixed(1)}ms  worst ${(st.worst * 1000).toFixed(1)}ms\n` +
-        `upd ${st.updateMs.toFixed(2)}ms  ren ${st.renderMs.toFixed(2)}ms\n` +
-        `scale ${this.pipeline.renderScale.toFixed(2)}  det ${snap.detection.toFixed(2)}\n` +
-        `state ${snap.state}  dist ${snap.distToPlayer.toFixed(0)}m`);
+        `upd ${st.updateMs.toFixed(2)}  ren ${st.renderMs.toFixed(2)}  gpu ${g.gpuMs.toFixed(2)}ms\n` +
+        `draws ${g.calls}  tris ${(g.triangles / 1000).toFixed(0)}k  passes ${g.passes}\n` +
+        `scale ${this.pipeline.renderScale.toFixed(2)}  effort ${this.pipeline.effort.toFixed(2)}\n` +
+        `wet ${this.weather.wetness.toFixed(2)}  batt ${this.flashlight.battery.toFixed(2)}\n` +
+        `state ${snap.state}  det ${snap.detection.toFixed(2)}  dist ${snap.distToPlayer.toFixed(0)}m`);
     }
 
     // ---- static overlay state for composite ----
-    this.staticState.level = this.fear.staticLevel + (inp.vfHeld ? 0.12 : 0);
+    this.staticState.level = this.fear.staticLevel + this.vfWeight * 0.12;
     this.staticState.glimpse = this.fear.glimpse;
     this.staticState.desat = this.fear.desat;
     this.staticState.time = time;
+    this.staticState.viewfinder = this.vfWeight;
 
     // ---- win check: reach the fire road ----
     const ex = this.hf.layout.exit;
@@ -550,6 +702,7 @@ class StaticGame {
       gpuStats: () => this.pipeline ? { ...this.pipeline.gpuStats } : null,
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
+        this.flashlight?.warp();
         this.pipeline.invalidateHistory();
       },
       start: () => this.startRun(),
