@@ -45,13 +45,15 @@ vec3 viewPosFromDepth(vec2 uv, float d, mat4 invProj){
 }
 `;
 
-/** Colour space helpers: luminance, YCoCg (for TAA clipping), sRGB transfer. */
+/** Colour space helpers: YCoCg (for TAA clipping) + sRGB transfer.
+ *  No custom luminance helper here — three r170 unconditionally injects
+ *  `float luminance( const in vec3 )` (identical Rec.709 coefficients)
+ *  into every ShaderMaterial fragment prologue (WebGLProgram.js), so pass
+ *  bodies can just call `luminance(...)`. (A previous `float lum(vec3)`
+ *  helper both duplicated that and had backticks in its GLSL comment,
+ *  which terminated the template literal and broke the esbuild parse.)
+ */
 export const GLSL_COLOR = /* glsl */`
-// NOTE: named `lum`, not `luminance`. three injects its own
-// `float luminance(const in vec3)` into the fragment prefix of every non-raw
-// material, so a same-named helper here fails to link with a confusing
-// "parameter qualifiers" error.
-float lum(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 vec3 rgbToYCoCg(vec3 c){
   float y = 0.25 * c.r + 0.5 * c.g + 0.25 * c.b;
   float co = 0.5 * c.r - 0.5 * c.b;
@@ -105,7 +107,7 @@ vec3 agx(vec3 col, float saturation, float slope){
   col = max(col, 0.0);
   // "look": per-channel slope then luminance-preserving saturation
   col = pow(col, vec3(slope));
-  float l = lum(col);
+  float l = luminance(col); // three-injected helper (identical Rec.709)
   col = mix(vec3(l), col, saturation);
   return clamp(col, 0.0, 1.0);
 }
