@@ -95,6 +95,8 @@ export const surfaceUniforms = {
   uDetailNormal: { value: null as THREE.Texture | null },
   /** shared low-frequency mask used to break up tiling */
   uMacroMask: { value: null as THREE.Texture | null },
+  /** 0..1 scalar letting the zone system dial organic growth up/down globally */
+  uZoneMoss: { value: 1 },
 };
 
 // ============================================================================
