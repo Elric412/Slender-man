@@ -53,7 +53,7 @@ export class AudioBuses {
   private busUser = new Map<BusId, GainNode>();
   private busEq = new Map<BusId, { low: BiquadFilterNode; high: BiquadFilterNode }>();
   private busMeterNode = new Map<BusId, AnalyserNode>();
-  private busMeterBuf = new Map<BusId, Float32Array>();
+  private busMeterBuf = new Map<BusId, Float32Array<ArrayBuffer>>();
 
   /** entity→ambience ducking */
   private duckGain!: GainNode;

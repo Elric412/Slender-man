@@ -154,7 +154,9 @@ function patchCoat(mat: THREE.MeshPhysicalMaterial, u: PalebarkUniforms, own: { 
   mat.customProgramCacheKey = () => 'palebark-coat';
 }
 
-function makeTexture(data: Uint8Array, size: number, srgb: boolean, aniso: number): THREE.DataTexture {
+function makeTexture(
+  data: Uint8Array<ArrayBuffer>, size: number, srgb: boolean, aniso: number,
+): THREE.DataTexture {
   const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
   t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
   t.wrapS = t.wrapT = THREE.RepeatWrapping;

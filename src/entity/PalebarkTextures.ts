@@ -27,9 +27,9 @@ export type AtlasKind = 'skin' | 'coat';
 export interface MapSet {
   kind: AtlasKind;
   size: number;
-  albedo: Uint8Array;
-  normal: Uint8Array;
-  orm: Uint8Array;
+  albedo: Uint8Array<ArrayBuffer>;
+  normal: Uint8Array<ArrayBuffer>;
+  orm: Uint8Array<ArrayBuffer>;
 }
 
 /* ------------------------------------------------------------------ noise */
@@ -83,7 +83,7 @@ function band(v: number, a: number, b: number, f = 0.02): number {
 
 /* -------------------------------------------------------- height → normal */
 
-function heightToNormal(height: Float32Array, size: number, out: Uint8Array, strength: number): void {
+function heightToNormal(height: Float32Array, size: number, out: Uint8Array<ArrayBuffer>, strength: number): void {
   const idx = (x: number, y: number) => ((y + size) % size) * size + ((x + size) % size);
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
