@@ -1,14 +1,52 @@
 export type QualityTier = 'low' | 'medium' | 'high' | 'ultra';
 
+/**
+ * Audio settings are deliberately split per-bus rather than hidden behind one
+ * master fader. STATIC's audio design leans on genuinely uncomfortable
+ * techniques (low-frequency dread drone, granular approach textures, sudden
+ * cut-to-silence), and a player who is bothered by exactly one of those layers
+ * must be able to turn *that* layer down without losing the rest of the game.
+ * See `src/audio/README-AUDIO.md` §safety.
+ */
+export interface AudioSettings {
+  /** post-bus master trim, 0..1 */
+  master: number;
+  /** environmental bed (wind / insects / water / creaks / rain) */
+  ambience: number;
+  /** Palebark: approach texture, interference, stings, sub-bass dread */
+  entity: number;
+  /** player body: breath, heartbeat, footsteps, cloth, gear */
+  foley: number;
+  /** menus, tape handling, viewfinder */
+  ui: number;
+  /**
+   * Independent scale on *low-frequency-intensity* content (the ~20-45Hz dread
+   * layer). 0 disables it entirely. This is NOT the same as turning the entity
+   * bus down: the mid/high tension layers stay fully intact.
+   */
+  lowFreq: number;
+  /**
+   * Loudness-normalised comfort profile for night listening / phone speakers.
+   * Narrows dynamic range and lifts the quiet floor. Off by default — the
+   * default experience keeps its full quiet-to-shock contrast.
+   */
+  nightMode: boolean;
+  /** visual captions for hearing-dependent tension cues (deaf/HoH support) */
+  audioCues: boolean;
+}
+
 export interface Settings {
   quality: 'auto' | QualityTier;
-  volume: number;        // 0..1
+  volume: number;        // 0..1 — legacy master; mirrors audio.master
+  audio: AudioSettings;
   sensitivity: number;   // multiplier
   invertY: boolean;
   subtitles: boolean;
   colorblind: boolean;
   gyro: boolean;
   fov: number;
+  /** set once the player has acknowledged the content advisory */
+  advisoryAck: boolean;
 }
 
 export interface QualitySpec {
@@ -70,24 +108,53 @@ export const QUALITY_SPECS: Record<QualityTier, QualitySpec> = {
   },
 };
 
-const KEY = 'static.settings.v1';
+const KEY = 'static.settings.v2';
+const LEGACY_KEY = 'static.settings.v1';
 
 export function loadSettings(): Settings {
+  const def = defaultSettings();
   try {
-    const raw = localStorage.getItem(KEY);
-    if (raw) return { ...defaultSettings(), ...JSON.parse(raw) };
+    const raw = localStorage.getItem(KEY) ?? localStorage.getItem(LEGACY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Settings>;
+      // audio is a nested object — a shallow spread would drop new keys when
+      // migrating a v1 blob or a partially-written v2 blob.
+      const merged: Settings = { ...def, ...parsed, audio: { ...def.audio, ...(parsed.audio ?? {}) } };
+      // v1 only had a single `volume`; carry it into the master trim.
+      if (!parsed.audio && typeof parsed.volume === 'number') merged.audio.master = parsed.volume;
+      merged.volume = merged.audio.master;
+      return merged;
+    }
   } catch { /* ignore */ }
-  return defaultSettings();
+  return def;
 }
 
 export function saveSettings(s: Settings): void {
   try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* ignore */ }
 }
 
+export function defaultAudioSettings(): AudioSettings {
+  return {
+    master: 0.8,
+    ambience: 1.0,
+    entity: 1.0,
+    foley: 1.0,
+    ui: 0.9,
+    // Default sub-bass intensity is deliberately conservative. §11 of the audio
+    // brief: the documented infrasound discomfort effect is real, so the shipped
+    // default sits well under it and the player can zero it out.
+    lowFreq: 0.55,
+    nightMode: false,
+    audioCues: false,
+  };
+}
+
 export function defaultSettings(): Settings {
   return {
-    quality: 'auto', volume: 0.8, sensitivity: 1.0, invertY: false,
+    quality: 'auto', volume: 0.8, audio: defaultAudioSettings(),
+    sensitivity: 1.0, invertY: false,
     subtitles: true, colorblind: false, gyro: false, fov: 75,
+    advisoryAck: false,
   };
 }
 
