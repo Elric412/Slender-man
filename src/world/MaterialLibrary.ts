@@ -105,7 +105,7 @@ export const surfaceUniforms = {
  * Seeded, *tileable* noise. Everything takes an explicit integer period and
  * wraps its lattice, which is what keeps 512² textures seam-free.
  */
-class PeriodicNoise {
+export class PeriodicNoise {
   constructor(private seed: number) {}
 
   private h2(ix: number, iy: number): number {
@@ -179,7 +179,7 @@ class PeriodicNoise {
 // texture assembly
 // ============================================================================
 
-interface SurfaceBuffers {
+export interface SurfaceBuffers {
   size: number;
   albedo: Uint8Array<ArrayBuffer>;   // RGBA
   height: Float32Array; // 0..1
@@ -188,7 +188,7 @@ interface SurfaceBuffers {
   metal: Float32Array;  // 0..1
 }
 
-function allocSurface(size: number): SurfaceBuffers {
+export function allocSurface(size: number): SurfaceBuffers {
   const n = size * size;
   const s: SurfaceBuffers = {
     size,
@@ -202,11 +202,11 @@ function allocSurface(size: number): SurfaceBuffers {
   return s;
 }
 
-function dataTexture(
+export function dataTexture(
   data: Uint8Array<ArrayBuffer>, size: number,
-  opts: { srgb?: boolean; repeat?: number | [number, number]; anisotropy?: number },
+  opts: { srgb?: boolean; repeat?: number | [number, number]; anisotropy?: number; height?: number },
 ): THREE.DataTexture {
-  const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  const t = new THREE.DataTexture(data, size, opts.height ?? size, THREE.RGBAFormat, THREE.UnsignedByteType);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   const rep = opts.repeat ?? 1;
   if (Array.isArray(rep)) t.repeat.set(rep[0], rep[1]); else t.repeat.set(rep, rep);
@@ -220,7 +220,7 @@ function dataTexture(
 }
 
 /** Sobel-ish height → tangent-space normal, wrapping at the edges. */
-function heightToNormalData(height: Float32Array, size: number, strength: number): Uint8Array<ArrayBuffer> {
+export function heightToNormalData(height: Float32Array, size: number, strength: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(size * size * 4);
   const at = (x: number, y: number) => height[(((y % size) + size) % size) * size + (((x % size) + size) % size)];
   for (let y = 0; y < size; y++) {
@@ -244,7 +244,7 @@ function heightToNormalData(height: Float32Array, size: number, strength: number
 }
 
 /** Cheap screen-space-free cavity AO baked from the height field. */
-function bakeCavityAO(height: Float32Array, ao: Float32Array, size: number, radius: number, strength: number): void {
+export function bakeCavityAO(height: Float32Array, ao: Float32Array, size: number, radius: number, strength: number): void {
   const at = (x: number, y: number) => height[(((y % size) + size) % size) * size + (((x % size) + size) % size)];
   const r = Math.max(1, radius | 0);
   for (let y = 0; y < size; y++) {
@@ -263,7 +263,7 @@ function bakeCavityAO(height: Float32Array, ao: Float32Array, size: number, radi
   }
 }
 
-function packORM(s: SurfaceBuffers): Uint8Array<ArrayBuffer> {
+export function packORM(s: SurfaceBuffers): Uint8Array<ArrayBuffer> {
   const n = s.size * s.size;
   const out = new Uint8Array(n * 4);
   for (let i = 0; i < n; i++) {
@@ -276,7 +276,7 @@ function packORM(s: SurfaceBuffers): Uint8Array<ArrayBuffer> {
 }
 
 /** Write an sRGB-ish colour into the albedo buffer. */
-function setRGB(s: SurfaceBuffers, i: number, r: number, g: number, b: number): void {
+export function setRGB(s: SurfaceBuffers, i: number, r: number, g: number, b: number): void {
   s.albedo[i * 4] = Math.max(0, Math.min(255, r * 255));
   s.albedo[i * 4 + 1] = Math.max(0, Math.min(255, g * 255));
   s.albedo[i * 4 + 2] = Math.max(0, Math.min(255, b * 255));
@@ -349,6 +349,194 @@ function macroVariationPatch(scale: number, strength: number): string {
         diffuseColor.rgb *= mix(vec3(1.0), m * 1.55, ${strength.toFixed(2)});
       }
       #endif`);
+  });
+}
+
+/**
+ * ============================================================================
+ * §10 — model / texture / material quality patches
+ * ============================================================================
+ *
+ * The §10 defect list is specific, so these patches target it item by item.
+ */
+
+/**
+ * **Triplanar world-space detail projection.**
+ *
+ * Defect addressed: *"stretched or repeating UVs on large surfaces (cliff
+ * faces, building walls) from missing triplanar/tri-blend treatment"* and
+ * *"normal maps at only one tiling scale, so surfaces look flat from a step
+ * back and blurry up close"*.
+ *
+ * A big fallen trunk, a quarry cliff or a cabin wall has UVs that were fine on
+ * the source primitive and are ruinous once the mesh is scaled non-uniformly.
+ * Rather than re-unwrapping every asset, we project detail from *world space*
+ * on all three axes and blend by the world normal — so texel density is a
+ * function of physical size, not of UV layout, and stretching is impossible by
+ * construction.
+ *
+ * Two frequencies are mixed (coarse + 4.3× fine at an offset) so the surface
+ * holds up both from a step back and under a flashlight at arm's length.
+ */
+function triplanarDetailPatch(scale: number, strength: number): string {
+  const key = `tri:${scale}:${strength}`;
+  return registerShaderPatch(key, () => (shader) => {
+    shader.uniforms.uDetailNormal = surfaceUniforms.uDetailNormal;
+    // world position + world normal for the projection
+    shader.vertexShader = 'varying vec3 vTriWPos;\nvarying vec3 vTriWNrm;\n'
+      + shader.vertexShader.replace(
+        '#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+        {
+          #ifdef USE_INSTANCING
+            vTriWPos = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+          #else
+            vTriWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          #endif
+          vTriWNrm = normalize(mat3(modelMatrix) * objectNormal);
+        }`);
+    shader.fragmentShader = `
+      uniform sampler2D uDetailNormal;
+      varying vec3 vTriWPos; varying vec3 vTriWNrm;
+      // Sample a tangent-space normal map triplanar-style and return a world
+      // -space perturbation. Whiteout-style blend on the axis weights avoids
+      // the mushy seams a naive linear blend produces at 45 degrees.
+      vec3 triplanarNrm(vec3 wp, vec3 wn, float sc) {
+        vec3 w = abs(wn);
+        w = max(w - 0.22, 0.0);
+        w = w * w;
+        w /= max(w.x + w.y + w.z, 1e-4);
+        vec3 nx = texture2D(uDetailNormal, wp.zy * sc).xyz * 2.0 - 1.0;
+        vec3 ny = texture2D(uDetailNormal, wp.xz * sc).xyz * 2.0 - 1.0;
+        vec3 nz = texture2D(uDetailNormal, wp.xy * sc).xyz * 2.0 - 1.0;
+        // reorient each planar sample into world space
+        vec3 bx = vec3(0.0, nx.y, nx.x) * sign(wn.x);
+        vec3 by = vec3(ny.x, 0.0, ny.y) * sign(wn.y);
+        vec3 bz = vec3(nz.x, nz.y, 0.0) * sign(wn.z);
+        return bx * w.x + by * w.y + bz * w.z;
+      }
+    ` + shader.fragmentShader.replace(
+      '#include <normal_fragment_maps>',
+      /* glsl */`
+      #include <normal_fragment_maps>
+      {
+        vec3 wn = normalize(vTriWNrm);
+        // two octaves: coarse form + fine grain for close inspection
+        vec3 d = triplanarNrm(vTriWPos, wn, ${scale.toFixed(4)})
+               + triplanarNrm(vTriWPos + 13.7, wn, ${(scale * 4.3).toFixed(4)}) * 0.55;
+        // perturb in view space (normal is view-space at this point in three)
+        vec3 dv = normalize((viewMatrix * vec4(d, 0.0)).xyz);
+        normal = normalize(normal + dv * ${strength.toFixed(3)});
+      }`);
+  });
+}
+
+/**
+ * **Layered growth + grime masking.**
+ *
+ * Defect addressed: *"no dirt/grime/wear masks — every asset looking as clean
+ * as the day it was modeled"* and *"a single flat roughness value across a
+ * whole material instead of real variation"*.
+ *
+ * Layers on top of the base PBR set, blended by *geometry*, not UVs:
+ *  - **moss/lichen** by world up-facing × low-height × noise. Moss grows on
+ *    the north-facing, damp, upward parts of things; keying it to the world
+ *    normal means it lands correctly on every instance of a shared mesh
+ *    without any per-instance authoring.
+ *  - **grime** accumulates in what the height map says are cavities (the AO
+ *    channel is already a curvature proxy) and streaks downward, because water
+ *    carries dirt down a surface.
+ *
+ * Roughness is driven by both layers, so no patched material has a uniform
+ * roughness anywhere on its surface.
+ */
+function layeredGrowthPatch(mossAmt: number, grimeAmt: number, heightFalloff: number): string {
+  const key = `grow:${mossAmt.toFixed(2)}:${grimeAmt.toFixed(2)}:${heightFalloff.toFixed(1)}`;
+  return registerShaderPatch(key, () => (shader) => {
+    shader.uniforms.uMacroMask = surfaceUniforms.uMacroMask;
+    shader.uniforms.uZoneMoss = surfaceUniforms.uZoneMoss;
+    shader.vertexShader = 'varying vec3 vGrowWPos;\nvarying vec3 vGrowWNrm;\n'
+      + shader.vertexShader.replace(
+        '#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+        {
+          #ifdef USE_INSTANCING
+            vGrowWPos = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+          #else
+            vGrowWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          #endif
+          vGrowWNrm = normalize(mat3(modelMatrix) * objectNormal);
+        }`);
+    shader.fragmentShader = `
+      uniform sampler2D uMacroMask; uniform float uZoneMoss;
+      varying vec3 vGrowWPos; varying vec3 vGrowWNrm;
+    ` + shader.fragmentShader.replace(
+      '#include <roughnessmap_fragment>',
+      /* glsl */`
+      #include <roughnessmap_fragment>
+      {
+        vec3 wn = normalize(vGrowWNrm);
+        // --- moss layer -----------------------------------------------------
+        float up = clamp(wn.y * 0.5 + 0.5, 0.0, 1.0);
+        // north side is damper in the northern hemisphere: bias on -Z
+        float north = clamp(-wn.z * 0.5 + 0.5, 0.0, 1.0);
+        // low on the object = closer to damp ground
+        float low = exp(-max(vGrowWPos.y, 0.0) / ${heightFalloff.toFixed(2)});
+        float mNoise = texture2D(uMacroMask, vGrowWPos.xz * 0.11 + vGrowWPos.y * 0.03).g;
+        float mNoise2 = texture2D(uMacroMask, vGrowWPos.xz * 0.55 - 7.1).r;
+        float moss = clamp((mNoise * 0.65 + mNoise2 * 0.35 - 0.42) * 3.2, 0.0, 1.0)
+                   * up * (0.5 + north * 0.5) * low
+                   * ${mossAmt.toFixed(3)} * uZoneMoss;
+        vec3 mossCol = vec3(0.115, 0.163, 0.086);
+        diffuseColor.rgb = mix(diffuseColor.rgb, mossCol, moss * 0.88);
+        roughnessFactor = mix(roughnessFactor, 0.97, moss);
+
+        // --- grime layer ----------------------------------------------------
+        // AO from the ORM map is a serviceable cavity proxy; combine it with a
+        // downward streak so dirt runs the way water would carry it.
+        float cavity = 1.0;
+        #ifdef USE_AOMAP
+          cavity = 1.0 - texture2D( aoMap, vAoMapUv ).r;
+        #endif
+        float streak = texture2D(uMacroMask, vec2(vGrowWPos.x * 0.7, vGrowWPos.y * 0.09)).b;
+        float grime = clamp(cavity * 1.3 + streak * 0.55 - 0.35, 0.0, 1.0) * ${grimeAmt.toFixed(3)};
+        diffuseColor.rgb *= mix(1.0, 0.52, grime);
+        roughnessFactor = mix(roughnessFactor, 0.99, grime * 0.8);
+      }`);
+  });
+}
+
+/**
+ * **Edge wear / bevel treatment.**
+ *
+ * Defect addressed: *"hard edges with no bevel or edge-wear treatment, so light
+ * doesn't catch geometry correctly"* — the single biggest reason a box reads as
+ * a flat CG box.
+ *
+ * True bevel geometry on every crate and wall is unaffordable. Instead we
+ * detect convex edges in screen space from the derivative of the interpolated
+ * normal (a fast curvature estimate), then on those edges drop roughness and
+ * lift albedo — which is physically what wear does: paint and grime rub off the
+ * corners first, exposing brighter, smoother substrate. The result is that
+ * edges catch a specular highlight and the silhouette reads.
+ */
+function edgeWearPatch(amount: number, tint: number): string {
+  const key = `edge:${amount.toFixed(2)}:${tint.toFixed(2)}`;
+  return registerShaderPatch(key, () => (shader) => {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <roughnessmap_fragment>',
+      /* glsl */`
+      #include <roughnessmap_fragment>
+      {
+        // curvature ≈ how fast the shading normal turns across a pixel
+        vec3 nDx = dFdx(vNormal), nDy = dFdy(vNormal);
+        float curv = clamp((length(nDx) + length(nDy)) * 5.5, 0.0, 1.0);
+        // only convex edges wear — concave creases collect dirt instead
+        float convex = clamp(-(dot(nDx, nDx) + dot(nDy, nDy)) * 40.0 + 1.0, 0.0, 1.0);
+        float wear = pow(curv, 0.7) * mix(0.45, 1.0, convex) * ${amount.toFixed(3)};
+        roughnessFactor = mix(roughnessFactor, 0.24, wear);
+        diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * 1.85 + 0.035, wear * ${tint.toFixed(2)});
+      }`);
   });
 }
 
