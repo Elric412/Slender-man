@@ -393,11 +393,20 @@ export class DreadToolkit {
     if (!c) return NULL_GRANULAR;
     const bus = opts.bus ?? 'entity';
     const out = c.createGain(); out.gain.value = 1;
-    out.connect(this.buses.bus(bus));
+    const busNode = this.buses.bus(bus);
+    out.connect(busNode);
     if (opts.reverbSend && opts.reverbSend > 0) {
       const s = c.createGain(); s.gain.value = opts.reverbSend;
       out.connect(s).connect(this.buses.reverbInput);
     }
+    // Shared by both the worklet path and the fallback below: swap the bus
+    // connection for a caller-supplied destination (a spatial voice input).
+    let routed: AudioNode = busNode;
+    const connectTo = (dest: AudioNode): void => {
+      try { out.disconnect(routed); } catch { /* not connected */ }
+      out.connect(dest);
+      routed = dest;
+    };
 
     if (this.buses.hasWorklet) {
       let node: AudioWorkletNode | null = null;
@@ -428,6 +437,7 @@ export class DreadToolkit {
             level = Math.max(0, Math.min(1, v));
             gp.setTargetAtTime(level, this.ctx.currentTime, tc);
           },
+          connectTo,
           shape: (s) => {
             if (!alive || !this.ctx) return;
             const t = this.ctx.currentTime;
@@ -449,7 +459,7 @@ export class DreadToolkit {
         };
       }
     }
-    return this.granularFallback(out, opts);
+    return this.granularFallback(out, opts, connectTo);
   }
 
   /**
@@ -459,7 +469,7 @@ export class DreadToolkit {
    */
   private granularFallback(out: GainNode, opts: {
     density?: number; centre?: number; resonance?: number;
-  }): GranularHandle {
+  }, connectTo: (dest: AudioNode) => void): GranularHandle {
     const c = this.ctx!;
     const src = this.noiseSource();
     const bp = c.createBiquadFilter();
@@ -486,6 +496,7 @@ export class DreadToolkit {
         level = Math.max(0, Math.min(1, v));
         g.gain.setTargetAtTime(level * 0.5, this.ctx.currentTime, tc);
       },
+      connectTo,
       shape: (s) => {
         if (!alive || !this.ctx) return;
         const t = this.ctx.currentTime;
@@ -731,11 +742,18 @@ export interface GranularShape {
 
 export interface GranularHandle extends DroneHandle {
   shape(s: GranularShape): void;
+  /**
+   * Reroute this texture's output away from its bus and into a custom
+   * destination — in practice a SpatialVoice input, so a granular layer can be
+   * localised in the world instead of playing flat on the bus. Idempotent-ish:
+   * calling it again moves the output again.
+   */
+  connectTo(dest: AudioNode): void;
 }
 
 const NULL_GRANULAR: GranularHandle = {
   set: () => undefined, level: 0, stop: () => undefined, alive: false,
-  shape: () => undefined,
+  shape: () => undefined, connectTo: () => undefined,
 };
 
 function clamp01(v: number): number { return v < 0 ? 0 : v > 1 ? 1 : v; }
