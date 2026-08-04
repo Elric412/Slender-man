@@ -18,7 +18,8 @@ import { PalebarkRig } from './game/PalebarkRig';
 import { FearSystem } from './game/FearSystem';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
-import { SynthEngine } from './audio/SynthEngine';
+import { AudioEngine } from './audio/AudioEngine';
+import { ZoneSystem } from './world/ZoneSystem';
 import { Menu } from './ui/Menu';
 
 const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchmarkable
@@ -50,7 +51,7 @@ class StaticGame {
   private settings: Settings;
   private spec: QualitySpec;
   private input!: Input;
-  private audio = new SynthEngine();
+  private audio: AudioEngine;
 
   private hf!: HeightField;
   private mats!: MaterialLibrary;
