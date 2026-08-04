@@ -907,6 +907,176 @@ export interface TileRect {
   sx: number; sy: number;
 }
 
+/**
+ * Vertex attribute carrying the per-vertex tile selection and repeat count.
+ *
+ * `x` = tile index (0..15, integer stored as float — one atlas cell)
+ * `y` = repeats along U
+ * `z` = repeats along V
+ *
+ * Because this rides on the *vertex*, a single merged geometry can mix bark
+ * verts and foliage verts and still resolve to the right cell per fragment,
+ * which is what collapses a whole chunk to one draw call.
+ */
+export const ATLAS_ATTRIBUTE = 'aTile';
+
+/**
+ * Patch a material to sample the atlas manually.
+ *
+ * Three problems have to be solved simultaneously, and they interact:
+ *
+ *  1. **Tiling inside an atlas.** `RepeatWrapping` is unusable — it would wrap
+ *     across the whole sheet into the neighbouring cell. So the UV is fracted
+ *     per fragment and then mapped into the tile's rect. Geometry UVs are
+ *     therefore *unbounded* (a 28 m trunk may run `uv.y` 0…6), which is what
+ *     keeps texel density constant regardless of trunk height.
+ *
+ *  2. **The derivative spike.** `fract()` is discontinuous at the wrap line, so
+ *     the hardware's implicit derivatives blow up there and mip selection jumps
+ *     to the smallest level — a visible dark seam at *every* repeat. The fix is
+ *     to compute the gradients from the *unfracted* UV (which is smooth) and
+ *     sample with `textureGrad`. `texture2DGradEXT` is three's alias, defined to
+ *     `textureGrad` on WebGL2, so this stays portable.
+ *
+ *  3. **Gutter clamping.** Even with correct mips, bilinear taps at the content
+ *     edge can reach past it. The fracted coordinate is inset by half a texel
+ *     of the *content area* so a tap can never leave the tile.
+ *
+ * Everything varies per-vertex via `aTile`, so no uniform branching and no
+ * material permutations: two materials serve the entire forest.
+ */
+function atlasPatch(
+  mat: THREE.Material, rects: TileRect[], foliage: boolean, atlasSize: number,
+): void {
+  // The rect table is baked into the source as a constant array rather than
+  // uploaded as a uniform: it is fixed for the lifetime of the atlas, and a
+  // compile-time constant lets the driver fold the indexing.
+  const table = rects
+    .map(r => `vec4(${r.ox.toFixed(6)},${r.oy.toFixed(6)},${r.sx.toFixed(6)},${r.sy.toFixed(6)})`)
+    .join(',\n    ');
+  const key = `atlas:${foliage ? 'foliage' : 'bark'}:${rects.length}:${atlasSize}:${table.length}`;
+
+  registerShaderPatch(key, () => (shader) => {
+    shader.uniforms.uAtlasTexel = { value: 1 / atlasSize };
+
+    // ---- vertex: forward tile + repeats, and the unbounded UV ----
+    shader.vertexShader = `attribute vec3 aTile;
+varying vec3 vAtlasTile;
+varying vec2 vAtlasUv;
+` + shader.vertexShader.replace(
+      '#include <uv_vertex>',
+      `#include <uv_vertex>
+      vAtlasTile = aTile;
+      // Unbounded, un-fracted UV. Kept separate from vMapUv so three's own
+      // transform pipeline is untouched and the gradients stay smooth.
+      vAtlasUv = uv * vec2(aTile.y, aTile.z);`,
+    );
+
+    // ---- fragment: resolve tile rect, fract, sample with explicit gradients ----
+    shader.fragmentShader = `varying vec3 vAtlasTile;
+varying vec2 vAtlasUv;
+uniform float uAtlasTexel;
+
+const vec4 ATLAS_RECTS[${rects.length}] = vec4[${rects.length}](
+    ${table}
+);
+
+// Gradients of the *unfracted* UV — smooth across the wrap line.
+vec2 atlasDx, atlasDy;
+vec4 atlasRect;
+
+vec4 atlasSample(sampler2D tex) {
+  vec2 f = fract(vAtlasUv);
+  // Inset by half a texel of the content area: a bilinear tap can then never
+  // cross into the gutter, let alone the next cell.
+  vec2 inset = vec2(uAtlasTexel * 0.5) / max(atlasRect.zw, vec2(1e-5));
+  f = clamp(f, inset, 1.0 - inset);
+  vec2 uvA = atlasRect.xy + f * atlasRect.zw;
+  // Gradients must be scaled into atlas space too, or the mip chain is picked
+  // for the wrong footprint (too sharp, and distant trunks alias badly).
+  return texture2DGradEXT(tex, uvA, atlasDx * atlasRect.zw, atlasDy * atlasRect.zw);
+}
+` + shader.fragmentShader
+      // Establish the shared per-fragment state before any map is read. Sits at
+      // the very top of main() because derivatives must be taken in uniform
+      // control flow — inside a branch they are undefined.
+      .replace(
+        'void main() {',
+        `void main() {
+        atlasDx = dFdx(vAtlasUv);
+        atlasDy = dFdy(vAtlasUv);
+        {
+          int ti = int(vAtlasTile.x + 0.5);
+          ti = clamp(ti, 0, ${rects.length - 1});
+          atlasRect = ATLAS_RECTS[ti];
+        }`,
+      )
+      // albedo
+      .replace(
+        '#include <map_fragment>',
+        `{
+          vec4 sampledDiffuseColor = atlasSample(map);
+          diffuseColor *= sampledDiffuseColor;
+        }`,
+      )
+      // tangent-space normal
+      .replace(
+        '#include <normal_fragment_maps>',
+        `{
+          vec3 mapN = atlasSample(normalMap).xyz * 2.0 - 1.0;
+          mapN.xy *= normalScale;
+          normal = normalize(tbn * mapN);
+        }`,
+      )
+      // packed ORM — one fetch, three parameters
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `float roughnessFactor = roughness;
+        vec4 atlasOrm = atlasSample(roughnessMap);
+        roughnessFactor *= atlasOrm.g;`,
+      )
+      .replace(
+        '#include <metalnessmap_fragment>',
+        `float metalnessFactor = metalness;
+        metalnessFactor *= atlasOrm.b;`,
+      )
+      .replace(
+        '#include <aomap_fragment>',
+        `{
+          float ambientOcclusion = (atlasOrm.r - 1.0) * aoMapIntensity + 1.0;
+          reflectedLight.indirectDiffuse *= ambientOcclusion;
+          #if defined( USE_SHEEN )
+            sheenSpecularIndirect *= ambientOcclusion;
+          #endif
+          #if defined( USE_ENVMAP ) && defined( STANDARD )
+            float dotNVao = saturate(dot(geometryNormal, geometryViewDir));
+            reflectedLight.indirectSpecular *= computeSpecularOcclusion(
+              dotNVao, ambientOcclusion, material.roughness);
+          #endif
+        }`,
+      );
+
+    if (foliage) {
+      // Alpha comes from the atlas fetch, not from three's alphaMap path. The
+      // test must also compensate for mip-chain alpha erosion: averaging a leaf
+      // card's alpha across mips pulls the mean down, so a fixed threshold eats
+      // distant foliage entirely and canopies visibly thin out with distance.
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <alphatest_fragment>',
+        `{
+          float mipBias = clamp(
+            log2(max(length(atlasDx * atlasRect.zw), length(atlasDy * atlasRect.zw))
+                 / max(uAtlasTexel, 1e-6)), 0.0, 4.0);
+          float thr = alphaTest * (1.0 - mipBias * 0.16);
+          if (diffuseColor.a < thr) discard;
+        }`,
+      );
+    }
+  });
+
+  applyShaderPatch(mat, key);
+}
+
 export class ForestAtlas {
   readonly albedo: THREE.DataTexture;
   readonly normal: THREE.DataTexture;
@@ -945,8 +1115,16 @@ export class ForestAtlas {
       side: THREE.DoubleSide,
     });
 
-    atlasPatch(this.barkMat, rects, false);
-    atlasPatch(this.foliageMat, rects, true);
+    // The atlas is square, so one edge length gives the texel size the shader
+    // needs for its gutter inset and mip-bias maths.
+    const atlasSize = albedo.image.width;
+    atlasPatch(this.barkMat, rects, false, atlasSize);
+    atlasPatch(this.foliageMat, rects, true, atlasSize);
+
+    // Anisotropy is applied here rather than at texture creation so both
+    // materials are guaranteed to agree — grazing angles on a trunk are exactly
+    // where an atlas seam would show first.
+    for (const t of [albedo, normal, orm]) t.anisotropy = anisotropy;
   }
 
   /**
