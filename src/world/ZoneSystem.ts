@@ -287,11 +287,6 @@ export class ZoneSystem {
 
   readonly exclusions: ExclusionVolume[] = [];
 
-  /** creek centreline, authored below and shared with CreekSystem */
-  readonly creek: { x: number; z: number }[] = [];
-  /** the waterfall drop point along the creek */
-  creekFallIndex = 0;
-
   private scratch = new Float32Array(7);
 
   constructor(private hf: HeightField, seed: number) {
@@ -300,87 +295,31 @@ export class ZoneSystem {
     this.step = hf.layout.size / (this.res - 1);
     this.field = new Float32Array(this.res * this.res * 7);
     this.domIdx = new Uint8Array(this.res * this.res);
-    this.buildCreek();
     this.bake();
     this.registerBaseExclusions();
   }
 
   // ==========================================================================
-  // creek centreline
+  // creek — delegated, NOT duplicated
   // ==========================================================================
 
   /**
-   * The creek runs from the high north-east ridge down to the lake in the
-   * south-west — i.e. downhill, because water does. Authored as a coarse
-   * control polyline, then resampled with noise wander so it never reads as a
-   * straight cut.
+   * The creek centreline is owned by `HeightField`, because there the channel is
+   * *carved into the height grid* before zone/trail relaxation. Duplicating the
+   * polyline here would let the ecology field and the actual terrain drift apart
+   * — ferns growing on a bank the ground no longer has. So we read the one
+   * authoritative copy.
    */
-  private buildCreek(): void {
-    const control = [
-      { x: 128, z: -142 },
-      { x: 96, z: -96 },
-      { x: 58, z: -52 },
-      { x: 22, z: -18 },
-      { x: -14, z: 6 },
-      { x: -52, z: 34 },
-      { x: -84, z: 62 },
-      { x: -112, z: 88 },
-      { x: -132, z: 108 },
-    ];
-    const r = this.rng.fork(0x517E);
-    for (let i = 0; i < control.length - 1; i++) {
-      const a = control[i], b = control[i + 1];
-      const segs = 7;
-      for (let s = 0; s < segs; s++) {
-        const t = s / segs;
-        // catmull-ish smoothing against neighbours keeps curvature continuous
-        const p0 = control[Math.max(0, i - 1)], p3 = control[Math.min(control.length - 1, i + 2)];
-        const t2 = t * t, t3 = t2 * t;
-        const cx = 0.5 * ((2 * a.x) + (-p0.x + b.x) * t + (2 * p0.x - 5 * a.x + 4 * b.x - p3.x) * t2 + (-p0.x + 3 * a.x - 3 * b.x + p3.x) * t3);
-        const cz = 0.5 * ((2 * a.z) + (-p0.z + b.z) * t + (2 * p0.z - 5 * a.z + 4 * b.z - p3.z) * t2 + (-p0.z + 3 * a.z - 3 * b.z + p3.z) * t3);
-        // perpendicular wander
-        const dx = b.x - a.x, dz = b.z - a.z;
-        const pl = Math.hypot(dx, dz) || 1;
-        const wob = r.noise1(i * 4.7 + t * 3.3) * 5.5;
-        this.creek.push({ x: cx - (dz / pl) * wob, z: cz + (dx / pl) * wob });
-      }
-    }
-    this.creek.push(control[control.length - 1]);
-    // waterfall sits about a third of the way down, where the ridge breaks
-    this.creekFallIndex = Math.floor(this.creek.length * 0.3);
-  }
+  get creek(): readonly { x: number; z: number }[] { return this.hf.layout.creek.path; }
+
+  /** index along `creek` where the waterfall drops */
+  get creekFallIndex(): number { return this.hf.layout.creek.fall?.index ?? 0; }
 
   /** distance to the creek centreline (m) */
-  creekDist(x: number, z: number): number {
-    let best = Infinity;
-    for (let i = 0; i < this.creek.length - 1; i++) {
-      const a = this.creek[i], b = this.creek[i + 1];
-      const dx = b.x - a.x, dz = b.z - a.z;
-      const len2 = dx * dx + dz * dz || 1;
-      let u = ((x - a.x) * dx + (z - a.z) * dz) / len2;
-      u = u < 0 ? 0 : u > 1 ? 1 : u;
-      const px = a.x + dx * u, pz = a.z + dz * u;
-      const d = (x - px) * (x - px) + (z - pz) * (z - pz);
-      if (d < best) best = d;
-    }
-    return Math.sqrt(best);
-  }
+  creekDist(x: number, z: number): number { return this.hf.creekDist(x, z); }
 
-  /** signed position along the creek, 0..1 from source to lake */
-  creekParam(x: number, z: number): number {
-    let best = Infinity, bestI = 0, bestU = 0;
-    for (let i = 0; i < this.creek.length - 1; i++) {
-      const a = this.creek[i], b = this.creek[i + 1];
-      const dx = b.x - a.x, dz = b.z - a.z;
-      const len2 = dx * dx + dz * dz || 1;
-      let u = ((x - a.x) * dx + (z - a.z) * dz) / len2;
-      u = u < 0 ? 0 : u > 1 ? 1 : u;
-      const px = a.x + dx * u, pz = a.z + dz * u;
-      const d = (x - px) * (x - px) + (z - pz) * (z - pz);
-      if (d < best) { best = d; bestI = i; bestU = u; }
-    }
-    return (bestI + bestU) / (this.creek.length - 1);
-  }
+  /** position along the creek, 0..1 from source to lake */
+  creekParam(x: number, z: number): number { return this.hf.creekParam(x, z); }
 
   // ==========================================================================
   // field bake
