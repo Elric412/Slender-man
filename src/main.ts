@@ -14,12 +14,14 @@ import { EnvironmentProbe } from './render/EnvironmentProbe';
 import { Sky } from './render/Sky';
 import { Player } from './game/Player';
 import { Flashlight } from './game/Flashlight';
-import { PalebarkRig } from './game/PalebarkRig';
+import { PalebarkEntity } from './entity/PalebarkEntity';
+import type { AnimState } from './entity/PalebarkAnimator';
 import { FearSystem } from './game/FearSystem';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';
 import { ZoneSystem } from './world/ZoneSystem';
+import { SeededRandom } from './core/SeededRandom';
 import { Menu } from './ui/Menu';
 
 const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchmarkable
@@ -27,6 +29,21 @@ const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchma
 type GameState = 'loading' | 'title' | 'playing' | 'paused' | 'ending' | 'escaped' | 'taken';
 
 const frame = (): Promise<void> => new Promise(r => requestAnimationFrame(() => r()));
+
+/**
+ * Brain state → animation state.
+ *
+ * The two vocabularies are deliberately separate: the brain reasons about
+ * *intent* ("investigating") while the animator reasons about *body* ("transit").
+ * Investigating and dormant-while-walking are the same body language, so they
+ * collapse to one entry here rather than duplicating a pose table.
+ */
+const ANIM_STATE: Record<EntitySnapshot['state'], AnimState> = {
+  dormant: 'dormant',
+  investigating: 'transit',
+  stalking: 'stalk',
+  confronting: 'confront',
+};
 
 /**
  * Weather director state. Rain doesn't just spawn particles — it drives a
@@ -66,7 +83,7 @@ class StaticGame {
   private player!: Player;
   private flashlight!: Flashlight;
   private entity!: EntityBrain;
-  private rig!: PalebarkRig;
+  private rig!: PalebarkEntity;
   private fear = new FearSystem();
   private tapes!: TapeSystem;
   private effects!: Effects;
@@ -80,6 +97,20 @@ class StaticGame {
   };
   private weather: Weather = { rain: 0, wetness: 0 };
   private windDir = { x: 0.8, z: 0.6 };
+  /** wind strength from the previous frame — the coat reads it before it is recomputed */
+  private lastWind = 0.32;
+  private entityGaze = new THREE.Vector3();
+  private entityWind = new THREE.Vector3();
+  /**
+   * Terrain sampler handed to the foot IK. Bound once as an arrow property so
+   * the animator can call it every frame without allocating a closure, and so
+   * `this` cannot be lost.
+   */
+  private groundAt = (x: number, z: number): number => this.hf.heightAt(x, z);
+  /** per-run RNG for the animator's discretionary variation */
+  private entityRand: () => number = Math.random;
+  /** QA hook: force the reach beat on the next frame (see debugApi) */
+  private forceExtension = false;
   private rainTriggered = false;
   private flinchCooldown = 0;
   private entityCueTimer = 0;
@@ -193,8 +224,20 @@ class StaticGame {
 
     p(0.68, 'waking the entity…');
     this.entity = new EntityBrain(this.nav, this.col, this.hf, WORLD_SEED);
-    this.rig = new PalebarkRig(this.mats);
+    // The hero character: three LODs on one skeleton, procedurally sculpted and
+    // textured at boot. Its own atlases are synthesised here (yielding frames),
+    // then the hero tier streams in during play via streamStep().
+    this.rig = await PalebarkEntity.create({
+      tier: this.spec.tier,
+      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
+      seed: WORLD_SEED,
+      onProgress: (f, label) => p(0.68 + f * 0.06, `${label}…`),
+    });
     this.scene.add(this.rig.group);
+    // Match the env-probe decision made in captureEnvironment() above. The
+    // entity is built after the probe, so it has to be told separately rather
+    // than relying on the shared MaterialLibrary call.
+    this.rig.setEnvIntensity(this.probe ? 1 : 0.55);
     this.wireEntity();
     await frame();
     this.bootMark('entity');
@@ -520,6 +563,22 @@ class StaticGame {
     if (this.flashlight.on) this.flashlight.toggle();
     this.flashlight.warp();
     this.entity.respawnFar(this.player.pos);
+    // Re-seed the brain's *discretionary* choices (which POI, which flank, how
+    // long to hold). The world seed stays fixed so the map is unchanged; this is
+    // the only thing that makes run 2 differ from run 1, which is what quality
+    // gate #6 (no two runs place a sighting identically) depends on.
+    this.entity.reseed(this.runSeed);
+    // The animator's variation draws from the same run seed, so a replay of a
+    // given seed is reproducible for testing.
+    const animRng = new SeededRandom(this.runSeed ^ 0xA5F1);
+    this.entityRand = () => animRng.next();
+    // Hard-reset the character: cloth particles, animator layers and LOD fade
+    // weights all get re-seated at the new position. Without this the coat would
+    // integrate the respawn displacement as one frame of motion and visibly
+    // billow before settling.
+    this.rig.reset(
+      this.entity.pos.x, this.entity.pos.y, this.entity.pos.z, this.entity.yaw,
+      Math.hypot(this.entity.pos.x - this.player.pos.x, this.entity.pos.z - this.player.pos.z));
     this.tapes.spawnAll(this.runSeed);
     this.tapes.onPickup = (zoneId, x, z) => this.onTapePickup(zoneId, x, z);
     this.pipeline.invalidateHistory();
@@ -701,7 +760,40 @@ class StaticGame {
       lightOn: this.flashlight.on,
     }, time);
     const snap = this.entitySnap;
-    this.rig.update(dt, time, snap.x, snap.y, snap.z, this.entity.yaw, snap.speed);
+
+    // The character. Detection state is the single source of truth: the same
+    // snapshot drives the mesh's pose, the fear/static system and the audio, so
+    // they cannot disagree about what the entity is doing.
+    this.entityGaze.set(this.player.pos.x, this.player.eyeY, this.player.pos.z);
+    this.entityWind.set(
+      this.windDir.x * this.lastWind, 0, this.windDir.z * this.lastWind);
+    this.rig.update(dt, time, {
+      x: snap.x, y: snap.y, z: snap.z,
+      yaw: this.entity.yaw,
+      speed: snap.speed,
+      state: ANIM_STATE[snap.state],
+      detection: snap.detection,
+      camera: this.player.camera.position,
+      // It only tracks the player when it actually perceives them; otherwise it
+      // faces its travel direction and the head stays level.
+      gaze: snap.detection > 0.08 ? this.entityGaze : null,
+      gazeWeight: Math.min(1, snap.detection * 1.6),
+      groundAt: this.groundAt,
+      wind: this.entityWind,
+      wetness: this.weather.wetness,
+      tapes: this.tapes.collected,
+      tapesTotal: this.tapes.total,
+      extensionRequest: snap.extensionRequest || this.forceExtension,
+      // QA override: the forced beat has to bypass the milestone gate too, or a
+      // test would have to collect six tapes before it could check the animation.
+      forceEligible: this.forceExtension,
+      rand: this.entityRand,
+      // Streaming budget: generous while far (the player cannot see the seam of a
+      // texture swap), tight when close so a swap can never cost a visible hitch.
+      streamBudgetMs: snap.distToPlayer > 40 ? 3.5 : 1.0,
+    });
+    // One-shot: consumed by exactly one frame so a forced beat cannot latch on.
+    this.forceExtension = false;
 
     // ---- fear / static ----
     this.fear.update(dt, snap.detection, snap.visibleToPlayer, snap.distToPlayer);
@@ -729,6 +821,7 @@ class StaticGame {
 
     // ---- environment ----
     const wind = 0.32 + this.fear.value * 0.85 + this.weather.wetness * 0.18;
+    this.lastWind = wind;
     const wTime = time * 0.05;
     this.windDir.x = Math.cos(wTime) * 0.8 + 0.2;
     this.windDir.z = Math.sin(wTime * 0.7) * 0.8 + 0.2;
@@ -824,6 +917,7 @@ class StaticGame {
         `scale ${this.pipeline.renderScale.toFixed(2)}  effort ${this.pipeline.effort.toFixed(2)}\n` +
         `wet ${this.weather.wetness.toFixed(2)}  batt ${this.flashlight.battery.toFixed(2)}\n` +
         `state ${snap.state}  det ${snap.detection.toFixed(2)}  dist ${snap.distToPlayer.toFixed(0)}m\n` +
+        this.entityPerfLine() +
         this.audioPerfLine());
     }
 
@@ -837,6 +931,24 @@ class StaticGame {
     // ---- win check: reach the fire road ----
     const ex = this.hf.layout.exit;
     if (Math.hypot(this.player.pos.x - ex.x, this.player.pos.z - ex.z) < 7) this.escape();
+  }
+
+  /**
+   * Character block of the F3 overlay.
+   *
+   * The two numbers that matter for the quality gates are `foot` (residual foot
+   * IK error \u2014 anything above a centimetre or so is a visible floating-foot
+   * artefact) and `ext` (extension beat count, which must stay very low across a
+   * whole run). `fade` exposes the LOD cross-fade weights so a pop can be caught
+   * as a discontinuity rather than hunted by eye.
+   */
+  private entityPerfLine(): string {
+    const d = this.rig.debug() as Record<string, number | string | boolean | number[]>;
+    const fade = (d.fade as number[]).map(v => v.toFixed(2)).join('/');
+    return `PB lod${d.lod} ${fade}  tris ${((d.tris as number) / 1000).toFixed(1)}k  `
+      + `tex ${d.texture}${d.streaming ? '\u2191' : ''}\n`
+      + `   foot ${((d.footError as number) * 1000).toFixed(1)}mm  `
+      + `swing ${d.swing}  ext ${d.extensionCount}${d.extension ? ' LIVE' : ''}\n`;
   }
 
   /**
@@ -910,6 +1022,16 @@ class StaticGame {
         };
       },
       flashlight: (on: boolean) => { if (this.flashlight.on !== on) this.flashlight.toggle(); },
+
+      // ---- character (brief §10 gates 2, 3, 8, 9) ----------------------------
+      // LOD fade weights, residual foot-IK error, cloth swing and the extension
+      // counter. The suite asserts against these because none of them are
+      // observable from a screenshot: a 3 mm floating foot and a correct plant
+      // look identical at test resolution, and LOD popping is a *discontinuity*
+      // in the fade weights rather than anything a single frame can show.
+      palebark: () => this.rig.debug(),
+      /** force the reach beat next frame, for gate #9 verification */
+      forceExtension: () => { this.forceExtension = true; },
       collectAll: () => {
         for (const t of this.tapes.tapes) {
           if (!t.collected) { t.collected = true; this.scene.remove(t.mesh); this.tapes.collected++; }
