@@ -82,6 +82,13 @@ export interface EntityFrame {
   tapesTotal: number;
   /** the AI is asking for the extension beat right now */
   extensionRequest: boolean;
+  /**
+   * QA override: grant eligibility regardless of the tape milestone.
+   *
+   * Exists so a test can exercise the reach animation without first playing six
+   * tapes' worth of a run. Never set by gameplay.
+   */
+  forceEligible?: boolean;
   /** deterministic per-run variation */
   rand: () => number;
   /** ms of frame budget the texture streamer may spend */
@@ -262,7 +269,7 @@ export class PalebarkEntity {
     }
 
     // ------------------------------------------------------------- 1. animation
-    const eligible = this.extensionEligible(f.tapes);
+    const eligible = this.extensionEligible(f.tapes) || !!f.forceEligible;
     if (f.gaze) this.gazeTarget.copy(f.gaze);
     this.animator.update(dt, time, {
       state: f.state,
