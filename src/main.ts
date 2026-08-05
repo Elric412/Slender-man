@@ -18,7 +18,8 @@ import { PalebarkRig } from './game/PalebarkRig';
 import { FearSystem } from './game/FearSystem';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
-import { SynthEngine } from './audio/SynthEngine';
+import { AudioEngine } from './audio/AudioEngine';
+import { ZoneSystem } from './world/ZoneSystem';
 import { Menu } from './ui/Menu';
 
 const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchmarkable
@@ -50,9 +51,10 @@ class StaticGame {
   private settings: Settings;
   private spec: QualitySpec;
   private input!: Input;
-  private audio = new SynthEngine();
+  private audio: AudioEngine;
 
   private hf!: HeightField;
+  private zones!: ZoneSystem;
   private mats!: MaterialLibrary;
   private col!: CollisionWorld;
   private map!: MapGenerator;
@@ -94,6 +96,9 @@ class StaticGame {
     this.menu = new Menu(this.settings);
     const tier = this.settings.quality === 'auto' ? probeQuality() : this.settings.quality;
     this.spec = QUALITY_SPECS[tier];
+    // The audio engine only *allocates* here; no AudioContext is created until
+    // init() runs behind a user gesture, so autoplay policy stays satisfied.
+    this.audio = new AudioEngine(this.settings.audio, this.spec.tier === 'low');
   }
 
   // ================================================================ boot
@@ -119,6 +124,14 @@ class StaticGame {
 
     p(0.08, 'surveying terrain…');
     this.hf = new HeightField(WORLD_SEED);
+    await frame();
+
+    // Ecology field. Must exist before anything is scattered or dressed: the
+    // zone weights decide species, density, ground cover, fog and light. It is
+    // also what the audio bed reads to know whether the player is standing in a
+    // closed thicket or on an open marsh edge.
+    p(0.09, 'reading the ecology…');
+    this.zones = new ZoneSystem(this.hf, WORLD_SEED);
     await frame();
 
     // Procedural PBR synthesis is the single heaviest boot stage. It yields a
@@ -596,7 +609,7 @@ class StaticGame {
     if (snap.visibleToPlayer && snap.distToPlayer < 16 && this.flashlight.on && this.flinchCooldown <= 0) {
       this.player.flinch();
       this.flinchCooldown = 4;
-      this.audio.entityCue(snap.distToPlayer, 'tone');
+      this.audio.entityCue(snap.distToPlayer, 'shift');
       if (navigator.vibrate && this.input.isTouch) navigator.vibrate(40);
     }
     // ambient entity proximity cue
@@ -631,13 +644,43 @@ class StaticGame {
     this.moonTarget.updateMatrixWorld();
 
     // ---- audio bed ----
+    // The ambience is not a global loop with a wind knob; it is a *reading of
+    // the place the listener is standing in*. Every environmental term below
+    // comes from the same zone field the scatter system used, so a marsh sounds
+    // like reeds and open water, the ravine sounds like moving water under a
+    // closed canopy, and the blight sounds conspicuously dead.
+    const px = this.player.pos.x, pz = this.player.pos.z;
+    const canopy = this.zones.scalarAt(px, pz, 'canopyClosure');
+    const openness = 1 - canopy * 0.82;
     this.audio.update(dt, {
-      windStrength: wind,
-      inForest: this.hf.trailDist(this.player.pos.x, this.player.pos.z) > 3,
-      fear: this.fear.value,
-      sprinting: this.player.sprinting,
+      x: px, y: this.player.eyeY, z: pz,
+      fx: this.player.forward.x, fy: this.player.forward.y, fz: this.player.forward.z,
       moving: this.player.moving,
-      time,
+      sprinting: this.player.sprinting,
+      crouched: this.player.crouched,
+      stamina: this.player.stamina,
+      fear: this.fear.value,
+      detection: snap.detection,
+      entityState: snap.state,
+      entityX: snap.x, entityY: snap.y, entityZ: snap.z,
+      entityVisible: snap.visibleToPlayer,
+      entityDist: snap.distToPlayer,
+      entitySpeed: snap.speed,
+      tapes: this.tapes.collected,
+      runTime: this.runTime,
+      wind,
+      canopyClosure: canopy,
+      wetness: this.weather.wetness,
+      reedDensity: this.zones.scalarAt(px, pz, 'reedDensity'),
+      deadfallDensity: this.zones.scalarAt(px, pz, 'deadfallDensity'),
+      creekDist: this.zones.creekDist(px, pz),
+      lakeDist: Math.max(0, Math.hypot(px - this.hf.layout.lake.x, pz - this.hf.layout.lake.z)
+        - this.hf.layout.lake.r),
+      openness,
+      // "enclosed" is a *built* interior (tunnel, mill, station), not a dense
+      // thicket — it drives reverb, and trees are terrible reflectors.
+      enclosed: this.hf.zoneAt(px, pz) !== null && canopy < 0.35,
+      inOpen: openness > 0.62,
     });
 
     // ---- renderer hand-off: beam, weather, exposure ----
