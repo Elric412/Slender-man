@@ -297,6 +297,53 @@ export class AudioEngine {
     this.log('sighting', 'entity');
   }
 
+  /**
+   * The entity's "extension / reach" beat — brief §8's rare late-run moment
+   * where it asserts presence without closing distance.
+   *
+   * This is the *only* gameplay-driven consumer of the sub-bass budget, and it
+   * is refused outright when:
+   *   • the player has turned low-frequency intensity off (§11), or
+   *   • the Director's `subBeat` ration for the run is spent (§9 cliché budget).
+   *
+   * Refusal is not silence: a mid-band component always plays, because the beat
+   * carries information and must survive a phone speaker (quality gate 7).
+   */
+  extensionBeat(dist: number): void {
+    const ctx = this.buses.ctx;
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    const near = 1 - Math.min(1, dist / 90);
+
+    // Mid-band "pressure" component — always present, no budget needed. Slow
+    // attack and a long tail so it reads as the air changing, not as a hit.
+    const src = this.kit.noiseSource(0.7, 0.45);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(180, t);
+    bp.frequency.exponentialRampToValueAtTime(430 + near * 260, t + 1.1);
+    bp.Q.value = 1.2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.1 + near * 0.14, t + 0.55);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 2.2);
+    src.connect(bp); bp.connect(g); g.connect(this.buses.bus('entity'));
+    setTimeout(() => {
+      try { src.stop?.(); } catch { /* ignore */ }
+      src.disconnect(); bp.disconnect(); g.disconnect();
+    }, 2600);
+
+    // Sub component — rationed.
+    if (!this.buses.lowFreqDisabled && this.director.requestSpend('subBeat')) {
+      const sub = this.kit.subBassDrone({ freq: 27 + this.rng.range(0, 6), beat: 0.55, swell: 0, swellDepth: 0 });
+      sub.set(0.8 + near * 0.2, 0.45);
+      setTimeout(() => sub.set(0, 0.7), 1200);
+      setTimeout(() => sub.stop(0.9), 2600);
+    }
+    this.pushCue('Something reaches', 'escalation', 3);
+    this.log('extensionBeat', 'entity');
+  }
+
   /** Returns the sequence length in seconds so the visual can be matched to it. */
   captureSting(): number {
     const len = this.entity.captureSequence();
