@@ -297,6 +297,19 @@ export class AudioEngine {
     this.log('sighting', 'entity');
   }
 
+  /**
+   * The late-act "reach" beat, requested by the brain.
+   *
+   * Captioned, because the beat is mostly sub-bass and a ducked bed — a player
+   * relying on subtitles would otherwise experience it as the audio briefly
+   * breaking rather than as a deliberate escalation.
+   */
+  extensionBeat(dist: number): void {
+    this.entity.extensionBeat(dist);
+    this.pushCue('Something reaches', 'escalation', 3.2);
+    this.log('extension', 'entity');
+  }
+
   /** Returns the sequence length in seconds so the visual can be matched to it. */
   captureSting(): number {
     const len = this.entity.captureSequence();
