@@ -294,10 +294,14 @@ function barkYoungConifer(c: Cell, seed: number): void {
 
       const h = clamp01(0.55 + grain * 0.16 + blister * 0.3 - scar * 0.3);
       const tone = grain;
-      // grey-brown with a faint purple cast, typical of young fir
-      const r = mix(0.235, 0.315, tone) - scar * 0.08 + blister * 0.05;
-      const g = mix(0.205, 0.268, tone) - scar * 0.075 + blister * 0.035;
-      const b = mix(0.192, 0.238, tone) - scar * 0.06 + blister * 0.02;
+      // Cool, pale grey with a faint purple cast — typical of young fir, and
+      // deliberately pushed away from the hardwood tile's warm mid-brown. The
+      // atlas harness measured these two as the closest pair in the bark group
+      // (RMS 0.022 against a 0.020 floor); a value *and* hue separation fixes
+      // that properly, whereas nudging one tint would just move the collision.
+      const r = mix(0.300, 0.405, tone) - scar * 0.08 + blister * 0.05;
+      const g = mix(0.288, 0.392, tone) - scar * 0.075 + blister * 0.035;
+      const b = mix(0.296, 0.396, tone) - scar * 0.06 + blister * 0.02;
       // resin is glossy — a real, localised roughness break rather than a
       // single flat value across the surface
       const rough = clamp01(0.86 - blister * 0.42 + scar * 0.06);
@@ -323,12 +327,23 @@ function barkHardwood(c: Cell, seed: number): void {
       const a = nz.ridged(u * 6, v * 17, 6, 17, 4, 0.5);
       // shallower diagonal set, warped so the lattice is irregular
       const b2 = nz.ridged((u + v * 0.35) * 7, v * 9, 7, 9, 3, 0.55);
-      const lattice = clamp01(a * 0.62 + b2 * 0.55);
+
+      // `ridged` averages around ~0.3 with most of its mass in the low third, so
+      // summing two of them and clamping produced a band hovering near 0.35 —
+      // the lattice existed numerically but occupied so little of the 0..1 range
+      // that it rasterised as flat brown noise (harness contrast 0.024, and
+      // visibly featureless on the contact sheet). Remapping through a smoothstep
+      // centred on the *actual* mean expands that band to fill the range, which
+      // is what makes the ridges legible as interlocking diamonds.
+      const raw = a * 0.62 + b2 * 0.55;
+      const lattice = smooth01((raw - 0.24) * 2.35);
       const fissure = 1 - lattice;
       const fine = nz.warped(u * 22, v * 40, 22, 40, 0.8, 3);
 
-      const h = clamp01(0.5 + lattice * 0.42 - fissure * 0.18 + fine * 0.08);
-      const dark = Math.pow(fissure, 1.3);
+      const h = clamp01(0.42 + lattice * 0.56 - fissure * 0.1 + fine * 0.07);
+      // gamma < 1 widens the dark fissure network so the lattice reads as raised
+      // ridges separated by deep shadow, rather than as gentle mottling
+      const dark = Math.pow(fissure, 0.85);
       // warm mid-brown, deep shadow in the fissure network
       const r = mix(0.335, 0.115, dark) * mix(0.9, 1.08, fine);
       const g = mix(0.272, 0.092, dark) * mix(0.9, 1.06, fine);
@@ -793,27 +808,41 @@ function fernCard(c: Cell, seed: number): void {
     const t = i / steps;
     pts.push({ x: 0.5 + Math.pow(t, 1.9) * 0.2, y: 0.02 + t * 0.94 - Math.pow(t, 3) * 0.1 });
   }
+  // Pinnae are stroked as *thin, well-separated* ribs.
+  //
+  // The first attempt drew them at w≈0.019 with three sub-pinnules branching off
+  // each, on a 18-step rachis. At 248 texels a cell that is ~5 texels of half-
+  // width per rib with ~7 texels of spacing, so after the 1.4-texel alpha
+  // feather every rib fused into its neighbours and the whole frond rasterised
+  // as one solid ovate blob — visually a big leaf, not a fern. Verified by the
+  // atlas harness: coverage 32.7% in a single connected mass.
+  //
+  // The fix is spacing-aware: ribs only on every other rachis step, half the
+  // stroke width, and sub-pinnules dropped entirely (they cannot resolve at this
+  // texel density, so they only ever contributed fill). What makes a fern read
+  // is the *gap rhythm* between pinnae, so the gaps are what we protect.
   for (let i = 0; i < steps; i++) {
-    segs.push({ ax: pts[i].x, ay: pts[i].y, bx: pts[i + 1].x, by: pts[i + 1].y, w: 0.011 * (1 - i / steps * 0.7), t: -1 });
+    segs.push({ ax: pts[i].x, ay: pts[i].y, bx: pts[i + 1].x, by: pts[i + 1].y, w: 0.009 * (1 - i / steps * 0.6), t: -1 });
+    if (i % 2 !== 0) continue;              // every other node → real gaps
     const t = i / steps;
     // pinna length peaks low and tapers to the tip
-    const pl = (0.055 + Math.sin(Math.pow(t, 0.7) * Math.PI) * 0.15) * (1 - t * 0.25);
+    const pl = (0.05 + Math.sin(Math.pow(t, 0.7) * Math.PI) * 0.155) * (1 - t * 0.25);
     for (const sign of [-1, 1]) {
       const j = nz.value(i * 6.1, sign + 2, 24, 4);
       const sweep = 0.42 + j * 0.3;
       const ex = pts[i].x + sign * pl, ey = pts[i].y + pl * sweep;
-      segs.push({ ax: pts[i].x, ay: pts[i].y, bx: ex, by: ey, w: 0.016 + j * 0.006, t: j });
-      // each pinna is itself lobed — sub-pinnules give the lacy read
-      const sub = 3;
-      for (let k = 1; k <= sub; k++) {
-        const ft = k / (sub + 1);
-        const mx = pts[i].x + sign * pl * ft, my = pts[i].y + pl * sweep * ft;
+      // taper: a pinna is a narrow blade, widest near the rachis
+      const seg2 = 3;
+      for (let k = 0; k < seg2; k++) {
+        const t0 = k / seg2, t1 = (k + 1) / seg2;
         segs.push({
-          ax: mx, ay: my,
-          bx: mx + sign * pl * 0.22, by: my + pl * 0.3,
-          w: 0.009, t: j,
+          ax: pts[i].x + sign * pl * t0, ay: pts[i].y + pl * sweep * t0,
+          bx: pts[i].x + sign * pl * t1, by: pts[i].y + pl * sweep * t1,
+          w: 0.0105 * (1 - t0 * 0.72) + j * 0.002,
+          t: j,
         });
       }
+      void ex; void ey;
     }
   }
   for (let y = 0; y < n; y++) {
@@ -886,8 +915,24 @@ function mossDrapeCard(c: Cell, seed: number): void {
       const r = mix(0.215, 0.295, t2);
       const g = mix(0.238, 0.318, t2);
       const b = mix(0.192, 0.252, t2);
-      // extremely diffuse; it's basically a light-trapping fibre mat
-      c.put(x, y, r, g, b, 0.5, 1, 0.97, alpha);
+
+      // Height and roughness were flat constants here, which the atlas harness
+      // correctly rejected: a constant height bakes to a perfectly flat normal
+      // map, so every filament lit identically and the drape read as printed
+      // wallpaper. Both now vary.
+      //
+      // Relief: each filament is a round fibre, so it is highest along its own
+      // centreline. `alpha` already encodes distance-to-centre (it is the
+      // feathered coverage), so it doubles as a cheap cylindrical profile.
+      const fibreCore = alpha * alpha;
+      const strandNoise = nz.fbm(u * 44, v * 26, 44, 26, 3);
+      const h = clamp01(0.4 + fibreCore * 0.34 + strandNoise * 0.12);
+
+      // Roughness: usnea is a light-trapping fibre mat, so it sits very high —
+      // but not uniformly. Where filaments bunch (high alpha) they trap more
+      // light and go rougher still; sparse edge strands catch a faint sheen.
+      const rough = clamp01(0.88 + fibreCore * 0.09 - strandNoise * 0.07);
+      c.put(x, y, r, g, b, h, 1, rough, alpha);
     }
   }
 }
