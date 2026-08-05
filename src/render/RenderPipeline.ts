@@ -249,7 +249,7 @@ export class RenderPipeline {
   private moon: THREE.DirectionalLight | null = null;
   private fog: FogParams = { density: 0.022, baseHeight: 0, falloff: 9, turbulence: 0.55 };
 
-  readonly gpuStats = { calls: 0, triangles: 0, gpuMs: 0, passes: 0 };
+  readonly gpuStats = { calls: 0, triangles: 0, gpuMs: 0, passes: 0, geometries: 0, textures: 0, programs: 0 };
 
   constructor(renderer: THREE.WebGLRenderer, spec: QualitySpec) {
     this.renderer = renderer;
@@ -1400,6 +1400,10 @@ export class RenderPipeline {
     this.gpuStats.triangles = r.info.render.triangles;
     this.gpuStats.gpuMs = this.timer.lastMs;
     this.gpuStats.passes = passes;
+    // memory counters for leak hunting: these must stay flat over a session
+    this.gpuStats.geometries = r.info.memory.geometries;
+    this.gpuStats.textures = r.info.memory.textures;
+    this.gpuStats.programs = r.info.programs ? r.info.programs.length : 0;
   }
 
   /**

@@ -101,9 +101,20 @@ class StaticGame {
     this.audio = new AudioEngine(this.settings.audio, this.spec.tier === 'low');
   }
 
+  // boot-stage wall-clock timings, for load-time profiling (F3/debug)
+  private bootTimes: Record<string, number> = {};
+  private bootT0 = 0;
+  private bootMark(stage: string): void {
+    const now = performance.now();
+    if (this.bootT0 === 0) { this.bootT0 = now; return; }
+    this.bootTimes[stage] = Math.round(now - this.bootT0);
+    this.bootT0 = now;
+  }
+
   // ================================================================ boot
   async boot(): Promise<void> {
     const p = (f: number, s: string) => { this.menu.setLoadProgress(f, s); };
+    this.bootMark('start');
 
     p(0.02, 'igniting renderer…');
     this.renderer = new THREE.WebGLRenderer({
@@ -121,10 +132,23 @@ class StaticGame {
     this.handleResize();
     if (import.meta.env.DEV) console.info('[STATIC] GPU:', probeRenderer());
     await frame();
+    this.bootMark('renderer');
+
+    // Start procedural PBR synthesis NOW — it is the heaviest CPU stage and is
+    // fully independent of terrain/ecology/collision/nav, so it runs
+    // CONCURRENTLY with the world-gen below instead of serially after it.
+    // We only await it at MapGenerator, the first consumer.
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    const matsPromise = MaterialLibrary.create(WORLD_SEED, {
+      size: this.spec.textureSize,
+      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
+      onProgress: (f, label) => p(0.10 + f * 0.20, `synthesising ${label}…`),
+    });
 
     p(0.08, 'surveying terrain…');
     this.hf = new HeightField(WORLD_SEED);
     await frame();
+    this.bootMark('heightfield');
 
     // Ecology field. Must exist before anything is scattered or dressed: the
     // zone weights decide species, density, ground cover, fog and light. It is
@@ -133,33 +157,39 @@ class StaticGame {
     p(0.09, 'reading the ecology…');
     this.zones = new ZoneSystem(this.hf, WORLD_SEED);
     await frame();
+    this.bootMark('zones');
 
-    // Procedural PBR synthesis is the single heaviest boot stage. It yields a
-    // frame between each surface so the loading bar animates instead of
-    // freezing (and mobile Safari doesn't kill the tab for jank).
-    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    this.mats = await MaterialLibrary.create(WORLD_SEED, {
-      size: this.spec.textureSize,
-      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
-      onProgress: (f, label) => p(0.10 + f * 0.20, `synthesising ${label}…`),
-    });
+    // Materials were synthesising in the background since renderer init;
+    // MapGenerator is their first consumer, so await here. (It yields a frame
+    // between surfaces internally, so the loading bar kept animating.)
+    this.mats = await matsPromise;
+    this.bootMark('materials');
 
     p(0.30, 'planting the forest…');
     this.col = new CollisionWorld(this.hf);
+    // Occlusion is raycast through the *same* collision data gameplay uses, so
+    // a sound is muffled by exactly the geometry that blocks movement and sight.
+    // Sharing the structure is the point: a separate audio-only world would
+    // drift out of agreement with what the player can see and walk through.
+    this.audio.setProbe(this.col);
     this.map = new MapGenerator(this.hf, this.mats, this.col, WORLD_SEED);
     await frame();
+    this.bootMark('map');
 
     p(0.48, 'teaching it to walk…');
     this.nav = new NavWorld(this.hf, this.col);
     await frame();
+    this.bootMark('nav');
 
     p(0.56, 'assembling scene…');
     this.buildScene();
     await frame();
+    this.bootMark('scene');
 
     p(0.62, 'measuring the sky…');
     this.captureEnvironment();
     await frame();
+    this.bootMark('envprobe');
 
     p(0.68, 'waking the entity…');
     this.entity = new EntityBrain(this.nav, this.col, this.hf, WORLD_SEED);
@@ -167,6 +197,7 @@ class StaticGame {
     this.scene.add(this.rig.group);
     this.wireEntity();
     await frame();
+    this.bootMark('entity');
 
     p(0.76, 'charging flashlight…');
     this.player = new Player(this.col, this.hf, this.mats);
@@ -179,17 +210,18 @@ class StaticGame {
     this.tapes = new TapeSystem(this.map, this.mats, this.scene, this.runSeed);
     this.effects = new Effects(this.scene, this.hf, this.spec.fogWisps, this.spec.particleCount);
     await frame();
+    this.bootMark('player/fx');
 
-    p(0.84, 'warming shader pipelines…');
+    p(0.84, 'assembling renderer…');
     this.pipeline = new RenderPipeline(this.renderer, this.spec);
     this.pipeline.resize(this.renderer.domElement.width, this.renderer.domElement.height);
     this.pipeline.setMoon(this.moon);
     this.syncProjection();
     this.applyWeatherLook(0, true);
-    await this.warmup();
     await frame();
+    this.bootMark('pipeline');
 
-    p(0.94, 'wiring input…');
+    p(0.92, 'wiring input…');
     this.input = new Input(this.canvas);
     this.applySettings(this.settings);
     this.input.onFirstGesture = () => { this.audio.init(); this.audio.resume(); };
@@ -199,9 +231,23 @@ class StaticGame {
     this.loop.onRender((dt) => this.render(dt));
     this.loop.start();
     await frame();
+    this.bootMark('input');
 
+    // Title FIRST, warm shaders SECOND. Shader program warm-up (multi-second
+    // on real GPUs) used to block the title screen; now it runs as a
+    // background task while the menu is already interactive. startRun()
+    // waits behind the loading screen only if it isn't finished yet.
     p(1.0, 'tape loaded.');
+    this.bootMark('title');
+    if (import.meta.env.DEV) console.info('[STATIC] boot ms:', this.bootTimes);
     this.toTitle();
+    const w0 = performance.now();
+    this.warmupPromise = this.warmup()
+      .catch(err => console.error('[STATIC] warmup failed', err))
+      .finally(() => {
+        this.bootTimes['warmup(bg)'] = Math.round(performance.now() - w0);
+        this.warmupPromise = null;
+      });
   }
 
   private buildScene(): void {
@@ -283,7 +329,14 @@ class StaticGame {
     this.effects.setRain(true);
     this.tapes.spawnAll(this.runSeed);
     await frame();
-    this.renderer.compile(this.scene, this.player.camera);
+    // compileAsync uses KHR_parallel_shader_compile when the driver offers it,
+    // so program linking overlaps instead of blocking one-by-one (big win on
+    // drivers with slow single-threaded compile); falls back to sync compile.
+    if (typeof this.renderer.compileAsync === 'function') {
+      await this.renderer.compileAsync(this.scene, this.player.camera);
+    } else {
+      this.renderer.compile(this.scene, this.player.camera);
+    }
     await frame();
     // Two full pipeline renders: the first compiles every post program, the
     // second exercises the temporal paths (TAA / AO / volumetric history) so
@@ -301,7 +354,14 @@ class StaticGame {
 
   // ================================================================ wiring
   private wireMenu(): void {
-    this.menu.onStart = () => this.startRun();
+    // The advisory is a hard gate on the *first* run only (§11 gate 9: "present
+    // before first play"). Once acknowledged it never interrupts again, and it
+    // remains reachable from Settings.
+    this.menu.onStart = () => {
+      if (!this.menu.advisoryAcknowledged) { this.menu.show('advisory'); return; }
+      this.startRun();
+    };
+    this.menu.onAdvisoryAck = () => this.startRun();
     this.menu.onRestart = () => this.startRun();
     this.menu.onResume = () => this.resume();
     this.menu.onQuit = () => this.toTitle();
@@ -327,16 +387,38 @@ class StaticGame {
 
   private wireEntity(): void {
     this.entity.onCaptured = () => { if (this.state === 'playing') this.capture(); };
-    this.entity.onGlimpse = () => this.fear.triggerGlimpse();
+    // A glimpse is the one moment the audio is allowed a transient of its own.
+    // The sting is round-robin'd inside EntityAudio, so no two sightings in a
+    // run share a recipe (brief §8 / quality gate 3).
+    this.entity.onGlimpse = () => {
+      this.fear.triggerGlimpse();
+      const s = this.entitySnap;
+      this.audio.sighting(s ? s.distToPlayer : 30);
+    };
+    // Footfalls carry true world position so the spatialiser can place them;
+    // EntityAudio adds its own distance-scaled positional error on top, so
+    // careful listening yields a direction, never a fix.
     this.entity.onFootfall = (x, z, dist) => {
-      this.audio.entityCue(dist, dist < 20 ? 'footfall' : undefined);
+      this.audio.entityCue(dist, dist < 20 ? 'footfall' : 'snap',
+        x, this.hf.heightAt(x, z) + 1.2, z);
     };
   }
 
   private wireLifecycle(): void {
     window.addEventListener('resize', () => { this.handleResize(); this.menu.checkOrientation(); });
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.state === 'playing') this.pause();
+      if (document.hidden) {
+        if (this.state === 'playing') this.pause();
+        // Suspend unconditionally, not just while playing: a backgrounded tab
+        // sitting on the title screen must not keep an AudioContext running, or
+        // mobile browsers will kill it in a state we can't detect (§12).
+        this.audio.suspend();
+      } else if (this.state === 'playing' || this.state === 'paused') {
+        // Resume on return. iOS may have hard-interrupted the context (phone
+        // call, screen lock); unlock() re-resumes and re-kicks it, and is a
+        // no-op when the context is already running.
+        this.audio.resume();
+      }
     });
     this.canvas.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
@@ -361,7 +443,10 @@ class StaticGame {
       this.input.gyroEnabled = s.gyro;
     }
     if (this.player) this.player.baseFov = s.fov;
-    this.audio.setVolume(s.volume);
+    // Per-bus levels, the low-frequency-intensity trim, night mode and the
+    // caption toggle all live in s.audio — the legacy single `volume` slider is
+    // mirrored into audio.master by loadSettings().
+    this.audio.applySettings(s.audio);
     const tier = s.quality === 'auto' ? probeQuality() : s.quality;
     const spec = QUALITY_SPECS[tier];
     if (this.pipeline && spec.tier !== this.spec.tier) {
@@ -401,11 +486,26 @@ class StaticGame {
     this.input?.releasePointerLock();
   }
 
+  private warmupPromise: Promise<void> | null = null;
+
   private startRun(): void {
+    if (this.warmupPromise) {
+      // Shader warm-up still running in the background — hold on the loading
+      // screen until it resolves, then re-enter startRun().
+      this.menu.show('loading');
+      this.menu.setLoadProgress(0.97, 'warming shaders…');
+      const wp = this.warmupPromise;
+      wp.then(() => this.startRun());
+      return;
+    }
     this.audio.init();
     this.audio.resume();
     // fresh per-run seed: tape positions & ambient variation differ per run
     this.runSeed = (WORLD_SEED ^ ((Date.now() & 0xffff) * 2654435761)) >>> 0;
+    // Every audio subsystem reseeds off this, so a fixed runSeed reproduces the
+    // exact same ambience schedule and sting order — which is what makes the
+    // seeded Director test in the suite meaningful.
+    this.audio.startRun(this.runSeed);
     this.runTime = 0;
     this.rainTriggered = false;
     this.weather.rain = 0;
@@ -443,6 +543,7 @@ class StaticGame {
   private pause(): void {
     if (this.state !== 'playing') return;
     this.state = 'paused';
+    this.audio.suspend();
     this.loop.paused = true;
     this.menu.show('pause');
     this.input.releasePointerLock();
@@ -451,6 +552,7 @@ class StaticGame {
   private resume(): void {
     if (this.state !== 'paused') return;
     this.state = 'playing';
+    this.audio.resume();
     this.loop.paused = false;
     this.menu.show('none');
     this.input.requestPointerLock();
@@ -477,6 +579,7 @@ class StaticGame {
 
   private finishRun(): void {
     this.state = this.endKind; // 'escaped' | 'taken' — win/lose is part of the state contract
+    this.audio.endRun();
     this.loop.paused = true;
     this.menu.showHud(false);
     this.menu.showTouchUI(false);
@@ -602,7 +705,12 @@ class StaticGame {
 
     // ---- fear / static ----
     this.fear.update(dt, snap.detection, snap.visibleToPlayer, snap.distToPlayer);
-    this.audio.setFearLevel(this.fear.value);
+
+    // The brain owns the "extension / reach" beat: a rare late-act moment where
+    // the entity asserts presence without moving. It is the only gameplay hook
+    // permitted to spend the sub-bass budget, and the Director can still refuse
+    // it if the budget is exhausted.
+    if (snap.extensionRequest) this.audio.extensionBeat(snap.distToPlayer);
 
     // close-range beam catch → flinch + cue
     this.flinchCooldown = Math.max(0, this.flinchCooldown - dt);
@@ -701,6 +809,9 @@ class StaticGame {
     // ---- HUD ----
     this.menu.update(dt);
     this.updateSubtitles(dt);
+    // Audio-cue captions are pushed every frame; the engine owns their lifetime
+    // and returns an empty list when the setting is off, so no branch is needed.
+    this.menu.setAudioCues(this.audio.cues.map(c => c.text));
     this.menu.setViewfinder(inp.vfHeld, 4);
     if (this.perfVisible) {
       const st = this.loop.stats();
@@ -712,7 +823,8 @@ class StaticGame {
         `draws ${g.calls}  tris ${(g.triangles / 1000).toFixed(0)}k  passes ${g.passes}\n` +
         `scale ${this.pipeline.renderScale.toFixed(2)}  effort ${this.pipeline.effort.toFixed(2)}\n` +
         `wet ${this.weather.wetness.toFixed(2)}  batt ${this.flashlight.battery.toFixed(2)}\n` +
-        `state ${snap.state}  det ${snap.detection.toFixed(2)}  dist ${snap.distToPlayer.toFixed(0)}m`);
+        `state ${snap.state}  det ${snap.detection.toFixed(2)}  dist ${snap.distToPlayer.toFixed(0)}m\n` +
+        this.audioPerfLine());
     }
 
     // ---- static overlay state for composite ----
@@ -727,8 +839,31 @@ class StaticGame {
     if (Math.hypot(this.player.pos.x - ex.x, this.player.pos.z - ex.z) < 7) this.escape();
   }
 
+  /**
+   * Audio block of the F3 overlay. Brief §6 requires the Director's state to be
+   * visible for tuning: without seeing `act`, `tension` and which layers are
+   * live, escalation can only be guessed at by ear across whole runs.
+   */
+  private audioPerfLine(): string {
+    const d = this.audio.directorState;
+    const m = this.audio.meterMaster();
+    const a = this.audio.debug() as { voices: number; poolSize: number; dropped: number; duck: number };
+    const spends = Object.entries(d.spends).map(([k, v]) => `${k[0]}${v}`).join(' ');
+    return (
+      `AUD ${this.audio.state}  act ${d.act}  ten ${d.tension.toFixed(2)}  sil ${d.silence.toFixed(2)} (${d.silenceSeconds.toFixed(0)}s)\n` +
+      `lyr ${d.layers.join(',') || '—'}  sub ${d.sub.toFixed(2)} cls ${d.cluster.toFixed(2)} ris ${d.riser.toFixed(2)}\n` +
+      `lufs ${m.lufs.toFixed(1)}  pk ${m.peak.toFixed(3)}  duck ${a.duck.toFixed(2)}  ` +
+      `vox ${a.voices}/${a.poolSize} drop ${a.dropped}\n` +
+      `budget ${spends}  why ${d.reason}`
+    );
+  }
+
   private render(dt: number): void {
-    if (!this.pipeline) return;
+    // While background warmup runs, skip the loop's renders entirely: the
+    // first pipeline.render() is what compiles every post program, and letting
+    // it happen inside a normal frame stalls the just-appeared title screen
+    // for seconds. Warmup does those compiles itself (direct pipeline calls).
+    if (!this.pipeline || this.warmupPromise) return;
     this.pipeline.render(this.scene, this.player.camera, this.staticState, dt);
     this.pipeline.adaptResolution(dt * 1000, performance.now() / 1000);
   }
@@ -743,6 +878,7 @@ class StaticGame {
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
       gpuStats: () => this.pipeline ? { ...this.pipeline.gpuStats } : null,
+      bootTimes: () => ({ ...this.bootTimes }),
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
         this.flashlight?.warp();
@@ -765,6 +901,12 @@ class StaticGame {
             this.entity.pos.x - this.player.pos.x,
             this.entity.pos.z - this.player.pos.z),
           speed: this.entitySnap.speed,
+          act: this.entity.currentAct,
+          extensionEligible: this.entity.extensionEligible,
+          // A request is a single-frame edge owned by the brain's own tick, so a
+          // debug read outside that tick must report false rather than
+          // resurrecting a stale edge.
+          extensionRequest: false,
         };
       },
       flashlight: (on: boolean) => { if (this.flashlight.on !== on) this.flashlight.toggle(); },
@@ -778,6 +920,42 @@ class StaticGame {
         spawn: this.hf.layout.spawn, exit: this.hf.layout.exit,
         zones: this.hf.layout.zones.map(z => ({ id: z.id, x: z.x, z: z.z })),
       }),
+
+      // ---- audio (brief §13) -------------------------------------------------
+      // One snapshot object carrying Director state, per-bus metering, voice
+      // counts and trigger history. The test suite asserts against this rather
+      // than trying to listen to the output, which is not observable headlessly.
+      audio: () => this.audio.debug(),
+      audioMeter: (bus?: 'ambience' | 'entity' | 'foley' | 'ui') =>
+        bus ? this.audio.meterBus(bus) : this.audio.meterMaster(),
+      audioDirector: () => this.audio.directorState,
+      audioTriggers: () => this.audio.triggerLog.slice(),
+      audioCues: () => this.audio.cues.map(c => ({ text: c.text, kind: c.kind })),
+      // Deterministic trigger hooks so a test can exercise a bus without having
+      // to manoeuvre the AI into the right state.
+      audioFire: (what: 'sighting' | 'capture' | 'cue' | 'tape' | 'ui' | 'step' | 'extension') => {
+        switch (what) {
+          case 'sighting': this.audio.sighting(18); break;
+          case 'capture': this.audio.captureSting(); break;
+          case 'cue': this.audio.entityCue(30, 'snap'); break;
+          case 'tape': this.audio.tapePickup(); break;
+          case 'ui': this.audio.uiClick(); break;
+          case 'step': this.audio.footstep(this.player.surfaceHere(), 0.8); break;
+          case 'extension': this.audio.extensionBeat(24); break;
+        }
+      },
+      // Force the Director forward without waiting out a real 7-minute run, so
+      // the "early vs late differs measurably" assertion is testable.
+      audioForce: (o: { tapes?: number; runTime?: number }) => {
+        if (o.tapes !== undefined) {
+          for (const t of this.tapes.tapes) {
+            if (!t.collected && this.tapes.collected < o.tapes) {
+              t.collected = true; this.scene.remove(t.mesh); this.tapes.collected++;
+            }
+          }
+        }
+        if (o.runTime !== undefined) this.runTime = o.runTime;
+      },
     };
   }
 }

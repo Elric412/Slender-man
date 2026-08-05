@@ -47,12 +47,20 @@ export interface EntityAudioInput {
 
 export interface EntityFireCounts {
   sighting: number; cue: number; capture: number; corrupt: number;
+  /** the rare late-act "reach" beat */
+  extension: number;
 }
 
 /** Distance past which the approach layer is not worth a voice. */
 const APPROACH_RANGE = 55;
 /** Sightings can't retrigger faster than this, regardless of budget. */
 const SIGHTING_COOLDOWN = 2.5;
+/**
+ * The extension beat is punctuation, not a mechanic. Even if the brain asks and
+ * the Director pays, it cannot recur inside this window — two reaches close
+ * together stop reading as "it asserted itself" and start reading as a loop.
+ */
+const EXTENSION_COOLDOWN = 26;
 
 export class EntityAudio {
   private rng: SeededRandom;
@@ -68,6 +76,7 @@ export class EntityAudio {
   private lastOcc = 0;
   private sightingTimer = 0;
   private cueTimer = 0;
+  private extensionTimer = 0;
 
   /** No-repeat memories — the actual mechanism behind quality gate 3. */
   private sightHistory: number[] = [];
@@ -77,7 +86,7 @@ export class EntityAudio {
   /** Set true when a close cue fires, so the HUD can caption it for HoH players (§11). */
   approachCueFired = false;
   /** Debug/telemetry: how many stings of each kind have fired this run. */
-  readonly fired: EntityFireCounts = { sighting: 0, cue: 0, capture: 0, corrupt: 0 };
+  readonly fired: EntityFireCounts = { sighting: 0, cue: 0, capture: 0, corrupt: 0, extension: 0 };
 
   constructor(
     private buses: AudioBuses,
@@ -99,9 +108,11 @@ export class EntityAudio {
     this.interferenceLevel = 0;
     this.sightingTimer = 0;
     this.cueTimer = 0;
+    this.extensionTimer = 0;
     this.approachCueFired = false;
     this.fired.sighting = 0; this.fired.cue = 0;
     this.fired.capture = 0; this.fired.corrupt = 0;
+    this.fired.extension = 0;
   }
 
   // ───────────────────────────── continuous layers ────────────────────────────
@@ -110,6 +121,7 @@ export class EntityAudio {
     if (!this.buses.ready) return;
     this.sightingTimer = Math.max(0, this.sightingTimer - dt);
     this.cueTimer = Math.max(0, this.cueTimer - dt);
+    this.extensionTimer = Math.max(0, this.extensionTimer - dt);
 
     const dormant = input.state === 'dormant';
     const inRange = input.distToPlayer < APPROACH_RANGE;
@@ -370,6 +382,115 @@ export class EntityAudio {
         this.stopLater(n, g, t + 1.3);
         break;
       }
+    }
+  }
+
+  // ───────────────────────────── extension beat ───────────────────────────────
+
+  /**
+   * The "reach" / extension beat.
+   *
+   * A rare late-act moment where the entity asserts presence **without moving**.
+   * Everything else in this class is a reaction to the entity *doing* something;
+   * this one is the absence of action made audible, which is why it gets its own
+   * recipe rather than another `distantCue` kind.
+   *
+   * The sound design intent, in order of what the player actually notices:
+   *
+   *  1. **A hole in the bed.** The first thing that happens is the ambience and
+   *     approach layers duck. A sound that arrives *into silence* lands far
+   *     harder than a loud sound layered on top of a busy mix, and it costs no
+   *     headroom. This is the primary effect — the rest is detail.
+   *  2. **A slow inhale-shaped swell**, not a hit. An attack transient reads as
+   *     an impact, i.e. as something that happened *at* a place. A 1.4 s swell
+   *     with no transient reads as something *arriving* everywhere at once,
+   *     which is the intended "it reached toward you" sensation.
+   *  3. **Sub pressure**, but strictly optional and strictly rationed: it must
+   *     pass both the low-frequency accessibility switch and the Director's
+   *     budget. When it is refused the beat still plays, because it is a
+   *     gameplay-visible event and must not silently no-op.
+   *  4. **A mid-band correlate** so the beat survives phone speakers with no
+   *     low-frequency reproduction at all.
+   *
+   * `dist` only trims the amplitude — the beat is deliberately non-positional.
+   * Giving it a direction would turn it into a free wallhack at the exact moment
+   * the player is most motivated to listen hard.
+   */
+  extensionBeat(dist: number): void {
+    if (!this.buses.ready) return;
+    if (this.extensionTimer > 0) return;
+    const ctx = this.buses.ctx;
+    if (!ctx) return;
+    this.extensionTimer = EXTENSION_COOLDOWN;
+    this.fired.extension++;
+
+    const t = ctx.currentTime;
+    const out = this.buses.bus('entity');
+    // Near beats are not louder — proximity already raises the approach layer.
+    // This tapers with distance only enough to keep a 90 m reach from being as
+    // present as a 10 m one.
+    const amp = 0.5 + 0.34 * Math.max(0, 1 - dist / 90);
+
+    // ── 1. carve the hole ───────────────────────────────────────────────────
+    // Duck the continuous layers under the beat and restore them slowly, so the
+    // bed "comes back" after the moment has passed rather than snapping on.
+    const duckFrom = this.approachLevel;
+    this.approachLevel *= 0.18;
+    if (this.approach) this.approach.set(this.approachLevel, 0.25);
+    setTimeout(() => {
+      this.approachLevel = duckFrom * 0.7;
+      if (this.approach) this.approach.set(this.approachLevel, 1.5);
+    }, 2100);
+
+    // ── 2. the swell ────────────────────────────────────────────────────────
+    // Band-limited noise through a slowly opening filter. The filter sweep, not
+    // the gain, is what makes it read as approaching: brightening is perceived
+    // as nearing far more strongly than loudening.
+    const n = this.kit.noiseSource(0.42, 0.85);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(180, t);
+    bp.frequency.exponentialRampToValueAtTime(760, t + 1.4);
+    bp.frequency.exponentialRampToValueAtTime(240, t + 3.1);
+    bp.Q.value = 0.85;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    // linear-in-log swell with no transient whatsoever
+    g.gain.exponentialRampToValueAtTime(amp * 0.42, t + 1.4);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 3.2);
+    n.connect(bp); bp.connect(g); g.connect(out);
+    this.stopLater(n, g, t + 3.4);
+
+    // ── 3. sub pressure, if we're allowed it ────────────────────────────────
+    if (!this.buses.lowFreqDisabled && this.director.requestSpend('subBeat')) {
+      // No beat modulation: a pulsing sub reads as a heartbeat, which is a
+      // different (and much more clichéd) emotion than a held pressure.
+      const sub = this.kit.subBassDrone({
+        freq: 23 + this.rng.range(0, 5), beat: 0, swell: 0.12, swellDepth: 0.3,
+      });
+      sub.set(0, 0.01);
+      sub.set(0.92, 1.2);
+      setTimeout(() => sub.set(0, 1.1), 1500);
+      setTimeout(() => sub.stop(1.0), 3000);
+    }
+
+    // ── 4. mid-band correlate ───────────────────────────────────────────────
+    // A thin, slightly inharmonic pair so the moment still exists on a laptop
+    // speaker. Detuned by a non-musical interval — a clean fifth would sound
+    // composed, and this should not sound composed.
+    const pair = [214, 214 * 1.0293];
+    for (let i = 0; i < pair.length; i++) {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = pair[i] * (1 + this.rng.range(-0.004, 0.004));
+      const og = ctx.createGain();
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.exponentialRampToValueAtTime(amp * (i === 0 ? 0.075 : 0.05), t + 1.5);
+      og.gain.exponentialRampToValueAtTime(0.0001, t + 3.0);
+      o.connect(og); og.connect(out);
+      o.start(t);
+      o.stop(t + 3.2);
+      this.stopLater(o, og, t + 3.2);
     }
   }
 

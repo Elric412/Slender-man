@@ -84,6 +84,37 @@ body.cb .panel-title { color: var(--accent-cb); }
 .settings-grid input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); justify-self: start; }
 .settings-grid select { font-family: var(--mono); background: #0d1114; color: var(--ink); border: 1px solid #232b31; padding: 6px 10px; font-size: 12px; }
 
+/* Section rules inside the settings grid. The audio block is long enough that
+   without headers it reads as one undifferentiated wall of sliders. */
+.settings-section {
+  grid-column: 1 / -1; font-size: 10px; letter-spacing: 0.26em;
+  color: var(--accent); border-bottom: 1px solid #1d2429;
+  padding-bottom: 6px; margin-top: 10px;
+}
+body.cb .settings-section { color: var(--accent-cb); }
+
+/* Explanatory sub-text under an accessibility control. These settings are only
+   useful if the player understands what they do, so the copy is part of the
+   feature rather than decoration. */
+.settings-grid label .hint,
+.advisory-grid label .hint {
+  display: block; margin-top: 4px; font-size: 10px; line-height: 1.6;
+  letter-spacing: 0.04em; color: var(--ink-dim); text-transform: none;
+}
+
+/* ---------- content advisory ---------- */
+.advisory-list { margin: 0 0 14px 18px; padding: 0; }
+.advisory-list li { margin-bottom: 8px; font-size: 12px; line-height: 1.7; }
+.advisory-list strong { color: var(--ink); }
+.advisory-grid {
+  display: grid; grid-template-columns: 1fr auto; gap: 14px 20px;
+  align-items: center; margin: 14px 0 16px;
+  padding: 14px 16px; border: 1px solid #1d2429; background: rgba(8,11,14,0.6);
+}
+.advisory-grid label { font-size: 12px; letter-spacing: 0.12em; color: var(--ink); }
+.advisory-grid input[type=range] { width: 150px; accent-color: var(--accent); }
+.advisory-grid input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); justify-self: start; }
+
 /* ---------- end ---------- */
 .end-inner { text-align: center; z-index: 1; padding: 0 16px; }
 .end-title { font-size: clamp(30px, 7vw, 68px); letter-spacing: 0.4em; text-indent: 0.4em; color: var(--ink); margin-bottom: 18px; }
@@ -122,6 +153,25 @@ body.cb .panel-title { color: var(--accent-cb); }
   font-size: 14px; line-height: 1.7; letter-spacing: 0.08em; color: #e8e4d8;
   background: rgba(3,4,6,0.72); padding: 10px 20px; text-shadow: 0 1px 2px #000;
 }
+
+/*
+  Audio-cue caption (§11). Positioned above the subtitle line and styled as a
+  bracketed system readout rather than speech, because it is describing the world
+  to a player who cannot hear it — conflating it with dialogue would be worse
+  than showing nothing.
+*/
+.audio-cue {
+  position: absolute; left: 50%; bottom: 21%; transform: translateX(-50%);
+  max-width: min(560px, 86vw); text-align: center;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--accent); background: rgba(3,4,6,0.66);
+  border-left: 2px solid var(--accent); border-right: 2px solid var(--accent);
+  padding: 7px 18px; text-shadow: 0 1px 2px #000;
+  animation: cuefade 0.22s ease-out;
+}
+body.cb .audio-cue { color: var(--accent-cb); border-left-color: var(--accent-cb); border-right-color: var(--accent-cb); }
+@keyframes cuefade { from { opacity: 0; transform: translateX(-50%) translateY(4px); } }
 
 /* viewfinder */
 .viewfinder { position: absolute; inset: 0; pointer-events: none; }
@@ -177,6 +227,10 @@ body.cb .panel-title { color: var(--accent-cb); }
 @media (max-height: 480px) and (pointer: coarse) {
   .interact-prompt { bottom: 30%; }
   .subtitle { bottom: 18%; font-size: 12px; }
+  /* Keep the cue clear of the subtitle line on short landscape screens. */
+  .audio-cue { bottom: 28%; font-size: 10px; letter-spacing: 0.14em; padding: 5px 12px; }
+  .advisory-grid { grid-template-columns: 1fr; gap: 8px; }
+  .advisory-grid input[type=range] { width: 100%; }
   #stick-base { bottom: 30px; width: 96px; height: 96px; }
   .touch-buttons { bottom: calc(16px + env(safe-area-inset-bottom)); grid-template-columns: repeat(3, 56px); }
   .tbtn { width: 56px; height: 56px; font-size: 18px; }
