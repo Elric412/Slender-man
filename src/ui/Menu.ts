@@ -1,10 +1,11 @@
 import { Settings, saveSettings } from '../core/Config';
 
-type ScreenId = 'loading' | 'title' | 'about' | 'settings' | 'pause' | 'end' | 'none';
+type ScreenId = 'loading' | 'title' | 'about' | 'settings' | 'pause' | 'end' | 'advisory' | 'none';
 
 const SCREEN_DIVS: Record<Exclude<ScreenId, 'none'>, string> = {
   loading: 'loading-screen', title: 'title-screen', about: 'about-screen',
   settings: 'settings-screen', pause: 'pause-screen', end: 'end-screen',
+  advisory: 'advisory-screen',
 };
 
 /** DOM menu/HUD controller — screens are styled as part of the game's found-footage world. */
@@ -18,6 +19,8 @@ export class Menu {
   onRestart: (() => void) | null = null;
   onSettingsChanged: ((s: Settings) => void) | null = null;
   onUiClick: (() => void) | null = null;
+  /** Fired once the player acknowledges the content advisory. */
+  onAdvisoryAck: (() => void) | null = null;
 
   private els = new Map<string, HTMLElement>();
   private tapeTimer = 0;
@@ -27,7 +30,8 @@ export class Menu {
     const ids = ['loading-screen', 'title-screen', 'about-screen', 'settings-screen', 'pause-screen',
       'end-screen', 'hud', 'load-bar', 'load-status', 'tape-counter', 'tape-count', 'interact-prompt',
       'subtitle', 'viewfinder-overlay', 'vf-time', 'rotate-prompt', 'perf-overlay', 'touch-ui',
-      'capture-overlay', 'end-title', 'end-detail', 'end-stats'];
+      'capture-overlay', 'end-title', 'end-detail', 'end-stats',
+      'advisory-screen', 'audio-cue'];
     for (const id of ids) {
       const el = document.getElementById(id);
       if (el) this.els.set(id, el);
@@ -75,7 +79,28 @@ export class Menu {
       s.quality = (e.target as HTMLSelectElement).value as Settings['quality'];
       this.commit();
     });
-    bindRange('set-volume', v => { s.volume = v / 100; });
+    // Master is mirrored into both the legacy field and the audio bus group, so
+    // an old saved profile and a new one converge on the same behaviour.
+    bindRange('set-volume', v => { s.volume = v / 100; s.audio.master = v / 100; });
+    bindRange('set-vol-ambience', v => { s.audio.ambience = v / 100; });
+    bindRange('set-vol-entity', v => { s.audio.entity = v / 100; });
+    bindRange('set-vol-foley', v => { s.audio.foley = v / 100; });
+    bindRange('set-vol-ui', v => { s.audio.ui = v / 100; });
+    // The low-frequency trim is intentionally NOT tied to master (§11): a player
+    // who wants a loud game with no sub-bass must be able to have exactly that.
+    bindRange('set-lowfreq', v => { s.audio.lowFreq = v / 100; this.mirrorAdvisory(); });
+    bindCheck('set-nightmode', v => { s.audio.nightMode = v; });
+    bindCheck('set-audiocues', v => { s.audio.audioCues = v; this.mirrorAdvisory(); });
+
+    // The advisory screen hosts duplicates of the two most important controls.
+    // They write the same settings object, so either surface works.
+    bindRange('adv-lowfreq', v => { s.audio.lowFreq = v / 100; this.mirrorSettingsAudio(); });
+    bindCheck('adv-audiocues', v => { s.audio.audioCues = v; this.mirrorSettingsAudio(); });
+    click('btn-advisory-ok', () => {
+      s.advisoryAck = true;
+      this.commit();
+      this.onAdvisoryAck?.();
+    });
     bindRange('set-sens', v => { s.sensitivity = v / 100; });
     bindRange('set-fov', v => { s.fov = v; });
     bindCheck('set-inverty', v => { s.invertY = v; });
@@ -87,7 +112,24 @@ export class Menu {
   private applySettingsToControls(): void {
     const s = this.settings;
     (document.getElementById('set-quality') as HTMLSelectElement).value = s.quality;
-    (document.getElementById('set-volume') as HTMLInputElement).value = String(s.volume * 100);
+    (document.getElementById('set-volume') as HTMLInputElement).value = String(s.audio.master * 100);
+    const setRange = (id: string, v: number) => {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      if (el) el.value = String(Math.round(v * 100));
+    };
+    const setCheck = (id: string, v: boolean) => {
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      if (el) el.checked = v;
+    };
+    setRange('set-vol-ambience', s.audio.ambience);
+    setRange('set-vol-entity', s.audio.entity);
+    setRange('set-vol-foley', s.audio.foley);
+    setRange('set-vol-ui', s.audio.ui);
+    setRange('set-lowfreq', s.audio.lowFreq);
+    setCheck('set-nightmode', s.audio.nightMode);
+    setCheck('set-audiocues', s.audio.audioCues);
+    setRange('adv-lowfreq', s.audio.lowFreq);
+    setCheck('adv-audiocues', s.audio.audioCues);
     (document.getElementById('set-sens') as HTMLInputElement).value = String(s.sensitivity * 100);
     (document.getElementById('set-fov') as HTMLInputElement).value = String(s.fov);
     (document.getElementById('set-inverty') as HTMLInputElement).checked = s.invertY;
@@ -100,6 +142,45 @@ export class Menu {
   private commit(): void {
     saveSettings(this.settings);
     this.onSettingsChanged?.(this.settings);
+  }
+
+  /** Push the shared audio values from Settings onto the advisory duplicates. */
+  private mirrorAdvisory(): void {
+    const a = document.getElementById('adv-lowfreq') as HTMLInputElement | null;
+    if (a) a.value = String(Math.round(this.settings.audio.lowFreq * 100));
+    const c = document.getElementById('adv-audiocues') as HTMLInputElement | null;
+    if (c) c.checked = this.settings.audio.audioCues;
+  }
+
+  /** And the reverse, when the advisory screen is the one being touched. */
+  private mirrorSettingsAudio(): void {
+    const a = document.getElementById('set-lowfreq') as HTMLInputElement | null;
+    if (a) a.value = String(Math.round(this.settings.audio.lowFreq * 100));
+    const c = document.getElementById('set-audiocues') as HTMLInputElement | null;
+    if (c) c.checked = this.settings.audio.audioCues;
+  }
+
+  /** Has the player seen and acknowledged the content advisory? (§11 gate 9) */
+  get advisoryAcknowledged(): boolean { return this.settings.advisoryAck; }
+
+  /**
+   * Render the current audio-cue captions. Called every frame with the engine's
+   * live list; an empty list hides the element rather than leaving a stale line
+   * on screen.
+   */
+  setAudioCues(texts: readonly string[]): void {
+    const el = this.els.get('audio-cue');
+    if (!el) return;
+    if (!texts.length) {
+      if (!el.classList.contains('hidden')) {
+        el.classList.add('hidden');
+        el.textContent = '';
+      }
+      return;
+    }
+    const joined = texts.join(' · ');
+    if (el.textContent !== joined) el.textContent = joined;
+    el.classList.remove('hidden');
   }
 
   openSettings(from: ScreenId): void {
