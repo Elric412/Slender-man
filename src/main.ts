@@ -101,9 +101,20 @@ class StaticGame {
     this.audio = new AudioEngine(this.settings.audio, this.spec.tier === 'low');
   }
 
+  // boot-stage wall-clock timings, for load-time profiling (F3/debug)
+  private bootTimes: Record<string, number> = {};
+  private bootT0 = 0;
+  private bootMark(stage: string): void {
+    const now = performance.now();
+    if (this.bootT0 === 0) { this.bootT0 = now; return; }
+    this.bootTimes[stage] = Math.round(now - this.bootT0);
+    this.bootT0 = now;
+  }
+
   // ================================================================ boot
   async boot(): Promise<void> {
     const p = (f: number, s: string) => { this.menu.setLoadProgress(f, s); };
+    this.bootMark('start');
 
     p(0.02, 'igniting renderer…');
     this.renderer = new THREE.WebGLRenderer({
@@ -121,10 +132,23 @@ class StaticGame {
     this.handleResize();
     if (import.meta.env.DEV) console.info('[STATIC] GPU:', probeRenderer());
     await frame();
+    this.bootMark('renderer');
+
+    // Start procedural PBR synthesis NOW — it is the heaviest CPU stage and is
+    // fully independent of terrain/ecology/collision/nav, so it runs
+    // CONCURRENTLY with the world-gen below instead of serially after it.
+    // We only await it at MapGenerator, the first consumer.
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    const matsPromise = MaterialLibrary.create(WORLD_SEED, {
+      size: this.spec.textureSize,
+      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
+      onProgress: (f, label) => p(0.10 + f * 0.20, `synthesising ${label}…`),
+    });
 
     p(0.08, 'surveying terrain…');
     this.hf = new HeightField(WORLD_SEED);
     await frame();
+    this.bootMark('heightfield');
 
     // Ecology field. Must exist before anything is scattered or dressed: the
     // zone weights decide species, density, ground cover, fog and light. It is
@@ -133,16 +157,13 @@ class StaticGame {
     p(0.09, 'reading the ecology…');
     this.zones = new ZoneSystem(this.hf, WORLD_SEED);
     await frame();
+    this.bootMark('zones');
 
-    // Procedural PBR synthesis is the single heaviest boot stage. It yields a
-    // frame between each surface so the loading bar animates instead of
-    // freezing (and mobile Safari doesn't kill the tab for jank).
-    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    this.mats = await MaterialLibrary.create(WORLD_SEED, {
-      size: this.spec.textureSize,
-      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
-      onProgress: (f, label) => p(0.10 + f * 0.20, `synthesising ${label}…`),
-    });
+    // Materials were synthesising in the background since renderer init;
+    // MapGenerator is their first consumer, so await here. (It yields a frame
+    // between surfaces internally, so the loading bar kept animating.)
+    this.mats = await matsPromise;
+    this.bootMark('materials');
 
     p(0.30, 'planting the forest…');
     this.col = new CollisionWorld(this.hf);
@@ -153,18 +174,22 @@ class StaticGame {
     this.audio.setProbe(this.col);
     this.map = new MapGenerator(this.hf, this.mats, this.col, WORLD_SEED);
     await frame();
+    this.bootMark('map');
 
     p(0.48, 'teaching it to walk…');
     this.nav = new NavWorld(this.hf, this.col);
     await frame();
+    this.bootMark('nav');
 
     p(0.56, 'assembling scene…');
     this.buildScene();
     await frame();
+    this.bootMark('scene');
 
     p(0.62, 'measuring the sky…');
     this.captureEnvironment();
     await frame();
+    this.bootMark('envprobe');
 
     p(0.68, 'waking the entity…');
     this.entity = new EntityBrain(this.nav, this.col, this.hf, WORLD_SEED);
@@ -172,6 +197,7 @@ class StaticGame {
     this.scene.add(this.rig.group);
     this.wireEntity();
     await frame();
+    this.bootMark('entity');
 
     p(0.76, 'charging flashlight…');
     this.player = new Player(this.col, this.hf, this.mats);
@@ -184,17 +210,18 @@ class StaticGame {
     this.tapes = new TapeSystem(this.map, this.mats, this.scene, this.runSeed);
     this.effects = new Effects(this.scene, this.hf, this.spec.fogWisps, this.spec.particleCount);
     await frame();
+    this.bootMark('player/fx');
 
-    p(0.84, 'warming shader pipelines…');
+    p(0.84, 'assembling renderer…');
     this.pipeline = new RenderPipeline(this.renderer, this.spec);
     this.pipeline.resize(this.renderer.domElement.width, this.renderer.domElement.height);
     this.pipeline.setMoon(this.moon);
     this.syncProjection();
     this.applyWeatherLook(0, true);
-    await this.warmup();
     await frame();
+    this.bootMark('pipeline');
 
-    p(0.94, 'wiring input…');
+    p(0.92, 'wiring input…');
     this.input = new Input(this.canvas);
     this.applySettings(this.settings);
     this.input.onFirstGesture = () => { this.audio.init(); this.audio.resume(); };
@@ -204,9 +231,23 @@ class StaticGame {
     this.loop.onRender((dt) => this.render(dt));
     this.loop.start();
     await frame();
+    this.bootMark('input');
 
+    // Title FIRST, warm shaders SECOND. Shader program warm-up (multi-second
+    // on real GPUs) used to block the title screen; now it runs as a
+    // background task while the menu is already interactive. startRun()
+    // waits behind the loading screen only if it isn't finished yet.
     p(1.0, 'tape loaded.');
+    this.bootMark('title');
+    if (import.meta.env.DEV) console.info('[STATIC] boot ms:', this.bootTimes);
     this.toTitle();
+    const w0 = performance.now();
+    this.warmupPromise = this.warmup()
+      .catch(err => console.error('[STATIC] warmup failed', err))
+      .finally(() => {
+        this.bootTimes['warmup(bg)'] = Math.round(performance.now() - w0);
+        this.warmupPromise = null;
+      });
   }
 
   private buildScene(): void {
@@ -288,7 +329,14 @@ class StaticGame {
     this.effects.setRain(true);
     this.tapes.spawnAll(this.runSeed);
     await frame();
-    this.renderer.compile(this.scene, this.player.camera);
+    // compileAsync uses KHR_parallel_shader_compile when the driver offers it,
+    // so program linking overlaps instead of blocking one-by-one (big win on
+    // drivers with slow single-threaded compile); falls back to sync compile.
+    if (typeof this.renderer.compileAsync === 'function') {
+      await this.renderer.compileAsync(this.scene, this.player.camera);
+    } else {
+      this.renderer.compile(this.scene, this.player.camera);
+    }
     await frame();
     // Two full pipeline renders: the first compiles every post program, the
     // second exercises the temporal paths (TAA / AO / volumetric history) so
@@ -438,7 +486,18 @@ class StaticGame {
     this.input?.releasePointerLock();
   }
 
+  private warmupPromise: Promise<void> | null = null;
+
   private startRun(): void {
+    if (this.warmupPromise) {
+      // Shader warm-up still running in the background — hold on the loading
+      // screen until it resolves, then re-enter startRun().
+      this.menu.show('loading');
+      this.menu.setLoadProgress(0.97, 'warming shaders…');
+      const wp = this.warmupPromise;
+      wp.then(() => this.startRun());
+      return;
+    }
     this.audio.init();
     this.audio.resume();
     // fresh per-run seed: tape positions & ambient variation differ per run
@@ -800,7 +859,11 @@ class StaticGame {
   }
 
   private render(dt: number): void {
-    if (!this.pipeline) return;
+    // While background warmup runs, skip the loop's renders entirely: the
+    // first pipeline.render() is what compiles every post program, and letting
+    // it happen inside a normal frame stalls the just-appeared title screen
+    // for seconds. Warmup does those compiles itself (direct pipeline calls).
+    if (!this.pipeline || this.warmupPromise) return;
     this.pipeline.render(this.scene, this.player.camera, this.staticState, dt);
     this.pipeline.adaptResolution(dt * 1000, performance.now() / 1000);
   }
@@ -815,6 +878,7 @@ class StaticGame {
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
       gpuStats: () => this.pipeline ? { ...this.pipeline.gpuStats } : null,
+      bootTimes: () => ({ ...this.bootTimes }),
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
         this.flashlight?.warp();
