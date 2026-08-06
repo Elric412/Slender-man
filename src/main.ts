@@ -14,12 +14,14 @@ import { EnvironmentProbe } from './render/EnvironmentProbe';
 import { Sky } from './render/Sky';
 import { Player } from './game/Player';
 import { Flashlight } from './game/Flashlight';
-import { PalebarkRig } from './game/PalebarkRig';
+import { PalebarkEntity } from './entity/PalebarkEntity';
+import type { AnimState } from './entity/PalebarkAnimator';
 import { FearSystem } from './game/FearSystem';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';
 import { ZoneSystem } from './world/ZoneSystem';
+import { SeededRandom } from './core/SeededRandom';
 import { Menu } from './ui/Menu';
 
 const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchmarkable
@@ -27,6 +29,21 @@ const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchma
 type GameState = 'loading' | 'title' | 'playing' | 'paused' | 'ending' | 'escaped' | 'taken';
 
 const frame = (): Promise<void> => new Promise(r => requestAnimationFrame(() => r()));
+
+/**
+ * Brain state → animation state.
+ *
+ * The two vocabularies are deliberately separate: the brain reasons about
+ * *intent* ("investigating") while the animator reasons about *body* ("transit").
+ * Investigating and dormant-while-walking are the same body language, so they
+ * collapse to one entry here rather than duplicating a pose table.
+ */
+const ANIM_STATE: Record<EntitySnapshot['state'], AnimState> = {
+  dormant: 'dormant',
+  investigating: 'transit',
+  stalking: 'stalk',
+  confronting: 'confront',
+};
 
 /**
  * Weather director state. Rain doesn't just spawn particles — it drives a
@@ -66,7 +83,7 @@ class StaticGame {
   private player!: Player;
   private flashlight!: Flashlight;
   private entity!: EntityBrain;
-  private rig!: PalebarkRig;
+  private rig!: PalebarkEntity;
   private fear = new FearSystem();
   private tapes!: TapeSystem;
   private effects!: Effects;
@@ -80,6 +97,20 @@ class StaticGame {
   };
   private weather: Weather = { rain: 0, wetness: 0 };
   private windDir = { x: 0.8, z: 0.6 };
+  /** wind strength from the previous frame — the coat reads it before it is recomputed */
+  private lastWind = 0.32;
+  private entityGaze = new THREE.Vector3();
+  private entityWind = new THREE.Vector3();
+  /**
+   * Terrain sampler handed to the foot IK. Bound once as an arrow property so
+   * the animator can call it every frame without allocating a closure, and so
+   * `this` cannot be lost.
+   */
+  private groundAt = (x: number, z: number): number => this.hf.heightAt(x, z);
+  /** per-run RNG for the animator's discretionary variation */
+  private entityRand: () => number = Math.random;
+  /** QA hook: force the reach beat on the next frame (see debugApi) */
+  private forceExtension = false;
   private rainTriggered = false;
   private flinchCooldown = 0;
   private entityCueTimer = 0;
@@ -193,8 +224,20 @@ class StaticGame {
 
     p(0.68, 'waking the entity…');
     this.entity = new EntityBrain(this.nav, this.col, this.hf, WORLD_SEED);
-    this.rig = new PalebarkRig(this.mats);
+    // The hero character: three LODs on one skeleton, procedurally sculpted and
+    // textured at boot. Its own atlases are synthesised here (yielding frames),
+    // then the hero tier streams in during play via streamStep().
+    this.rig = await PalebarkEntity.create({
+      tier: this.spec.tier,
+      anisotropy: Math.min(this.spec.anisotropy, maxAniso),
+      seed: WORLD_SEED,
+      onProgress: (f, label) => p(0.68 + f * 0.06, `${label}…`),
+    });
     this.scene.add(this.rig.group);
+    // Match the env-probe decision made in captureEnvironment() above. The
+    // entity is built after the probe, so it has to be told separately rather
+    // than relying on the shared MaterialLibrary call.
+    this.rig.setEnvIntensity(this.probe ? 1 : 0.55);
     this.wireEntity();
     await frame();
     this.bootMark('entity');
@@ -520,6 +563,22 @@ class StaticGame {
     if (this.flashlight.on) this.flashlight.toggle();
     this.flashlight.warp();
     this.entity.respawnFar(this.player.pos);
+    // Re-seed the brain's *discretionary* choices (which POI, which flank, how
+    // long to hold). The world seed stays fixed so the map is unchanged; this is
+    // the only thing that makes run 2 differ from run 1, which is what quality
+    // gate #6 (no two runs place a sighting identically) depends on.
+    this.entity.reseed(this.runSeed);
+    // The animator's variation draws from the same run seed, so a replay of a
+    // given seed is reproducible for testing.
+    const animRng = new SeededRandom(this.runSeed ^ 0xA5F1);
+    this.entityRand = () => animRng.next();
+    // Hard-reset the character: cloth particles, animator layers and LOD fade
+    // weights all get re-seated at the new position. Without this the coat would
+    // integrate the respawn displacement as one frame of motion and visibly
+    // billow before settling.
+    this.rig.reset(
+      this.entity.pos.x, this.entity.pos.y, this.entity.pos.z, this.entity.yaw,
+      Math.hypot(this.entity.pos.x - this.player.pos.x, this.entity.pos.z - this.player.pos.z));
     this.tapes.spawnAll(this.runSeed);
     this.tapes.onPickup = (zoneId, x, z) => this.onTapePickup(zoneId, x, z);
     this.pipeline.invalidateHistory();
@@ -675,6 +734,15 @@ class StaticGame {
     }
   }
 
+  // per-stage update profiling (EMA ms) — stability hunting + perf overlay
+  readonly prof: Record<string, number> = {
+    player: 0, tapes: 0, entity: 0, rig: 0, fear: 0, env: 0, audio: 0, hud: 0,
+  };
+  private profMark(stage: string, t0: number): void {
+    const d = performance.now() - t0;
+    this.prof[stage] += (d - this.prof[stage]) * 0.05;
+  }
+
   // ================================================================ frame update
   private update(dt: number, time: number): void {
     if (!this.started) { this.started = true; }
@@ -685,26 +753,68 @@ class StaticGame {
     if (inp.pauseQueued) { this.pause(); return; }
 
     // ---- player ----
+    let p0 = performance.now();
     this.player.update(dt, inp, this.fear.tremor);
     if (inp.flashQueued) this.flashlight.toggle();
     this.flashlight.update(dt, time);
+    this.profMark('player', p0);
 
     // ---- tapes / interact ----
+    p0 = performance.now();
     const near = this.tapes.update(time, this.player.pos.x, this.player.eyeY, this.player.pos.z);
+    this.profMark('tapes', p0);
     this.menu.setInteractPrompt(!!near);
     if (inp.interactQueued && near) this.tapes.tryCollect();
 
     // ---- entity ----
+    p0 = performance.now();
     this.entitySnap = this.entity.update(dt, {
       pos: this.player.pos, eyeY: this.player.eyeY, fwd: this.player.forward,
       sprinting: this.player.sprinting, moving: this.player.moving,
       lightOn: this.flashlight.on,
     }, time);
+    this.profMark('entity', p0);
     const snap = this.entitySnap;
-    this.rig.update(dt, time, snap.x, snap.y, snap.z, this.entity.yaw, snap.speed);
+
+    // The character. Detection state is the single source of truth: the same
+    // snapshot drives the mesh's pose, the fear/static system and the audio, so
+    // they cannot disagree about what the entity is doing.
+    this.entityGaze.set(this.player.pos.x, this.player.eyeY, this.player.pos.z);
+    this.entityWind.set(
+      this.windDir.x * this.lastWind, 0, this.windDir.z * this.lastWind);
+    this.rig.update(dt, time, {
+      x: snap.x, y: snap.y, z: snap.z,
+      yaw: this.entity.yaw,
+      speed: snap.speed,
+      state: ANIM_STATE[snap.state],
+      detection: snap.detection,
+      camera: this.player.camera.position,
+      // It only tracks the player when it actually perceives them; otherwise it
+      // faces its travel direction and the head stays level.
+      gaze: snap.detection > 0.08 ? this.entityGaze : null,
+      gazeWeight: Math.min(1, snap.detection * 1.6),
+      groundAt: this.groundAt,
+      wind: this.entityWind,
+      wetness: this.weather.wetness,
+      tapes: this.tapes.collected,
+      tapesTotal: this.tapes.total,
+      extensionRequest: snap.extensionRequest || this.forceExtension,
+      // QA override: the forced beat has to bypass the milestone gate too, or a
+      // test would have to collect six tapes before it could check the animation.
+      forceEligible: this.forceExtension,
+      rand: this.entityRand,
+      // Streaming budget: generous while far (the player cannot see the seam of a
+      // texture swap), tight when close so a swap can never cost a visible hitch.
+      streamBudgetMs: snap.distToPlayer > 40 ? 3.5 : 1.0,
+    });
+    this.profMark('rig', p0);
+    // One-shot: consumed by exactly one frame so a forced beat cannot latch on.
+    this.forceExtension = false;
 
     // ---- fear / static ----
+    p0 = performance.now();
     this.fear.update(dt, snap.detection, snap.visibleToPlayer, snap.distToPlayer);
+    this.profMark('fear', p0);
 
     // The brain owns the "extension / reach" beat: a rare late-act moment where
     // the entity asserts presence without moving. It is the only gameplay hook
@@ -729,10 +839,12 @@ class StaticGame {
 
     // ---- environment ----
     const wind = 0.32 + this.fear.value * 0.85 + this.weather.wetness * 0.18;
+    this.lastWind = wind;
     const wTime = time * 0.05;
     this.windDir.x = Math.cos(wTime) * 0.8 + 0.2;
     this.windDir.z = Math.sin(wTime * 0.7) * 0.8 + 0.2;
     updateWind({ strength: wind, dirX: this.windDir.x, dirZ: this.windDir.z, time });
+    p0 = performance.now();
     this.map.update(time, wind);
     this.map.veg.setDrawDistance(this.player.pos.x, this.player.pos.z, this.spec.drawDistance);
     this.effects.update(dt, time, this.player.pos.x, this.player.eyeY, this.player.pos.z);
@@ -750,6 +862,7 @@ class StaticGame {
       this.player.pos.y + this.sky.moonDir.y * 140,
       sz + this.sky.moonDir.z * 140);
     this.moonTarget.updateMatrixWorld();
+    this.profMark('env', p0);
 
     // ---- audio bed ----
     // The ambience is not a global loop with a wind knob; it is a *reading of
@@ -758,6 +871,7 @@ class StaticGame {
     // like reeds and open water, the ravine sounds like moving water under a
     // closed canopy, and the blight sounds conspicuously dead.
     const px = this.player.pos.x, pz = this.player.pos.z;
+    p0 = performance.now();
     const canopy = this.zones.scalarAt(px, pz, 'canopyClosure');
     const openness = 1 - canopy * 0.82;
     this.audio.update(dt, {
@@ -790,6 +904,7 @@ class StaticGame {
       enclosed: this.hf.zoneAt(px, pz) !== null && canopy < 0.35,
       inOpen: openness > 0.62,
     });
+    this.profMark('audio', p0);
 
     // ---- renderer hand-off: beam, weather, exposure ----
     this.vfWeight += ((inp.vfHeld ? 1 : 0) - this.vfWeight) * Math.min(1, dt * 9);
@@ -807,6 +922,7 @@ class StaticGame {
       + this.vfWeight * 0.10);
 
     // ---- HUD ----
+    p0 = performance.now();
     this.menu.update(dt);
     this.updateSubtitles(dt);
     // Audio-cue captions are pushed every frame; the engine owns their lifetime
@@ -824,8 +940,10 @@ class StaticGame {
         `scale ${this.pipeline.renderScale.toFixed(2)}  effort ${this.pipeline.effort.toFixed(2)}\n` +
         `wet ${this.weather.wetness.toFixed(2)}  batt ${this.flashlight.battery.toFixed(2)}\n` +
         `state ${snap.state}  det ${snap.detection.toFixed(2)}  dist ${snap.distToPlayer.toFixed(0)}m\n` +
+        this.entityPerfLine() +
         this.audioPerfLine());
     }
+    this.profMark('hud', p0);
 
     // ---- static overlay state for composite ----
     this.staticState.level = this.fear.staticLevel + this.vfWeight * 0.12;
@@ -837,6 +955,24 @@ class StaticGame {
     // ---- win check: reach the fire road ----
     const ex = this.hf.layout.exit;
     if (Math.hypot(this.player.pos.x - ex.x, this.player.pos.z - ex.z) < 7) this.escape();
+  }
+
+  /**
+   * Character block of the F3 overlay.
+   *
+   * The two numbers that matter for the quality gates are `foot` (residual foot
+   * IK error \u2014 anything above a centimetre or so is a visible floating-foot
+   * artefact) and `ext` (extension beat count, which must stay very low across a
+   * whole run). `fade` exposes the LOD cross-fade weights so a pop can be caught
+   * as a discontinuity rather than hunted by eye.
+   */
+  private entityPerfLine(): string {
+    const d = this.rig.debug() as Record<string, number | string | boolean | number[]>;
+    const fade = (d.fade as number[]).map(v => v.toFixed(2)).join('/');
+    return `PB lod${d.lod} ${fade}  tris ${((d.tris as number) / 1000).toFixed(1)}k  `
+      + `tex ${d.texture}${d.streaming ? '\u2191' : ''}\n`
+      + `   foot ${((d.footError as number) * 1000).toFixed(1)}mm  `
+      + `swing ${d.swing}  ext ${d.extensionCount}${d.extension ? ' LIVE' : ''}\n`;
   }
 
   /**
@@ -878,6 +1014,59 @@ class StaticGame {
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
       gpuStats: () => this.pipeline ? { ...this.pipeline.gpuStats } : null,
+      // per-stage update cost (EMA ms): player/tapes/entity/rig/fear/env/audio/hud
+      prof: () => ({ ...this.prof }),
+      // deep subsystem profiler: wraps audio + rig subsystem update()s with
+      // EMA timers at runtime (no source changes to those modules). Idempotent.
+      subProf: () => {
+        const wrap = (obj: any, key: string, store: Record<string, number>, label: string) => {
+          if (!obj || typeof obj.update !== 'function') return;
+          if (store[label] !== undefined) return;
+          const orig = obj.update.bind(obj);
+          store[label] = 0;
+          obj.update = (...a: unknown[]) => {
+            const t0 = performance.now();
+            (orig as any)(...a);
+            const d = performance.now() - t0;
+            store[label] += (d - store[label]) * 0.05;
+          };
+        };
+        const store: Record<string, number> = ((this as any).__subProf ||= {});
+        const ae = this.audio as any;
+        wrap(ae.director, 'update', store, 'a:director');
+        wrap(ae.player, 'update', store, 'a:player');
+        wrap(ae.entity, 'update', store, 'a:entity');
+        wrap(ae.ambience, 'update', store, 'a:ambience');
+        wrap(ae.spatial, 'update', store, 'a:spatial');
+        const rig = this.rig as any;
+        wrap(rig.animator, 'update', store, 'r:animator');
+        wrap(rig.cloth, 'update', store, 'r:cloth');
+        wrap(rig.lod, 'update', store, 'r:lod');
+        if (rig.materials && typeof rig.materials.streamStep === 'function' && store['r:stream'] === undefined) {
+          const orig = rig.materials.streamStep.bind(rig.materials);
+          store['r:stream'] = 0;
+          rig.materials.streamStep = (b: number) => {
+            const t0 = performance.now();
+            orig(b);
+            const d = performance.now() - t0;
+            store['r:stream'] += (d - store['r:stream']) * 0.05;
+          };
+        }
+        return { ...store };
+      },
+      // scene-graph census: bucket every geometry by owning-object name /
+      // constructor so a stability run can diff two snapshots and name the
+      // exact object class that is leaking (info.memory only gives a count).
+      sceneStats: () => {
+        const buckets: Record<string, number> = {};
+        this.scene.traverse(o => {
+          const g = (o as THREE.Mesh).geometry as THREE.BufferGeometry | undefined;
+          if (!g) return;
+          const key = o.name || o.type || 'anon';
+          buckets[key] = (buckets[key] || 0) + 1;
+        });
+        return buckets;
+      },
       bootTimes: () => ({ ...this.bootTimes }),
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
@@ -910,6 +1099,16 @@ class StaticGame {
         };
       },
       flashlight: (on: boolean) => { if (this.flashlight.on !== on) this.flashlight.toggle(); },
+
+      // ---- character (brief §10 gates 2, 3, 8, 9) ----------------------------
+      // LOD fade weights, residual foot-IK error, cloth swing and the extension
+      // counter. The suite asserts against these because none of them are
+      // observable from a screenshot: a 3 mm floating foot and a correct plant
+      // look identical at test resolution, and LOD popping is a *discontinuity*
+      // in the fade weights rather than anything a single frame can show.
+      palebark: () => this.rig.debug(),
+      /** force the reach beat next frame, for gate #9 verification */
+      forceExtension: () => { this.forceExtension = true; },
       collectAll: () => {
         for (const t of this.tapes.tapes) {
           if (!t.collected) { t.collected = true; this.scene.remove(t.mesh); this.tapes.collected++; }
