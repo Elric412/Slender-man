@@ -148,6 +148,21 @@
         </label>
         <input id="set-audiocues" type="checkbox" />
 
+        <div class="settings-section">PROXIMITY WARNING</div>
+
+        <label for="set-proximity">
+          Warn when it is near
+          <span class="hint">Off is the intended experience &mdash; you are meant
+          to be unsure. <em>Diegetic</em> lets the tape react a little sooner,
+          with nothing added to the screen. <em>On-screen</em> shows a direct
+          indicator with a direction.</span>
+        </label>
+        <select id="set-proximity">
+          <option value="off">Off (intended)</option>
+          <option value="subtle">Diegetic &mdash; tape reacts sooner</option>
+          <option value="explicit">On-screen indicator</option>
+        </select>
+
         <div class="settings-section">CONTROLS</div>
 
         <label for="set-sens">Look sensitivity</label>
@@ -216,6 +231,20 @@
       <div class="vf-label">&#9654; PLAY &nbsp;&nbsp;SP&nbsp;&nbsp;CAM 01&nbsp;&nbsp;<span id="vf-time">-0:04</span></div>
       <div class="vf-scan"></div>
     </div>
+    <!--
+      Proximity tell (`explicit` mode only). A bearing dial rather than a bar:
+      the useful question is "which way do I not walk", and a bare intensity
+      number would just teach the player to stand still and watch it. Hidden
+      unless the setting asks for it — see src/game/ProximityTell.ts.
+    -->
+    <div id="proximity-tell" class="proximity-tell hidden" aria-hidden="true">
+      <div class="pt-dial">
+        <div class="pt-ring"></div>
+        <div id="pt-needle" class="pt-needle"></div>
+      </div>
+      <div id="pt-label" class="pt-label">NEAR</div>
+    </div>
+
     <div id="rotate-prompt" class="rotate-prompt hidden">ROTATE DEVICE FOR BEST EXPERIENCE</div>
     <div id="perf-overlay" class="perf-overlay hidden"></div>
 
