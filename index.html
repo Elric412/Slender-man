@@ -41,6 +41,44 @@
     </div>
   </div>
 
+  <!-- ============ CONTENT ADVISORY ============ -->
+  <!--
+    Shown once, before the first run can start, gated on settings.advisoryAck.
+    Brief §11 requires this to be brief and honest rather than a legal wall of
+    text: the player is told what the sound design actually does to them, and is
+    given the two controls that matter *before* they need them.
+  -->
+  <div id="advisory-screen" class="screen hidden">
+    <div class="panel">
+      <div class="panel-title">BEFORE YOU START</div>
+      <div class="panel-body">
+        <p>STATIC uses intense sound design as its primary tool. Specifically:</p>
+        <ul class="advisory-list">
+          <li><strong>Low-frequency effects.</strong> Deep sub-bass pressure you may feel more than hear. Some people find this physically uncomfortable.</li>
+          <li><strong>Sudden loud moments.</strong> Short, sharp sounds at close range, including jump-scare-style stings.</li>
+          <li><strong>Long stretches of near-silence,</strong> used deliberately. If the game goes quiet, it has not crashed.</li>
+          <li><strong>Wide dynamic range.</strong> Quiet passages are genuinely quiet. Set your volume during a loud moment, not a quiet one.</li>
+        </ul>
+        <p class="dim">You can change any of this at any time in Settings. Two controls are worth knowing now:</p>
+        <div class="advisory-grid">
+          <label for="adv-lowfreq">
+            Low-frequency intensity
+            <span class="hint">Set to 0 to remove sub-bass entirely.</span>
+          </label>
+          <input id="adv-lowfreq" type="range" min="0" max="100" value="55" />
+
+          <label for="adv-audiocues">
+            Visual sound cues
+            <span class="hint">Captions audio-only warnings on screen.</span>
+          </label>
+          <input id="adv-audiocues" type="checkbox" />
+        </div>
+        <p class="dim">Headphones are recommended, but the game is mixed to still work on laptop and phone speakers.</p>
+      </div>
+      <button id="btn-advisory-ok" class="menu-btn">I UNDERSTAND &mdash; CONTINUE</button>
+    </div>
+  </div>
+
   <!-- ============ ABOUT ============ -->
   <div id="about-screen" class="screen hidden">
     <div class="panel">
@@ -72,6 +110,45 @@
 
         <label for="set-volume">Master volume</label>
         <input id="set-volume" type="range" min="0" max="100" value="80" />
+
+        <div class="settings-section">AUDIO MIX</div>
+
+        <label for="set-vol-ambience">Ambience</label>
+        <input id="set-vol-ambience" type="range" min="0" max="100" value="100" />
+
+        <label for="set-vol-entity">Entity</label>
+        <input id="set-vol-entity" type="range" min="0" max="100" value="100" />
+
+        <label for="set-vol-foley">Your movement</label>
+        <input id="set-vol-foley" type="range" min="0" max="100" value="100" />
+
+        <label for="set-vol-ui">Interface &amp; tapes</label>
+        <input id="set-vol-ui" type="range" min="0" max="100" value="90" />
+
+        <div class="settings-section">AUDIO COMFORT &amp; ACCESSIBILITY</div>
+
+        <label for="set-lowfreq">
+          Low-frequency intensity
+          <span class="hint">Deep sub-bass pressure effects. Set to 0 to remove them
+          entirely; this is independent of master volume.</span>
+        </label>
+        <input id="set-lowfreq" type="range" min="0" max="100" value="55" />
+
+        <label for="set-nightmode">
+          Night / small-speaker mode
+          <span class="hint">Evens out loudness and lifts mid frequencies. Easier on
+          laptop and phone speakers, but flattens the intended dynamic range.</span>
+        </label>
+        <input id="set-nightmode" type="checkbox" />
+
+        <label for="set-audiocues">
+          Visual sound cues
+          <span class="hint">Captions important audio-only information — approach
+          warnings and escalation — separately from dialogue subtitles.</span>
+        </label>
+        <input id="set-audiocues" type="checkbox" />
+
+        <div class="settings-section">CONTROLS</div>
 
         <label for="set-sens">Look sensitivity</label>
         <input id="set-sens" type="range" min="20" max="200" value="100" />
@@ -127,6 +204,12 @@
     <div id="tape-counter" class="tape-counter hidden"><span id="tape-count">0</span> / 8 TAPES</div>
     <div id="interact-prompt" class="interact-prompt hidden">E &mdash; RECOVER TAPE</div>
     <div id="subtitle" class="subtitle hidden"></div>
+    <!--
+      Audio-cue captions (§11). Deliberately a *separate* element from #subtitle,
+      styled differently and positioned higher, so a player who needs it can tell
+      "this is information about the world" apart from "this is someone talking".
+    -->
+    <div id="audio-cue" class="audio-cue hidden" aria-live="polite"></div>
     <div id="viewfinder-overlay" class="viewfinder hidden">
       <div class="vf-corner tl"></div><div class="vf-corner tr"></div>
       <div class="vf-corner bl"></div><div class="vf-corner br"></div>
