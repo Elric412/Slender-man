@@ -499,12 +499,18 @@ function barkMossy(c: Cell, seed: number): void {
 
       // bark base
       let r = mix(0.20, 0.145, barkTex), g = mix(0.172, 0.122, barkTex), b = mix(0.148, 0.108, barkTex);
-      // moss: desaturated green, darker in its own crevices. Kept low-chroma —
-      // saturated green would read as arcade grass under moonlight.
+      // Moss: olive-grey, NOT green.
+      //
+      // The first pass ran green at ~1.7× the red channel, which the contact
+      // sheet exposed immediately — it read as bright arcade grass rather than
+      // bryophyte on a night-lit trunk. Real moss is a very low-chroma olive; it
+      // only looks "green" in daylight photographs. Green is now ~1.25× red with
+      // blue lifted to match, so the hue survives the moonlit grade without the
+      // saturation surviving with it.
       const mt = mossTex;
-      r = mix(r, mix(0.105, 0.185, mt), mossAmt);
-      g = mix(g, mix(0.165, 0.268, mt), mossAmt);
-      b = mix(b, mix(0.088, 0.135, mt), mossAmt);
+      r = mix(r, mix(0.128, 0.196, mt), mossAmt);
+      g = mix(g, mix(0.158, 0.240, mt), mossAmt);
+      b = mix(b, mix(0.118, 0.165, mt), mossAmt);
       // lichen: pale mineral grey-green
       r = mix(r, 0.44, lichen * 0.8);
       g = mix(g, 0.465, lichen * 0.8);
@@ -1140,7 +1146,7 @@ export class ForestAtlas {
     this.albedo = albedo; this.normal = normal; this.orm = orm; this.rects = rects;
 
     // ── the two materials ───────────────────────────────────────────────────
-    // Two, not sixteen. Bark is opaque and двусторонне irrelevant; foliage is
+    // Two, not sixteen. Bark is opaque and single-sided; foliage is
     // alpha-tested and double-sided. Everything else — which tile, how many
     // repeats, what tint — travels as *vertex data*, so material count stays at
     // two no matter how many archetypes and variants we add.
