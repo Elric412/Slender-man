@@ -1026,9 +1026,10 @@ class StaticGame {
           store[label] = 0;
           obj.update = (...a: unknown[]) => {
             const t0 = performance.now();
-            (orig as any)(...a);
+            const ret = (orig as any)(...a);   // MUST pass the return through (lod.update returns {w, active})
             const d = performance.now() - t0;
             store[label] += (d - store[label]) * 0.05;
+            return ret;
           };
         };
         const store: Record<string, number> = ((this as any).__subProf ||= {});

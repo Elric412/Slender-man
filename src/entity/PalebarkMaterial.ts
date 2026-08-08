@@ -222,10 +222,17 @@ export class PalebarkMaterials implements PalebarkMaterialSet {
   }
 
   private async runGen(gen: Generator<number, MapSet>, onP: (f: number) => void): Promise<MapSet> {
+    // Budget-batched: consume generator steps until an 8ms slice elapses, then
+    // yield one frame to the browser. (The generator now yields PER ROW, so one
+    // step per rAF would take 512+ frames — this keeps boot time unchanged.)
     for (;;) {
-      const r = gen.next();
-      if (r.done) return r.value;
-      onP(r.value);
+      const t0 = performance.now();
+      for (;;) {
+        const r = gen.next();
+        if (r.done) return r.value;
+        onP(r.value);
+        if (performance.now() - t0 >= 8) break;
+      }
       await new Promise<void>(res => requestAnimationFrame(() => res()));
     }
   }

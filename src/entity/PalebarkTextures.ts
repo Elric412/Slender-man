@@ -118,11 +118,14 @@ function* synthSkinAtlas(size: number, seed: number): Generator<number, MapSet> 
   const normal = new Uint8Array(size * size * 4);
   const height = new Float32Array(size * size);
   const P = 64;
-  const bandRows = Math.max(8, size >> 5);
 
-  for (let y0 = 0; y0 < size; y0 += bandRows) {
-    const y1 = Math.min(size, y0 + bandRows);
-    for (let y = y0; y < y1; y++) {
+  // Yield granularity is per ROW, not per multi-row band: streamStep()'s budget
+  // loop checks elapsed time *between* generator steps, so a single step must be
+  // cheaper than the frame budget (~1-3.5ms). A whole band of 512² fbm work is
+  // 15-60ms — far over budget — which turned the streaming into a per-frame
+  // hitch. Per-row yields let the loop stop after any row. Output is unchanged
+  // (same pixels, same seed, same order).
+  for (let y = 0; y < size; y++) {
       const v = 1 - y / (size - 1);           // texture v (0 at bottom row)
       for (let x = 0; x < size; x++) {
         const u = x / (size - 1);
@@ -177,9 +180,8 @@ function* synthSkinAtlas(size: number, seed: number): Generator<number, MapSet> 
         orm[o + 2] = 0;
         orm[o + 3] = Math.round(thick * 255);
       }
+      yield ((y + 1) / size) * 0.85;
     }
-    yield y1 / size * 0.85;
-  }
   heightToNormal(height, size, normal, size / 512 * 1.6);
   yield 1;
   return { kind: 'skin', size, albedo, normal, orm };
@@ -200,11 +202,10 @@ function* synthCoatAtlas(size: number, seed: number): Generator<number, MapSet> 
   const normal = new Uint8Array(size * size * 4);
   const height = new Float32Array(size * size);
   const P = 64;
-  const bandRows = Math.max(8, size >> 5);
 
-  for (let y0 = 0; y0 < size; y0 += bandRows) {
-    const y1 = Math.min(size, y0 + bandRows);
-    for (let y = y0; y < y1; y++) {
+  // Per-row yields, not per-band: see synthSkinAtlas for why (streamStep's
+  // budget loop can only stop between steps; a whole band was 15-60ms of fbm).
+  for (let y = 0; y < size; y++) {
       const v = 1 - y / (size - 1);
       for (let x = 0; x < size; x++) {
         const u = x / (size - 1);
@@ -280,9 +281,8 @@ function* synthCoatAtlas(size: number, seed: number): Generator<number, MapSet> 
         orm[o + 2] = 0;
         orm[o + 3] = Math.round(clamp01(grime * 0.75 + damp * 0.5 + spatter) * 255);
       }
+      yield ((y + 1) / size) * 0.85;
     }
-    yield y1 / size * 0.85;
-  }
   heightToNormal(height, size, normal, size / 512 * 2.1);
   yield 1;
   return { kind: 'coat', size, albedo, normal, orm };
