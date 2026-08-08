@@ -1,4 +1,4 @@
-import type { TellMode } from '../game/ProximityTell';
+import type { TellMode } from '../world/ProximityTell';
 
 export type QualityTier = 'low' | 'medium' | 'high' | 'ultra';
 
