@@ -184,6 +184,68 @@ body.cb .audio-cue { color: var(--accent-cb); border-left-color: var(--accent-cb
 .vf-label { position: absolute; top: 5.5%; left: 9%; font-size: 15px; letter-spacing: 0.25em; color: rgba(220,225,230,0.85); text-shadow: 0 0 4px #000; }
 .vf-scan { position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(255,255,255,0.03) 0 2px, transparent 2px 4px); }
 
+/* ---------- proximity tell (optional accessibility affordance) ----------
+   Deliberately styled as worn analog instrumentation rather than a game HUD
+   widget: it is an admitted affordance, but it should not look like it belongs
+   to a different game. Bottom-right, out of the flashlight's read area.
+   The needle is rotated by JS; intensity drives opacity + glow, so a faint
+   contact is legible without shouting. */
+.proximity-tell {
+  position: absolute;
+  right: calc(22px + env(safe-area-inset-right));
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  z-index: 28; pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  /* set by JS: 0..1 */
+  --pt: 0;
+  opacity: calc(0.22 + 0.78 * var(--pt));
+  transition: opacity 0.18s linear;
+}
+.pt-dial { position: relative; width: 62px; height: 62px; }
+.pt-ring {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 1px solid rgba(154,165,173,0.30);
+  background:
+    radial-gradient(circle at 50% 50%,
+      rgba(200,185,138,calc(0.05 + 0.20 * var(--pt))) 0%,
+      rgba(6,8,11,0.62) 68%);
+  box-shadow: 0 0 calc(2px + 14px * var(--pt)) rgba(200,185,138,calc(0.10 + 0.34 * var(--pt)));
+}
+/* forward tick — tells the player which way is "ahead" so the needle reads */
+.pt-ring::after {
+  content: ''; position: absolute; left: 50%; top: -3px;
+  width: 1px; height: 6px; margin-left: -0.5px;
+  background: rgba(154,165,173,0.5);
+}
+.pt-needle {
+  position: absolute; left: 50%; top: 50%;
+  width: 2px; height: 25px; margin-left: -1px;
+  transform-origin: 50% 100%;
+  /* rotate(0) points up = dead ahead; JS writes --pt-bearing in degrees */
+  transform: translateY(-100%) rotate(var(--pt-bearing, 0deg));
+  background: linear-gradient(to top, rgba(200,185,138,0.15), var(--accent));
+  transition: transform 0.10s linear;
+}
+.pt-label {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.20em;
+  text-transform: uppercase; color: var(--accent);
+  text-shadow: 0 1px 2px #000;
+}
+/* Bands escalate colour as well as glow: colour alone would fail for the very
+   players most likely to have this setting on. */
+.proximity-tell.pt-close .pt-label,
+.proximity-tell.pt-close .pt-needle { color: #d8c68e; }
+.proximity-tell.pt-imminent .pt-label { color: var(--danger); }
+.proximity-tell.pt-imminent .pt-needle { background: linear-gradient(to top, rgba(184,84,63,0.2), var(--danger)); }
+.proximity-tell.pt-imminent .pt-ring { border-color: rgba(184,84,63,0.55); }
+body.cb .pt-label, body.cb .pt-needle { color: var(--accent-cb); }
+body.cb .proximity-tell.pt-imminent .pt-label { color: #ff9d7a; }
+/* Respect reduced-motion: keep the readout, drop the sweep interpolation. */
+@media (prefers-reduced-motion: reduce) {
+  .pt-needle { transition: none; }
+  .proximity-tell { transition: none; }
+}
+
 .rotate-prompt {
   position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
   font-size: 11px; letter-spacing: 0.2em; color: var(--ink-dim); background: rgba(5,7,10,0.7);
@@ -229,6 +291,16 @@ body.cb .audio-cue { color: var(--accent-cb); border-left-color: var(--accent-cb
   .subtitle { bottom: 18%; font-size: 12px; }
   /* Keep the cue clear of the subtitle line on short landscape screens. */
   .audio-cue { bottom: 28%; font-size: 10px; letter-spacing: 0.14em; padding: 5px 12px; }
+  /* The touch buttons own the bottom-right corner on phones, so the dial moves
+     to the top-right and shrinks rather than sitting under the player's thumb. */
+  .proximity-tell {
+    right: calc(12px + env(safe-area-inset-right));
+    bottom: auto; top: calc(46px + env(safe-area-inset-top));
+    gap: 3px;
+  }
+  .pt-dial { width: 44px; height: 44px; }
+  .pt-needle { height: 18px; }
+  .pt-label { font-size: 8px; letter-spacing: 0.14em; }
   .advisory-grid { grid-template-columns: 1fr; gap: 8px; }
   .advisory-grid input[type=range] { width: 100%; }
   #stick-base { bottom: 30px; width: 96px; height: 96px; }
