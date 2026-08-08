@@ -734,6 +734,15 @@ class StaticGame {
     }
   }
 
+  // per-stage update profiling (EMA ms) — stability hunting + perf overlay
+  readonly prof: Record<string, number> = {
+    player: 0, tapes: 0, entity: 0, rig: 0, fear: 0, env: 0, audio: 0, hud: 0,
+  };
+  private profMark(stage: string, t0: number): void {
+    const d = performance.now() - t0;
+    this.prof[stage] += (d - this.prof[stage]) * 0.05;
+  }
+
   // ================================================================ frame update
   private update(dt: number, time: number): void {
     if (!this.started) { this.started = true; }
@@ -744,21 +753,27 @@ class StaticGame {
     if (inp.pauseQueued) { this.pause(); return; }
 
     // ---- player ----
+    let p0 = performance.now();
     this.player.update(dt, inp, this.fear.tremor);
     if (inp.flashQueued) this.flashlight.toggle();
     this.flashlight.update(dt, time);
+    this.profMark('player', p0);
 
     // ---- tapes / interact ----
+    p0 = performance.now();
     const near = this.tapes.update(time, this.player.pos.x, this.player.eyeY, this.player.pos.z);
+    this.profMark('tapes', p0);
     this.menu.setInteractPrompt(!!near);
     if (inp.interactQueued && near) this.tapes.tryCollect();
 
     // ---- entity ----
+    p0 = performance.now();
     this.entitySnap = this.entity.update(dt, {
       pos: this.player.pos, eyeY: this.player.eyeY, fwd: this.player.forward,
       sprinting: this.player.sprinting, moving: this.player.moving,
       lightOn: this.flashlight.on,
     }, time);
+    this.profMark('entity', p0);
     const snap = this.entitySnap;
 
     // The character. Detection state is the single source of truth: the same
@@ -792,11 +807,14 @@ class StaticGame {
       // texture swap), tight when close so a swap can never cost a visible hitch.
       streamBudgetMs: snap.distToPlayer > 40 ? 3.5 : 1.0,
     });
+    this.profMark('rig', p0);
     // One-shot: consumed by exactly one frame so a forced beat cannot latch on.
     this.forceExtension = false;
 
     // ---- fear / static ----
+    p0 = performance.now();
     this.fear.update(dt, snap.detection, snap.visibleToPlayer, snap.distToPlayer);
+    this.profMark('fear', p0);
 
     // The brain owns the "extension / reach" beat: a rare late-act moment where
     // the entity asserts presence without moving. It is the only gameplay hook
@@ -826,6 +844,7 @@ class StaticGame {
     this.windDir.x = Math.cos(wTime) * 0.8 + 0.2;
     this.windDir.z = Math.sin(wTime * 0.7) * 0.8 + 0.2;
     updateWind({ strength: wind, dirX: this.windDir.x, dirZ: this.windDir.z, time });
+    p0 = performance.now();
     this.map.update(time, wind);
     this.map.veg.setDrawDistance(this.player.pos.x, this.player.pos.z, this.spec.drawDistance);
     this.effects.update(dt, time, this.player.pos.x, this.player.eyeY, this.player.pos.z);
@@ -843,6 +862,7 @@ class StaticGame {
       this.player.pos.y + this.sky.moonDir.y * 140,
       sz + this.sky.moonDir.z * 140);
     this.moonTarget.updateMatrixWorld();
+    this.profMark('env', p0);
 
     // ---- audio bed ----
     // The ambience is not a global loop with a wind knob; it is a *reading of
@@ -851,6 +871,7 @@ class StaticGame {
     // like reeds and open water, the ravine sounds like moving water under a
     // closed canopy, and the blight sounds conspicuously dead.
     const px = this.player.pos.x, pz = this.player.pos.z;
+    p0 = performance.now();
     const canopy = this.zones.scalarAt(px, pz, 'canopyClosure');
     const openness = 1 - canopy * 0.82;
     this.audio.update(dt, {
@@ -883,6 +904,7 @@ class StaticGame {
       enclosed: this.hf.zoneAt(px, pz) !== null && canopy < 0.35,
       inOpen: openness > 0.62,
     });
+    this.profMark('audio', p0);
 
     // ---- renderer hand-off: beam, weather, exposure ----
     this.vfWeight += ((inp.vfHeld ? 1 : 0) - this.vfWeight) * Math.min(1, dt * 9);
@@ -900,6 +922,7 @@ class StaticGame {
       + this.vfWeight * 0.10);
 
     // ---- HUD ----
+    p0 = performance.now();
     this.menu.update(dt);
     this.updateSubtitles(dt);
     // Audio-cue captions are pushed every frame; the engine owns their lifetime
@@ -920,6 +943,7 @@ class StaticGame {
         this.entityPerfLine() +
         this.audioPerfLine());
     }
+    this.profMark('hud', p0);
 
     // ---- static overlay state for composite ----
     this.staticState.level = this.fear.staticLevel + this.vfWeight * 0.12;
@@ -990,6 +1014,60 @@ class StaticGame {
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
       gpuStats: () => this.pipeline ? { ...this.pipeline.gpuStats } : null,
+      // per-stage update cost (EMA ms): player/tapes/entity/rig/fear/env/audio/hud
+      prof: () => ({ ...this.prof }),
+      // deep subsystem profiler: wraps audio + rig subsystem update()s with
+      // EMA timers at runtime (no source changes to those modules). Idempotent.
+      subProf: () => {
+        const wrap = (obj: any, key: string, store: Record<string, number>, label: string) => {
+          if (!obj || typeof obj.update !== 'function') return;
+          if (store[label] !== undefined) return;
+          const orig = obj.update.bind(obj);
+          store[label] = 0;
+          obj.update = (...a: unknown[]) => {
+            const t0 = performance.now();
+            const ret = (orig as any)(...a);   // MUST pass the return through (lod.update returns {w, active})
+            const d = performance.now() - t0;
+            store[label] += (d - store[label]) * 0.05;
+            return ret;
+          };
+        };
+        const store: Record<string, number> = ((this as any).__subProf ||= {});
+        const ae = this.audio as any;
+        wrap(ae.director, 'update', store, 'a:director');
+        wrap(ae.player, 'update', store, 'a:player');
+        wrap(ae.entity, 'update', store, 'a:entity');
+        wrap(ae.ambience, 'update', store, 'a:ambience');
+        wrap(ae.spatial, 'update', store, 'a:spatial');
+        const rig = this.rig as any;
+        wrap(rig.animator, 'update', store, 'r:animator');
+        wrap(rig.cloth, 'update', store, 'r:cloth');
+        wrap(rig.lod, 'update', store, 'r:lod');
+        if (rig.materials && typeof rig.materials.streamStep === 'function' && store['r:stream'] === undefined) {
+          const orig = rig.materials.streamStep.bind(rig.materials);
+          store['r:stream'] = 0;
+          rig.materials.streamStep = (b: number) => {
+            const t0 = performance.now();
+            orig(b);
+            const d = performance.now() - t0;
+            store['r:stream'] += (d - store['r:stream']) * 0.05;
+          };
+        }
+        return { ...store };
+      },
+      // scene-graph census: bucket every geometry by owning-object name /
+      // constructor so a stability run can diff two snapshots and name the
+      // exact object class that is leaking (info.memory only gives a count).
+      sceneStats: () => {
+        const buckets: Record<string, number> = {};
+        this.scene.traverse(o => {
+          const g = (o as THREE.Mesh).geometry as THREE.BufferGeometry | undefined;
+          if (!g) return;
+          const key = o.name || o.type || 'anon';
+          buckets[key] = (buckets[key] || 0) + 1;
+        });
+        return buckets;
+      },
       bootTimes: () => ({ ...this.bootTimes }),
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
