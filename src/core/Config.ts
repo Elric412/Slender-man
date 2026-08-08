@@ -1,3 +1,5 @@
+import type { TellMode } from '../world/ProximityTell';
+
 export type QualityTier = 'low' | 'medium' | 'high' | 'ultra';
 
 /**
@@ -45,6 +47,13 @@ export interface Settings {
   colorblind: boolean;
   gyro: boolean;
   fov: number;
+  /**
+   * Optional "the entity is nearby" signalling. Defaults to `off` because the
+   * ambiguity is the game; the other two positions exist for players for whom
+   * that ambiguity reads as unfairness, or who cannot rely on the audio tells.
+   * See `src/world/ProximityTell.ts`.
+   */
+  proximityTell: TellMode;
   /** set once the player has acknowledged the content advisory */
   advisoryAck: boolean;
 }
@@ -123,6 +132,12 @@ export function loadSettings(): Settings {
       // v1 only had a single `volume`; carry it into the master trim.
       if (!parsed.audio && typeof parsed.volume === 'number') merged.audio.master = parsed.volume;
       merged.volume = merged.audio.master;
+      // The spread will happily install a garbage string here from a hand-edited
+      // or downgraded blob, and an unrecognised mode would silently behave as
+      // `off` in some call sites and truthy-on in others. Pin it to the enum.
+      if (merged.proximityTell !== 'subtle' && merged.proximityTell !== 'explicit') {
+        merged.proximityTell = 'off';
+      }
       return merged;
     }
   } catch { /* ignore */ }
@@ -154,6 +169,7 @@ export function defaultSettings(): Settings {
     quality: 'auto', volume: 0.8, audio: defaultAudioSettings(),
     sensitivity: 1.0, invertY: false,
     subtitles: true, colorblind: false, gyro: false, fov: 75,
+    proximityTell: 'off',
     advisoryAck: false,
   };
 }
