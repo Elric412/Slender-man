@@ -51,7 +51,7 @@ export interface Settings {
    * Optional "the entity is nearby" signalling. Defaults to `off` because the
    * ambiguity is the game; the other two positions exist for players for whom
    * that ambiguity reads as unfairness, or who cannot rely on the audio tells.
-   * See `src/world/ProximityTell.ts`.
+   * See `src/game/ProximityTell.ts`.
    */
   proximityTell: TellMode;
   /** set once the player has acknowledged the content advisory */

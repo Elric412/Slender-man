@@ -17,7 +17,6 @@ import { Flashlight } from './game/Flashlight';
 import { PalebarkEntity } from './entity/PalebarkEntity';
 import type { AnimState } from './entity/PalebarkAnimator';
 import { FearSystem } from './game/FearSystem';
-import { ProximityTell } from './game/ProximityTell';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';
@@ -86,11 +85,6 @@ class StaticGame {
   private entity!: EntityBrain;
   private rig!: PalebarkEntity;
   private fear = new FearSystem();
-  /**
-   * Optional proximity signalling. Off by default; the mode is pushed in from
-   * settings rather than read here, so this object never touches localStorage.
-   */
-  private tell = new ProximityTell();
   private tapes!: TapeSystem;
   private effects!: Effects;
 
@@ -492,10 +486,6 @@ class StaticGame {
       this.input.gyroEnabled = s.gyro;
     }
     if (this.player) this.player.baseFov = s.fov;
-    // Switching away from `explicit` must also clear whatever the dial was last
-    // showing; Menu owns that, and the call is idempotent.
-    this.tell.mode = s.proximityTell;
-    if (s.proximityTell !== 'explicit') this.menu.setProximityTell(null);
     // Per-bus levels, the low-frequency-intensity trim, night mode and the
     // caption toggle all live in s.audio — the legacy single `volume` slider is
     // mirrored into audio.master by loadSettings().
@@ -568,10 +558,6 @@ class StaticGame {
     this.subtitleQueue.length = 0;
     this.subtitleTimer = 0;
     this.fear.reset();
-    // Carry the mode across but drop the accumulated value, so a fresh run never
-    // opens with a warning inherited from the previous one's final moments.
-    this.tell.reset();
-    this.menu.setProximityTell(null);
     this.player.reset(this.hf.layout.spawn.x, this.hf.layout.spawn.z);
     this.flashlight.battery = 1;
     if (this.flashlight.on) this.flashlight.toggle();
@@ -825,16 +811,6 @@ class StaticGame {
     // One-shot: consumed by exactly one frame so a forced beat cannot latch on.
     this.forceExtension = false;
 
-    // ---- optional proximity tell ----
-    // Reads the same authoritative snapshot as everything else, so the warning
-    // can never disagree with what the entity is actually doing. Self-gating on
-    // mode, so `off` costs one comparison. `explicit` presents a dial; `subtle`
-    // stays silent here and instead leaks into the static level below.
-    const tellState = this.tell.update(
-      dt, snap, this.player.pos.x, this.player.pos.z,
-      this.player.forward.x, this.player.forward.z);
-    if (this.tell.mode === 'explicit') this.menu.setProximityTell(tellState);
-
     // ---- fear / static ----
     p0 = performance.now();
     this.fear.update(dt, snap.detection, snap.visibleToPlayer, snap.distToPlayer);
@@ -970,11 +946,7 @@ class StaticGame {
     this.profMark('hud', p0);
 
     // ---- static overlay state for composite ----
-    // `subtle` mode folds its warning in here rather than drawing anything: the
-    // tape veil simply starts reacting a little earlier than it otherwise would.
-    // Returns 0 in the other two modes, so this stays a single unconditional add.
-    this.staticState.level =
-      Math.min(1, this.fear.staticLevel + this.vfWeight * 0.12 + this.tell.staticBoost());
+    this.staticState.level = this.fear.staticLevel + this.vfWeight * 0.12;
     this.staticState.glimpse = this.fear.glimpse;
     this.staticState.desat = this.fear.desat;
     this.staticState.time = time;
@@ -1102,13 +1074,6 @@ class StaticGame {
         this.pipeline.invalidateHistory();
       },
       start: () => this.startRun(),
-      // Proximity tell: read the live state, and set the mode without going
-      // through the settings screen so a test can exercise all three positions.
-      tell: () => ({ mode: this.tell.mode, ...this.tell.current, boost: this.tell.staticBoost() }),
-      setTell: (m: 'off' | 'subtle' | 'explicit') => {
-        this.settings.proximityTell = m;
-        this.applySettings(this.settings);
-      },
       forceFear: (v: number) => { this.fear.value = v; },
       forceDetection: (v: number) => { this.entity.detection = v; },
       // Live snapshot: reads brain fields directly so it never goes stale
@@ -1189,6 +1154,39 @@ class StaticGame {
           }
         }
         if (o.runTime !== undefined) this.runTime = o.runTime;
+      },
+      /**
+       * Tear the audio graph down and close the AudioContext.
+       *
+       * Needed by the test harness on headless Linux CI: the browser has no
+       * sound card, so Chromium's audio service falls back to ALSA, finds
+       * nothing that can consume samples, and its render callback then times
+       * out indefinitely ("SyncReader::Read timed out"). An output stream left
+       * open at that point wedges browser teardown, and the run dies on
+       * `browserContext.close: Test ended.` — after the test body has already
+       * passed. Closing the context releases the stream so teardown completes.
+       *
+       * Harmless in production; nothing calls it outside the debug API.
+       */
+      /**
+       * Render only every Nth frame while keeping simulation at full rate.
+       *
+       * Used by the audio suite on headless CI: SwiftShader saturates both
+       * cores of a 2-core runner, starving Chromium's audio render thread until
+       * its output stream wedges. Audio tests assert on Director state and
+       * AnalyserNode meters, never on pixels, so dropping render frames costs
+       * them nothing and keeps the audio thread scheduled.
+       */
+      renderThrottle: (n: number) => { this.loop.renderSkip = Math.max(1, Math.floor(n)); },
+      audioShutdown: async () => {
+        // Stop rendering FIRST. On a 2-core CI box SwiftShader saturates both
+        // cores, which is what starves the audio render thread in the first
+        // place; if the loop keeps running, the audio thread never gets
+        // scheduled long enough to finish closing its stream.
+        this.loop.paused = true;
+        this.audio.dispose();
+        // Give the (now unblocked) audio thread time to release the device.
+        await new Promise<void>(r => setTimeout(r, 400));
       },
     };
   }
