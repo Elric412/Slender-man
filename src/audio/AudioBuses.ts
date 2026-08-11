@@ -93,12 +93,34 @@ export class AudioBuses {
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AC) return false;
     let c: AudioContext;
+    /* Headless/CI escape hatch --------------------------------------------
+     * On a machine with no sound card, Chromium opens a real output stream
+     * anyway, and its audio render thread then either starves (competing with
+     * a software rasteriser for 2 cores) or spins against a null ALSA sink
+     * that consumes samples instantly. Either way it logs
+     * `SyncReader::Read timed out` until the stream wedges, which takes
+     * browser teardown down with it — after the tests have already passed.
+     *
+     * Chromium's silent sink (`sinkId: { type: 'none' }`) is the supported
+     * answer: the graph is still rendered on the real audio clock, so
+     * AudioWorklets run and AnalyserNode meters read true values, but no
+     * device is ever opened. Opt-in via ?silentaudio=1 so it can only ever
+     * affect a deliberate test run, never a player. */
+    const silentSink = typeof location !== 'undefined' &&
+      /[?&]silentaudio=1\b/.test(location.search);
     try {
       // 'interactive' latencyHint: footsteps and stings must land tight against
       // the visual event. 'playback' would buy CPU headroom at the cost of a
       // perceptible lag on the flashlight click.
-      c = new AC({ latencyHint: 'interactive' });
-    } catch { return false; }
+      const opts: AudioContextOptions = { latencyHint: 'interactive' };
+      if (silentSink) {
+        (opts as { sinkId?: unknown }).sinkId = { type: 'none' };
+      }
+      c = new AC(opts);
+    } catch {
+      // sinkId is Chromium-only; fall back to a normal context if rejected.
+      try { c = new AC({ latencyHint: 'interactive' }); } catch { return false; }
+    }
     this.ctx = c;
 
     // ---- master chain ----
