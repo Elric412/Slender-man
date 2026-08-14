@@ -9,6 +9,23 @@ export class GameLoop {
   paused = false;
   time = 0;
 
+  /**
+   * Render only every Nth frame (1 = every frame, the default).
+   *
+   * Simulation is unaffected — update() still runs at full rate, so game logic,
+   * the AI and the audio Director all advance normally.
+   *
+   * This exists for headless CI. Under SwiftShader a single frame can occupy
+   * both available cores for tens of milliseconds, which starves Chromium's
+   * audio render thread; it misses its deadline, logs `SyncReader::Read timed
+   * out`, and eventually the output stream wedges hard enough to take browser
+   * teardown with it. Throttling *rendering* alone hands enough CPU back to the
+   * audio thread to keep the stream healthy, without weakening any assertion
+   * about game or audio behaviour.
+   */
+  renderSkip = 1;
+  private renderPhase = 0;
+
   private updateFns: TickFn[] = [];
   private renderFn: TickFn | null = null;
 
@@ -48,10 +65,15 @@ export class GameLoop {
         this.updateMsEma += ((u1 - u0) / 1000 - this.updateMsEma) * 0.06;
       }
       if (this.renderFn) {
-        const r0 = performance.now();
-        this.renderFn(dt, this.time);
-        const r1 = performance.now();
-        this.renderMsEma += ((r1 - r0) / 1000 - this.renderMsEma) * 0.06;
+        // renderSkip > 1 drops frames deliberately; see the field docs.
+        this.renderPhase++;
+        if (this.renderPhase >= this.renderSkip) {
+          this.renderPhase = 0;
+          const r0 = performance.now();
+          this.renderFn(dt, this.time);
+          const r1 = performance.now();
+          this.renderMsEma += ((r1 - r0) / 1000 - this.renderMsEma) * 0.06;
+        }
       }
     };
     this.raf = requestAnimationFrame(tick);

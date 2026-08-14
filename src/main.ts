@@ -1190,6 +1190,39 @@ class StaticGame {
         }
         if (o.runTime !== undefined) this.runTime = o.runTime;
       },
+      /**
+       * Tear the audio graph down and close the AudioContext.
+       *
+       * Needed by the test harness on headless Linux CI: the browser has no
+       * sound card, so Chromium's audio service falls back to ALSA, finds
+       * nothing that can consume samples, and its render callback then times
+       * out indefinitely ("SyncReader::Read timed out"). An output stream left
+       * open at that point wedges browser teardown, and the run dies on
+       * `browserContext.close: Test ended.` — after the test body has already
+       * passed. Closing the context releases the stream so teardown completes.
+       *
+       * Harmless in production; nothing calls it outside the debug API.
+       */
+      /**
+       * Render only every Nth frame while keeping simulation at full rate.
+       *
+       * Used by the audio suite on headless CI: SwiftShader saturates both
+       * cores of a 2-core runner, starving Chromium's audio render thread until
+       * its output stream wedges. Audio tests assert on Director state and
+       * AnalyserNode meters, never on pixels, so dropping render frames costs
+       * them nothing and keeps the audio thread scheduled.
+       */
+      renderThrottle: (n: number) => { this.loop.renderSkip = Math.max(1, Math.floor(n)); },
+      audioShutdown: async () => {
+        // Stop rendering FIRST. On a 2-core CI box SwiftShader saturates both
+        // cores, which is what starves the audio render thread in the first
+        // place; if the loop keeps running, the audio thread never gets
+        // scheduled long enough to finish closing its stream.
+        this.loop.paused = true;
+        this.audio.dispose();
+        // Give the (now unblocked) audio thread time to release the device.
+        await new Promise<void>(r => setTimeout(r, 400));
+      },
     };
   }
 }
