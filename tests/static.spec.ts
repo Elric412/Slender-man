@@ -7,23 +7,9 @@ import { test, expect, Page } from '@playwright/test';
  * is RAM-hungry, so each test takes at most a couple of screenshots.
  */
 
-interface StaticApi {
-  state(): string;
-  tapes(): number;
-  stats(): { avg: number; p95: number; worst: number; fps: number };
-  warp(x: number, z: number): void;
-  start(): void;
-  forceFear(v: number): void;
-  forceDetection(v: number): void;
-  entity(): { state: string; distToPlayer: number; detection: number };
-  flashlight(on: boolean): void;
-  collectAll(): void;
-  positions(): { spawn: { x: number; z: number }; exit: { x: number; z: number }; zones: { id: string; x: number; z: number }[] };
-}
-
-declare global {
-  interface Window { __static: StaticApi; }
-}
+// The `window.__static` type lives in ./api so both spec files can share one
+// global declaration (see the note there).
+import './api';
 
 const errors: string[] = [];
 
@@ -111,7 +97,8 @@ test('entity sighting + high static stress frame', async ({ page }) => {
   });
   await page.waitForTimeout(2000);
   const ent = await page.evaluate(() => window.__static.entity());
-  expect(['investigating', 'stalking', 'confronting']).toContain(ent.state);
+  expect(ent, 'entity snapshot unavailable').not.toBeNull();
+  expect(['investigating', 'stalking', 'confronting']).toContain(ent!.state);
   expect(errors, errors.join('\n')).toHaveLength(0);
   await page.screenshot({ path: 'shots/e2e-static-high.png' });
 });

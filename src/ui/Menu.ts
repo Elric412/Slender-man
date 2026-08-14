@@ -1,4 +1,5 @@
 import { Settings, saveSettings } from '../core/Config';
+import type { TellMode, TellState } from '../game/ProximityTell';
 
 type ScreenId = 'loading' | 'title' | 'about' | 'settings' | 'pause' | 'end' | 'advisory' | 'none';
 
@@ -24,6 +25,12 @@ export class Menu {
 
   private els = new Map<string, HTMLElement>();
   private tapeTimer = 0;
+  /** Last band pushed to the tell element, so we only touch classes on change. */
+  private tellBand: TellState['band'] = 'none';
+  /** Last needle angle in whole degrees — same reason. */
+  private tellDeg = 0;
+  /** Last intensity, quantised, for the same write-avoidance. */
+  private tellIntensity = -1;
 
   constructor(settings: Settings) {
     this.settings = settings;
@@ -31,7 +38,8 @@ export class Menu {
       'end-screen', 'hud', 'load-bar', 'load-status', 'tape-counter', 'tape-count', 'interact-prompt',
       'subtitle', 'viewfinder-overlay', 'vf-time', 'rotate-prompt', 'perf-overlay', 'touch-ui',
       'capture-overlay', 'end-title', 'end-detail', 'end-stats',
-      'advisory-screen', 'audio-cue'];
+      'advisory-screen', 'audio-cue',
+      'proximity-tell', 'pt-needle', 'pt-label'];
     for (const id of ids) {
       const el = document.getElementById(id);
       if (el) this.els.set(id, el);
@@ -107,6 +115,23 @@ export class Menu {
     bindCheck('set-subtitles', v => { s.subtitles = v; });
     bindCheck('set-colorblind', v => { s.colorblind = v; document.body.classList.toggle('cb', v); });
     bindCheck('set-gyro', v => { s.gyro = v; });
+    document.getElementById('set-proximity')?.addEventListener('change', (e) => {
+      s.proximityTell = (e.target as HTMLSelectElement).value as TellMode;
+      // Hide the dial the instant the player leaves `explicit`, rather than
+      // waiting for the next gameplay frame — the settings screen is often
+      // opened while paused, where no frames are being pushed at all.
+      if (s.proximityTell !== 'explicit') this.hideProximityTell();
+      this.commit();
+    });
+  }
+
+  /** Collapse the tell element to its resting hidden state. */
+  private hideProximityTell(): void {
+    const el = this.els.get('proximity-tell');
+    if (!el || el.classList.contains('hidden')) return;
+    el.classList.add('hidden');
+    el.classList.remove('pt-close', 'pt-imminent');
+    this.tellBand = 'none';
   }
 
   private applySettingsToControls(): void {
@@ -136,6 +161,8 @@ export class Menu {
     (document.getElementById('set-subtitles') as HTMLInputElement).checked = s.subtitles;
     (document.getElementById('set-colorblind') as HTMLInputElement).checked = s.colorblind;
     (document.getElementById('set-gyro') as HTMLInputElement).checked = s.gyro;
+    const pt = document.getElementById('set-proximity') as HTMLSelectElement | null;
+    if (pt) pt.value = s.proximityTell;
     document.body.classList.toggle('cb', s.colorblind);
   }
 
@@ -181,6 +208,54 @@ export class Menu {
     const joined = texts.join(' · ');
     if (el.textContent !== joined) el.textContent = joined;
     el.classList.remove('hidden');
+  }
+
+  /**
+   * Render the proximity tell. Called every frame in `explicit` mode.
+   *
+   * Every write here is change-gated. This runs at frame rate on a mobile
+   * browser, and unconditionally assigning `style.setProperty` and `textContent`
+   * would dirty layout/paint on a HUD element every single frame for no visual
+   * difference. The needle angle is quantised to whole degrees and the intensity
+   * to 1/32 for the same reason — below that the difference is not perceivable
+   * but the style recalc is still real.
+   */
+  setProximityTell(state: TellState | null): void {
+    const el = this.els.get('proximity-tell');
+    if (!el) return;
+    if (!state || !state.active) { this.hideProximityTell(); return; }
+
+    if (el.classList.contains('hidden')) el.classList.remove('hidden');
+
+    // intensity → CSS custom property (drives opacity + glow)
+    const q = Math.round(Math.min(1, Math.max(0, state.intensity)) * 32) / 32;
+    if (q !== this.tellIntensity) {
+      this.tellIntensity = q;
+      el.style.setProperty('--pt', String(q));
+    }
+
+    // bearing → needle rotation. The CSS needle points up at 0deg, which is the
+    // same convention as bearing 0 = dead ahead, so this is a direct mapping.
+    const needle = this.els.get('pt-needle');
+    const deg = Math.round(state.bearing * 57.2957795);
+    if (needle && deg !== this.tellDeg) {
+      this.tellDeg = deg;
+      needle.style.setProperty('--pt-bearing', `${deg}deg`);
+    }
+
+    if (state.band !== this.tellBand) {
+      this.tellBand = state.band;
+      el.classList.toggle('pt-close', state.band === 'close');
+      el.classList.toggle('pt-imminent', state.band === 'imminent');
+      const label = this.els.get('pt-label');
+      // Words, not numbers: a numeric readout would turn stalking into a
+      // spreadsheet, and these three rungs are all the player can act on.
+      if (label) {
+        label.textContent =
+          state.band === 'imminent' ? 'CLOSE' :
+          state.band === 'close' ? 'NEARBY' : 'PRESENT';
+      }
+    }
   }
 
   openSettings(from: ScreenId): void {
