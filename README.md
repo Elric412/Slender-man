@@ -79,7 +79,7 @@ B crouch, Start pause.
 | World         | Analytic heightfield (single source of truth), chunk-streamed instanced vegetation (5 archetypes + grass/ferns), procedural sky, rain |
 | Physics       | Yaw-box grid-hash colliders, terrain marching, vault, LOS slab tests |
 | AI            | Palebark brain: FOV + LOS + hearing perception, detection accumulation, dormant/investigating/stalking/confronting states, A* nav grid |
-| Audio         | 100% synthesized Web Audio: noise buffers, ADSR envelopes, modal resonators, positional fear mix — no samples |
+| Audio         | Adaptive procedural system: 5-bus graph w/ safety-only limiter, AudioWorklet DSP, HRTF + occlusion + propagation delay, tension Director (3-act arc, silence & cliché budgets), state-driven breath/heartbeat, granular entity layers, zone-aware ambience — **no samples of any length** (see `src/audio/README-AUDIO.md`) |
 | Input         | Unified InputFrame across pointer lock, touch (stick/drag/buttons), gamepad |
 | Offline       | Service worker (network-first navigation, cache-first assets) + PWA manifest |
 
@@ -101,4 +101,36 @@ __static.flashlight(true)
 __static.entity()         // { state, distToPlayer, detection }
 __static.stats()          // { fps, avg, p95, worst }
 __static.positions()      // spawn / exit / zones
+
+// ---- audio ----
+__static.audio()          // full snapshot: act, tension, layers, voices, meters
+__static.audioDirector()  // Director state incl. silence + cliché budgets
+__static.audioMeter('entity')   // { peak, rms, lufs } per bus, or master
+__static.audioTriggers()  // recent trigger history
+__static.audioCues()      // captioned audio cues (accessibility)
+__static.audioFire('sighting')  // deterministically fire a layer
+__static.audioForce({ tapes: 6, runTime: 480 })  // jump the Director forward
+__static.renderThrottle(12)     // render every Nth frame, full-rate sim
+__static.audioShutdown()        // close the AudioContext (test teardown)
 ```
+
+## Audio
+
+All sound is synthesised at runtime — no samples, no downloaded clips, no
+licensed material. Highlights:
+
+- **Real dynamic range.** The opening act is genuinely near-silent; the master
+  compressor is a safety limiter only, not a loudness maximiser.
+- **An adaptive Director**, not a looping ambient track: tension is modelled from
+  detection, progression and player behaviour, and escalations are *rationed* by a
+  per-run budget so the late game never becomes continuous noise.
+- **Accessibility is not optional.** Separate Master/Ambience/Entity/Foley/UI
+  volumes, a **Reduce low frequencies** toggle that works independently of the
+  volume slider, captioned audio cues, and a content advisory shown before the
+  first run.
+
+Full architecture, psychoacoustic rationale, tuning notes and known limitations:
+**[`src/audio/README-AUDIO.md`](src/audio/README-AUDIO.md)**.
+
+> Running the audio tests headlessly requires Chromium's silent sink — audio
+> specs boot with `?silentaudio=1`. See §13 of the audio README for why.

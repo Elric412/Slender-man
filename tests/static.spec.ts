@@ -28,6 +28,8 @@ interface StaticApi {
   audioCues(): { text: string; kind: string }[];
   audioFire(what: 'sighting' | 'capture' | 'cue' | 'tape' | 'ui' | 'step' | 'extension'): void;
   audioForce(o: { tapes?: number; runTime?: number }): void;
+  audioShutdown(): Promise<void>;
+  renderThrottle(n: number): void;
 }
 
 interface AudioDebug {
@@ -69,14 +71,53 @@ function watch(page: Page) {
   page.on('console', (m) => { if (m.type() === 'error') errors.push('CONSOLE: ' + m.text()); });
 }
 
-async function bootToTitle(page: Page) {
-  await page.goto('/', { waitUntil: 'load' });
+/**
+ * Release the audio device before Playwright closes the browser.
+ *
+ * Headless Linux CI (and this sandbox) has no sound card: no PulseAudio daemon
+ * and no ALSA plugin libraries. Chromium's audio service still opens a real
+ * output stream, finds nothing that can consume the samples, and its render
+ * callback then times out forever:
+ *
+ *   audio_manager_linux.cc] Falling back to ALSA ... could not be initialized
+ *   sync_reader.cc] SyncReader::Read timed out, audio glitch count=10
+ *   sync_reader.cc] ASR: No room in socket buffer.: Broken pipe (32)
+ *
+ * The page keeps running (so the test body passes and the meters read real
+ * values) but the browser can no longer be torn down: every audio test then
+ * fails with `browserContext.close: Test ended.`, and on some builds the
+ * browser SIGSEGVs on exit. Closing the AudioContext ourselves hands the
+ * stream back before teardown, which is enough to unblock it.
+ *
+ * This is a host-environment workaround, not a product behaviour: it runs
+ * after all assertions, so it cannot mask a real audio defect.
+ */
+test.afterEach(async ({ page }) => {
+  await page.evaluate(() => window.__static?.audioShutdown?.()).catch(() => undefined);
+});
+
+async function bootToTitle(page: Page, opts: { silentAudio?: boolean } = {}) {
+  // ?silentaudio=1 makes the game build its AudioContext on Chromium's silent
+  // sink: the graph is still rendered on the real audio clock (worklets run,
+  // meters read true values) but no output device is opened. Required on
+  // headless CI, which has no sound card — see the afterEach note above.
+  await page.goto(opts.silentAudio ? '/?silentaudio=1' : '/', { waitUntil: 'load' });
   await page.waitForFunction(() => window.__static && window.__static.state() === 'title', undefined, { timeout: 90_000 });
+}
+
+/** Boot for an audio test: silent sink + throttled rendering. */
+async function bootForAudio(page: Page) {
+  await bootToTitle(page, { silentAudio: true });
 }
 
 async function startRun(page: Page) {
   await page.evaluate(() => window.__static.start());
-  await page.waitForFunction(() => window.__static.state() === 'playing', undefined, { timeout: 15_000 });
+  // startRun() builds the world (terrain, forest scatter, collision BVH) and
+  // brings up the audio graph. On a 2-core CI box with a software rasteriser
+  // that can take well over 15 s, so this budget is generous on purpose —
+  // it is a slowness allowance, not a correctness one: the state must still
+  // reach 'playing', we simply refuse to call a slow machine a failure.
+  await page.waitForFunction(() => window.__static.state() === 'playing', undefined, { timeout: 60_000 });
 }
 
 /** Canvas is actually rendering: at least N distinct lit pixels sampled via readback. */
@@ -199,6 +240,11 @@ test('performance: frame-time budget after warmup', async ({ page }) => {
 
 /** Wait until the AudioContext is actually running (or report what it settled on). */
 async function audioRunning(page: Page): Promise<string> {
+  // Give the audio thread room to breathe: SwiftShader will otherwise occupy
+  // both cores of a 2-core CI runner and starve it (see the afterEach note).
+  // Simulation keeps ticking at full rate, so nothing the audio tests assert
+  // on — Director state, meters, trigger history — is affected.
+  await page.evaluate(() => window.__static.renderThrottle(12));
   await page.evaluate(() => {
     // A trusted-looking gesture is not available here, but Chromium's autoplay
     // policy in headless mode permits resume() from script.
@@ -230,7 +276,7 @@ async function peakOver(page: Page, ms: number, bus?: 'ambience' | 'entity' | 'f
 }
 
 test('audio: context comes up, worklets load, buses exist', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   const state = await audioRunning(page);
   const a = await page.evaluate(() => window.__static.audio());
@@ -243,7 +289,7 @@ test('audio: context comes up, worklets load, buses exist', async ({ page }) => 
 });
 
 test('audio: each bus produces output at its expected trigger (§13)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   const state = await audioRunning(page);
   test.skip(state !== 'running', `AudioContext did not start (${state}) — cannot meter`);
@@ -273,7 +319,7 @@ test('audio: each bus produces output at its expected trigger (§13)', async ({ 
 });
 
 test('audio: Director escalates measurably from early to late (§6, gate 5)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   await audioRunning(page);
 
@@ -302,7 +348,7 @@ test('audio: Director escalates measurably from early to late (§6, gate 5)', as
 });
 
 test('audio: opening act contains genuine near-silence (gate 1)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   const state = await audioRunning(page);
   await page.waitForTimeout(9000);
@@ -322,7 +368,7 @@ test('audio: opening act contains genuine near-silence (gate 1)', async ({ page 
 });
 
 test('audio: no two sightings or captures repeat in a run (gate 3)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   await audioRunning(page);
   // Move the Director into an act that will grant sighting budget.
@@ -344,7 +390,7 @@ test('audio: no two sightings or captures repeat in a run (gate 3)', async ({ pa
 });
 
 test('audio: low-frequency toggle removes sub-bass independently of volume (§11)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   // Zero the LF trim but keep master high — the two must be independent.
   await page.evaluate(() => {
     const raw = localStorage.getItem('static.settings.v2');
@@ -378,7 +424,7 @@ test('audio: low-frequency toggle removes sub-bass independently of volume (§11
 });
 
 test('audio: survives backgrounding and resumes (§12, gate 8)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   const state = await audioRunning(page);
   await page.waitForTimeout(2000);
@@ -409,7 +455,7 @@ test('audio: survives backgrounding and resumes (§12, gate 8)', async ({ page }
 });
 
 test('audio: no leaked voices or errors across an extended run and restart', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   await audioRunning(page);
 
@@ -443,7 +489,7 @@ test('audio: no leaked voices or errors across an extended run and restart', asy
 });
 
 test('audio: master stays below the safety ceiling under worst case (§3, §10)', async ({ page }) => {
-  await bootToTitle(page);
+  await bootForAudio(page);
   await startRun(page);
   const state = await audioRunning(page);
   test.skip(state !== 'running', `AudioContext did not start (${state})`);
