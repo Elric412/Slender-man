@@ -105,9 +105,22 @@ async function bootToTitle(page: Page, opts: { silentAudio?: boolean } = {}) {
   await page.waitForFunction(() => window.__static && window.__static.state() === 'title', undefined, { timeout: 90_000 });
 }
 
-/** Boot for an audio test: silent sink + throttled rendering. */
+/**
+ * Boot for an audio test: tiny viewport + silent sink.
+ *
+ * Audio specs assert on Director state, meters and trigger history — never on
+ * pixels — so they run at 320x240. This matters on a 985 MB runner with no
+ * swap: at 1920x1080 SwiftShader's HDR scene target, normals prepass, AO, TAA
+ * history and bloom chain together exhaust memory and the renderer is killed
+ * ("Target crashed") part-way through the suite. Dropping the viewport cuts
+ * that footprint by ~27x and costs the audio assertions nothing.
+ */
 async function bootForAudio(page: Page) {
+  await page.setViewportSize({ width: 320, height: 240 });
   await bootToTitle(page, { silentAudio: true });
+  // Throttle before the run starts, so the heavy first seconds of world build
+  // and streaming never render at full rate.
+  await page.evaluate(() => window.__static.renderThrottle(12));
 }
 
 async function startRun(page: Page) {
