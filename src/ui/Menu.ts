@@ -1,5 +1,5 @@
 import { Settings, saveSettings } from '../core/Config';
-import type { TellMode, TellState } from '../game/ProximityTell';
+import type { TellMode, TellState } from '../world/ProximityTell';
 
 type ScreenId = 'loading' | 'title' | 'about' | 'settings' | 'pause' | 'end' | 'advisory' | 'none';
 
