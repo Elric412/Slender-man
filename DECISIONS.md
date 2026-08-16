@@ -68,6 +68,72 @@ Found bug worth recording: `flashlightClick` and `tapePickup` originally
 created a gain node and passed it to `modal()` without connecting it to the
 UI bus — the nodes rendered into nothing and the clicks were silent.
 
+### Why the audio was rebuilt around a Director (`src/audio/`)
+`SynthEngine` proved the "no samples" thesis but mixed a *reactive* soundtrack:
+loud when the entity was near, quiet otherwise. That fails in two specific ways.
+It habituates — a sound that always accompanies the same event stops carrying
+information after about the third time — and it has no floor, so there is never
+real silence to make the loud moments mean anything.
+
+The replacement models **tension** and lets layers follow it, with two rules that
+did the most work:
+
+1. **Tension decays when the player is genuinely safe.** Without decay a run
+   becomes monotonically loud within ~90 s and escape never feels like relief.
+2. **Dramatic devices are rationed, not triggered.** Every riser, cut-to-quiet,
+   sighting sting, wrongness pass and sub-bass beat goes through
+   `requestSpend()` against a per-run `CLICHE_BUDGET`, which is allowed to
+   refuse. This is the single change that stops the late act from degenerating
+   into continuous noise — the standard failure mode of reactive horror audio.
+
+Silence is therefore *budgeted*, not incidental, and the master compressor was
+deliberately kept as a safety limiter only (`threshold -1.5 dB, ratio 20`). It
+exists to catch a pathological sum. Using it to glue the mix would have flattened
+the dynamic range the whole design depends on.
+
+### Sub-bass is capped in the DSP, not in the mix
+The low-frequency ceiling (`SUB_HARD_CEIL`) is enforced inside the AudioWorklet
+processor rather than by a gain node upstream. A mixing bug, a bad settings
+migration or a future refactor can all produce a wrong gain value; none of them
+can exceed a limit applied in the sample loop. Comfort limits should not depend
+on the correctness of the code above them.
+
+Relatedly, **"reduce low frequencies" is not wired to master volume.** They are
+different requests: one is "this is too loud", the other is "stop putting
+pressure in my chest". Collapsing them into one slider forces players to give up
+the mix to get the comfort.
+
+### Occlusion reuses the gameplay collision data
+Audio occlusion raycasts against the same `CollisionWorld` that movement and LOS
+use, rather than a separate acoustic mesh. A dedicated acoustic model would be
+more accurate in principle, but any divergence between the two is immediately
+audible as a lie: a sound leaking through something the player can see is solid
+reads as a bug, not as ambience. Correlation beats fidelity here. Cost is
+controlled by caching with time expiry and evaluating at ~5 Hz rather than
+per-frame.
+
+### Headless audio testing needs Chromium's silent sink
+CI has no sound card. Chromium opens a real output stream regardless, falls back
+to ALSA, finds nothing that consumes samples, and its audio thread then logs
+`SyncReader::Read timed out` until the stream wedges badly enough to break
+browser teardown — so every audio test passed its assertions and the *run* still
+failed with `browserContext.close: Test ended.`
+
+Three approaches were tried and rejected before the right one: `--mute-audio`
+only zeroes samples (the device is still opened); `--disable-audio-output` is not
+honoured by `chromium_headless_shell`, and forcing the audio service in-process
+turned the stall into a SIGSEGV; a null ALSA sink *did* open successfully but
+consumes samples instantly, so the audio thread spun and starved anyway.
+
+The supported answer is `sinkId: { type: 'none' }` — the graph is rendered on the
+real audio clock, so worklets execute and `AnalyserNode` meters read true values,
+but no device is ever opened. It is gated behind `?silentaudio=1` so it cannot
+affect a player. Two smaller findings from the same investigation: SwiftShader
+saturates both cores of a 2-core runner and will starve the audio thread on its
+own (hence `renderThrottle`, which drops render frames while simulation continues
+at full rate), and Playwright trace serialisation on a 985 MB box can itself hang
+teardown (hence `trace: 'off'` by default).
+
 ## Input
 
 ### One InputFrame, three devices

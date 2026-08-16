@@ -1,7 +1,7 @@
 # ASSETS
 
 **STATIC ships zero third-party assets.** No texture files, no model files,
-no audio samples, no fonts — everything below is generated procedurally at
+no audio samples of any length, no fonts — everything below is generated procedurally at
 boot time from seeded randomness. The entire game is code.
 
 This file inventories what is generated and where, so contributors know where
@@ -49,18 +49,63 @@ roughness maps are generated for surfaces that need breakup.
 - **Fog**: `FogExp2` tuned to the flashlight falloff so the beam reads as a
   volume.
 
-## Audio (100% synthesized — `src/audio/SynthEngine.ts`)
+## Audio (100% synthesized — `src/audio/`)
 
-| Sound              | Synthesis method |
-| ------------------ | -------------------------------------------------------- |
-| Wind bed           | Filtered noise buffer + slow LFO movement                |
-| Rain               | High-passed noise, droplet transients                    |
-| Footsteps          | ADSR transient → modal resonator bank, tuned per surface |
-| Flashlight click   | Modal resonator (fixed: gain must connect to `ui` bus)   |
-| Tape pickup/handling | Plastic modal bank + mechanical tick                   |
-| Palebark drone     | Detuned sub oscillators, amplitude-modulated             |
-| Static / fear      | Noise layer whose level tracks `FearSystem.value`        |
-| UI clicks          | Short modal ticks                                        |
+Every sound is generated at runtime by the Web Audio API. There are **no samples,
+no downloaded clips and no licensed audio of any length**, however short. Full
+architecture and rationale: [`src/audio/README-AUDIO.md`](src/audio/README-AUDIO.md).
+
+### Ambience (`Ambience.ts`)
+
+| Layer | Synthesis method |
+| ----- | ---------------- |
+| Wind bed / low wind | Pink + brown noise through state-variable bandpasses, slow independent LFO movement; canopy closure darkens and widens it |
+| Insects | Narrow resonant band chorus; centre frequency drops with ground wetness (marsh chorus sits lower) |
+| Water / creek | Filtered noise + stochastic droplet transients, distance-filtered |
+| Rain | High-passed noise bed + droplet transients; duller and heavier under canopy |
+| Air floor | Very low-level broadband bed — the floor that makes silence read as held breath rather than as a dropout |
+| Events (`creak`, `groan`, `bird`, `settle`, `drip`, `leaf`, `reed`, `stone`) | Modal resonator banks and shaped noise transients, spatialised, scheduled from three independent seeded RNG streams so families cannot phase-lock |
+
+### Player foley (`PlayerAudio.ts`)
+
+| Sound | Synthesis method |
+| ----- | ---------------- |
+| Breathing | Resynthesised per breath from movement load + fear; distinct in/out/hold/catch/release phases, no-repeat formant memory (never a loop) |
+| Heartbeat | Low sine thump + body resonance, tempo tied to fear, centre-panned, ducks other player-bus content |
+| Footsteps | Filtered-noise transient → modal resonator bank per surface (leaf, mud, wood, metal, water, stone), seeded micro-variation every step |
+| Cloth / gear | Short filtered-noise swells with seeded variation |
+| Flashlight click | Modal resonator (fixed: gain must connect to the `ui` bus) |
+| Tape pickup/handling | Plastic modal bank + mechanical tick |
+| Vault / exhausted | Impact transient + breath overlay |
+
+### Entity — the Palebark (`EntityAudio.ts`)
+
+| Layer | Synthesis method |
+| ----- | ---------------- |
+| Approach | Granular texture (AudioWorklet); density, grain size, spectral centre, scatter and resonance all morph with detection — brightening reads as *nearing* |
+| Interference | Synthesised static/RF corruption, deliberately head-locked (the recorder reacting, not an object in the forest) |
+| Sighting stings | 5 recipes, short and non-looping, drawn through a no-repeat memory so no two sightings in a run are identical |
+| Distant cues | 4 kinds, with deliberate positional uncertainty so far events are hard to localise |
+| Reach / extension beat | Ducked approach layer + filter sweep 180→760→240 Hz |
+| Capture | Abstracted: near-silence or brief controlled distortion, then quiet — nothing violent or graphic |
+
+### Psychoacoustic toolkit (`DreadToolkit.ts`, `worklets/DreadWorklet.ts`)
+
+| Tool | Synthesis method |
+| ---- | ---------------- |
+| Sub-bass dread drone | 20–45 Hz detuned oscillator pair (beating) + slow AM; hard-capped inside the worklet DSP |
+| Dissonant cluster | 3–5 oscillators at non-octave / non-fifth ratios with independent LFOs; constructed so it cannot resolve |
+| Shepard/Risset riser | Octave-spaced partials under a Gaussian log-frequency window — endless rise, no release |
+| Granular texture | Hann-windowed grains from a fixed recycled grain pool (zero allocation while running) |
+| Wrongness processor | Comb filter + ring modulation applied briefly to ordinary diegetic sounds |
+| Reverb | Procedural impulse responses: predelay, discrete early reflections, dual-band exponential decay, energy normalisation — regenerated per probed space |
+
+### UI
+
+| Sound | Synthesis method |
+| ----- | ---------------- |
+| UI clicks | Short modal ticks |
+| Audio cues | Captioned visually (`#audio-cue`) as well as sounded, for accessibility |
 
 ## Icons & PWA (`public/`)
 
