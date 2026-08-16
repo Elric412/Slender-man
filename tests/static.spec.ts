@@ -94,6 +94,18 @@ function watch(page: Page) {
  */
 test.afterEach(async ({ page }) => {
   await page.evaluate(() => window.__static?.audioShutdown?.()).catch(() => undefined);
+  // Drop the WebGL context explicitly. Playwright reuses one browser process
+  // across the tests in a file, and on a 985 MB runner with no swap the
+  // SwiftShader render targets from finished tests are not reclaimed fast
+  // enough — the renderer is then killed mid-suite ("Target crashed"), so a
+  // test fails for something the previous test allocated.
+  await page.evaluate(() => {
+    const c = document.querySelector('canvas') as HTMLCanvasElement | null;
+    const gl = c?.getContext('webgl2') as WebGL2RenderingContext | null;
+    gl?.getExtension('WEBGL_lose_context')?.loseContext();
+  }).catch(() => undefined);
+  // Navigating away tears down the page's heap before the next test boots.
+  await page.goto('about:blank').catch(() => undefined);
 });
 
 async function bootToTitle(page: Page, opts: { silentAudio?: boolean } = {}) {
