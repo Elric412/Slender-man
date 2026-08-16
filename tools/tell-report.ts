@@ -10,7 +10,7 @@
  * this cannot answer — that the dial actually appears, and that the `subtle`
  * boost reaches the composite.
  */
-import { ProximityTell } from '../src/game/ProximityTell';
+import { ProximityTell } from '../src/world/ProximityTell';
 import type { EntitySnapshot } from '../src/ai/EntityBrain';
 
 const DT = 1 / 60;

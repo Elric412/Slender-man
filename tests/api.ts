@@ -29,6 +29,34 @@ export interface EntityView {
   extensionRequest: boolean;
 }
 
+/** Full audio-engine debug dump (brief §13). */
+export interface AudioDebug {
+  ctx: string;
+  worklet: boolean;
+  lowFreq: number;
+  act: string;
+  tension: number;
+  silence: number;
+  silenceSeconds: number;
+  layers: string[];
+  sub: number;
+  cluster: number;
+  riser: number;
+  spends: Record<string, number>;
+  peakTension: number;
+  voices: number;
+  poolSize: number;
+  dropped: number;
+  duck: number;
+  master: { peak: number; rms: number; lufs: number };
+  buses: Record<string, { peak: number; rms: number; lufs: number }>;
+  ambience: { levels: Record<string, number>; events: Record<string, number> };
+  entity: { approach: number; interference: number; presence: number; fired: Record<string, number> };
+  heart: number;
+  triggers: number;
+  cues: string[];
+}
+
 export interface StaticApi {
   state(): string;
   tapes(): number;
@@ -49,12 +77,33 @@ export interface StaticApi {
     exit: { x: number; z: number };
     zones: { id: string; x: number; z: number }[];
   };
+  // ---- audio (brief §13) ----
+  audio(): AudioDebug;
+  audioMeter(bus?: 'ambience' | 'entity' | 'foley' | 'ui'): { peak: number; rms: number; lufs: number };
+  audioDirector(): {
+    act: string; tension: number; silence: number; silenceSeconds: number;
+    layers: string[]; sub: number; cluster: number; riser: number;
+    spends: Record<string, number>; reason: string;
+  };
+  audioTriggers(): { t: number; event: string; bus: string }[];
+  audioCues(): { text: string; kind: string }[];
+  audioFire(what: 'sighting' | 'capture' | 'cue' | 'tape' | 'ui' | 'step' | 'extension'): void;
+  audioForce(o: { tapes?: number; runTime?: number }): void;
   // Palebark
   palebark(): Record<string, unknown>;
   forceExtension(): void;
   // Proximity tell
   tell(): TellSnapshot;
   setTell(m: 'off' | 'subtle' | 'explicit'): void;
+  /**
+   * Render every Nth frame while simulation continues at full rate. On a
+   * 2-core headless runner SwiftShader saturates both cores and starves
+   * Chromium's audio render thread until its output stream wedges and the page
+   * is killed. Tests that assert on state rather than pixels can throttle.
+   */
+  renderThrottle(n: number): void;
+  /** Tear down the audio graph so browser teardown is not wedged by ALSA. */
+  audioShutdown(): Promise<void>;
 }
 
 declare global {

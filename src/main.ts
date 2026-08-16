@@ -17,7 +17,7 @@ import { Flashlight } from './game/Flashlight';
 import { PalebarkEntity } from './entity/PalebarkEntity';
 import type { AnimState } from './entity/PalebarkAnimator';
 import { FearSystem } from './game/FearSystem';
-import { ProximityTell } from './game/ProximityTell';
+import { ProximityTell } from './world/ProximityTell';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';

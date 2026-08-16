@@ -29,7 +29,11 @@ function watch(page: Page) {
 }
 
 async function bootToTitle(page: Page) {
-  await page.goto('/', { waitUntil: 'load' });
+  // ?silentaudio=1 builds the AudioContext on Chromium's silent sink: the graph
+  // still renders on the real audio clock, but no output device is opened. On a
+  // headless runner with no sound card an opened device wedges the audio thread
+  // and takes the page with it. See playwright.config.ts's header note.
+  await page.goto('/?silentaudio=1', { waitUntil: 'load' });
   await page.waitForFunction(() => window.__static && window.__static.state() === 'title',
     undefined, { timeout: 90_000 });
 }
@@ -38,6 +42,12 @@ async function startRun(page: Page) {
   await page.evaluate(() => window.__static.start());
   await page.waitForFunction(() => window.__static.state() === 'playing',
     undefined, { timeout: 20_000 });
+  // Every assertion in this suite is about state or DOM, never about pixels, so
+  // we can afford to render sparsely. On a 2-core headless runner SwiftShader
+  // otherwise saturates both cores and starves Chromium's audio render thread
+  // until the page is killed outright ("Target crashed"). The shader-compile
+  // test overrides this back down, since it *does* need frames to be drawn.
+  await page.evaluate(() => window.__static.renderThrottle(6));
   // `playing` is set before the first update tick completes, and the entity
   // snapshot only exists after that tick. Waiting on the snapshot itself is the
   // honest precondition — polling for a fixed number of ms would be flaky on a
@@ -85,6 +95,26 @@ async function forceContact(page: Page, mode: 'off' | 'subtle' | 'explicit' = 'e
 }
 
 test.beforeEach(async ({ page }) => watch(page));
+
+/**
+ * Same teardown as the main suite (see tests/static.spec.ts for the full
+ * rationale): release the audio device, explicitly lose the WebGL context, and
+ * drop the page heap. On a small headless runner the SwiftShader render targets
+ * from a finished test are otherwise not reclaimed in time and the *next* test
+ * dies with "Target crashed" for memory it never allocated.
+ *
+ * Host-environment workaround, not product behaviour — it runs after all
+ * assertions, so it cannot mask a real defect.
+ */
+test.afterEach(async ({ page }) => {
+  await page.evaluate(() => window.__static?.audioShutdown?.()).catch(() => undefined);
+  await page.evaluate(() => {
+    const c = document.querySelector('canvas') as HTMLCanvasElement | null;
+    const gl = c?.getContext('webgl2') as WebGL2RenderingContext | null;
+    gl?.getExtension('WEBGL_lose_context')?.loseContext();
+  }).catch(() => undefined);
+  await page.goto('about:blank').catch(() => undefined);
+});
 
 test('proximity tell defaults to off and stays invisible', async ({ page }) => {
   await bootToTitle(page);

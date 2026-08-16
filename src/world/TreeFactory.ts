@@ -257,17 +257,57 @@ function limb(b: Builder, o: LimbOpts): void {
   }
   const total = arc[n - 1] || 1;
 
+  // ---- UV parameterisation: constant texel density on a *tapering* tube ----
+  //
+  // This is where the naive implementation quietly fails the quality bar, and
+  // it took a measurement to see it.
+  //
+  // `u` necessarily spans 0…1 once around the loop at every ring, and
+  // `repeatsU` must be a whole number, or `fract()` doesn't return to 0 at the
+  // seam and a hard stripe runs the length of the trunk. But a trunk *tapers*:
+  // the widest ring may be 1.7 m around and the tip 6 cm. With a single
+  // `repeatsV` for the whole limb, one bark tile occupies 1.7/repeatsU metres
+  // horizontally at the base and 0.06/repeatsU at the tip, while advancing the
+  // same distance vertically at both ends. Measured on the first build that was
+  // up to **12:1** anisotropy — bark visibly smeared along the grain, which is
+  // exactly the "stretched UVs / inconsistent texel density" defect.
+  //
+  // The fix is to stop treating V as a single scalar. `repeatsV` is pinned to 1
+  // and the *vertex* `v` carries absolute repeat count, accumulated ring by
+  // ring against the **local** circumference. Each ring therefore advances V by
+  // however much keeps its texels square. Bark naturally becomes finer-grained
+  // toward the tips, which is also how real bark behaves.
+  //
+  // A minimum radius is enforced for both geometry and UVs: without it, a
+  // branch tapering to 12 mm makes V explode into hundreds of repeats over a
+  // few centimetres, which aliases into noise and wastes mip bandwidth. 35 mm
+  // is below the point where a viewer can tell, and it removes the degenerate
+  // slivers at every branch tip as a bonus.
+  const MIN_R = 0.035;
+  const rEff: number[] = new Array(n);
   let rMax = 0;
-  for (const r of o.radii) rMax = Math.max(rMax, r);
+  for (let i = 0; i < n; i++) {
+    rEff[i] = Math.max(o.radii[i], MIN_R);
+    if (rEff[i] > rMax) rMax = rEff[i];
+  }
   const repeatsU = Math.max(1, Math.round((2 * Math.PI * rMax) / o.tileWorld));
-  const repeatsV = Math.max(0.35, total / o.tileWorld);
+
+  const vAt: number[] = new Array(n);
+  vAt[0] = 0;
+  for (let i = 1; i < n; i++) {
+    // Horizontal world size of one tile at this ring, from the *quantised* U.
+    const rAvg = (rEff[i - 1] + rEff[i]) * 0.5;
+    const localTile = (2 * Math.PI * rAvg) / repeatsU;
+    vAt[i] = vAt[i - 1] + (arc[i] - arc[i - 1]) / localTile;
+  }
+  void total;   // arc length no longer drives V directly
 
   const seg = o.radialSegs;
   const base = b.count;
 
   for (let i = 0; i < n; i++) {
-    const p = o.path[i], rad = o.radii[i];
-    const v = arc[i] / total;
+    const p = o.path[i], rad = rEff[i];
+    const v = vAt[i];
     // seg+1 verts so u can reach 1.0 — a shared seam vert would force u=0 and
     // u=1 onto one vertex and mirror the last column of bark.
     for (let j = 0; j <= seg; j++) {
@@ -281,7 +321,7 @@ function limb(b: Builder, o: LimbOpts): void {
         nx, ny, nz,
         j / seg, v,
         o.r, o.g, o.b,
-        o.tile, repeatsU, repeatsV,
+        o.tile, repeatsU, 1,
       );
     }
   }
@@ -294,11 +334,15 @@ function limb(b: Builder, o: LimbOpts): void {
     }
   }
 
-  if (o.capTip && o.radii[n - 1] > 1e-4) {
-    const tip = o.path[n - 1], t = tan[n - 1];
+  if (o.capTip) {
+    const tip = o.path[n - 1], t = tan[n - 1], rTip = rEff[n - 1];
+    // The apex continues V at the tip ring's own rate, so the cap's texels
+    // match the last ring's rather than compressing to a point.
+    const localTile = (2 * Math.PI * rTip) / repeatsU;
     const apex = b.vert(
-      tip.x + t.x * o.radii[n - 1], tip.y + t.y * o.radii[n - 1], tip.z + t.z * o.radii[n - 1],
-      t.x, t.y, t.z, 0.5, 1, o.r, o.g, o.b, o.tile, repeatsU, repeatsV,
+      tip.x + t.x * rTip, tip.y + t.y * rTip, tip.z + t.z * rTip,
+      t.x, t.y, t.z, 0.5, vAt[n - 1] + rTip / localTile,
+      o.r, o.g, o.b, o.tile, repeatsU, 1,
     );
     const ring = base + (n - 1) * stride;
     for (let j = 0; j < seg; j++) b.tri(ring + j, apex, ring + j + 1);
@@ -420,6 +464,11 @@ function fractureCap(
   severity: number,
 ): void {
   const spikes = 5 + Math.floor(severity * 5);
+  // Splintered wood is finer-grained than bark: the interesting frequency is
+  // the fibre, not the plate. A dedicated, smaller tile size also keeps the
+  // fracture reading as *torn* next to the bark it interrupts.
+  const TW = BARK_TILE_WORLD_FINE;
+
   for (let i = 0; i < spikes; i++) {
     const a0 = (i / spikes) * Math.PI * 2;
     const a1 = ((i + 1) / spikes) * Math.PI * 2;
@@ -430,14 +479,36 @@ function fractureCap(
     const tipA = a0 + (a1 - a0) * rng.range(0.25, 0.75);
     const tx = cx + Math.cos(tipA) * rr * 0.5, tz = cz + Math.sin(tipA) * rr * 0.5;
 
+    // UVs are derived from **world size**, not from a 0…1 unit square.
+    //
+    // Hardcoding `uv` 0→1 across a spike was measurably wrong: a fibre 0.3 m
+    // wide and 1.8 m tall got one tile in each direction, i.e. 6:1 texel
+    // anisotropy, and it was the single worst offender in the whole tree set
+    // (12:1 on the shattered veteran). Spanning U and V by the actual metres
+    // each edge covers makes the splinter texture the same physical scale here
+    // as it is everywhere else. Fractional spans are safe on these triangles
+    // because — unlike a trunk — they do not wrap, so `fract()` has no seam to
+    // mismatch across.
+    const wWorld = Math.max(0.02, Math.hypot(x1 - x0, z1 - z0));
+    const uSpan = wWorld / TW;
+    const vSpan = h / TW;
+    // Random origin so adjacent fibres don't all sample the same patch of the
+    // tile — without it the fracture crown looks stamped from one splinter.
+    const u0 = rng.range(0, 1), v0 = rng.range(0, 1);
+
     // Two triangles per fibre: an outer face and an inner face, so the spike
     // has thickness from every angle rather than being a billboard.
     const nA = norm(v3(Math.cos(tipA), 0.25, Math.sin(tipA)));
-    const i0 = b.vert(x0, cy, z0, nA.x, nA.y, nA.z, 0, 0, r, g, bl, TILE.woodSplintered, 1, 1);
-    const i1 = b.vert(x1, cy, z1, nA.x, nA.y, nA.z, 1, 0, r, g, bl, TILE.woodSplintered, 1, 1);
-    const i2 = b.vert(tx, cy + h, tz, nA.x, nA.y, nA.z, 0.5, 1, r * 1.15, g * 1.12, bl * 1.05, TILE.woodSplintered, 1, 1);
+    const i0 = b.vert(x0, cy, z0, nA.x, nA.y, nA.z, u0, v0, r, g, bl, TILE.woodSplintered, 1, 1);
+    const i1 = b.vert(x1, cy, z1, nA.x, nA.y, nA.z, u0 + uSpan, v0, r, g, bl, TILE.woodSplintered, 1, 1);
+    const i2 = b.vert(tx, cy + h, tz, nA.x, nA.y, nA.z, u0 + uSpan * 0.5, v0 + vSpan,
+      r * 1.15, g * 1.12, bl * 1.05, TILE.woodSplintered, 1, 1);
     b.tri(i0, i1, i2);
-    const cc = b.vert(cx, cy + h * 0.12, cz, 0, 1, 0, 0.5, 0, r * 0.7, g * 0.7, bl * 0.7, TILE.woodSplintered, 1, 1);
+    // Inner face runs back to the trunk centre; its V span is the *depth* it
+    // covers, which is a horizontal distance, not the spike height.
+    const cVs = (rr / TW) * 0.5;
+    const cc = b.vert(cx, cy + h * 0.12, cz, 0, 1, 0, u0 + uSpan * 0.5, v0 - cVs,
+      r * 0.7, g * 0.7, bl * 0.7, TILE.woodSplintered, 1, 1);
     b.tri(i1, i0, cc);
     b.tri(i0, i2, cc);
     b.tri(i2, i1, cc);
@@ -1571,3 +1642,340 @@ const UNDERSTORY: BroadSpec[] = [
     suppress: 0.22, forkAt: 0.04, buttressCount: 0, crownAspect: 0.2, clumpsPerTip: 3,
   },
 ];
+
+// ============================================================================
+// silhouette signature
+// ============================================================================
+
+/**
+ * Compute the structural fingerprint used by the automated non-repetition check.
+ *
+ * Two channels, `SIL_BINS` bands each:
+ *  - **radius profile**: max horizontal extent of *bark* geometry per height
+ *    band, normalised by the widest band. This is the branch-structure
+ *    signature, and normalising by both width and height is the point — a
+ *    uniform rescale produces an *identical* signature, so "same tree, bigger"
+ *    is caught rather than excused. That was precisely the old system's trick.
+ *  - **foliage mass profile**: foliage verts per height band, normalised by the
+ *    fullest band. Two trees with the same skeleton but crowns starting at 34%
+ *    vs. 68% of height separate here even if their trunks agree.
+ *
+ * Deliberately geometric rather than a render: it runs in a plain node process
+ * with no GPU, so it can gate a build.
+ */
+function silhouetteOf(bark: RawGeo, fol: RawGeo | null, height: number): Float32Array {
+  const sig = new Float32Array(SIL_BINS * 2);
+  const H = Math.max(0.5, height);
+
+  const p = bark.position;
+  for (let i = 0; i < p.length; i += 3) {
+    const y = p[i + 1];
+    let bin = Math.floor((y / H) * SIL_BINS);
+    if (bin < 0) bin = 0; else if (bin >= SIL_BINS) bin = SIL_BINS - 1;
+    const r = Math.hypot(p[i], p[i + 2]);
+    if (r > sig[bin]) sig[bin] = r;
+  }
+  let rMax = 0;
+  for (let i = 0; i < SIL_BINS; i++) rMax = Math.max(rMax, sig[i]);
+  if (rMax > 1e-4) for (let i = 0; i < SIL_BINS; i++) sig[i] /= rMax;
+
+  if (fol) {
+    const q = fol.position;
+    for (let i = 0; i < q.length; i += 3) {
+      const y = q[i + 1];
+      let bin = Math.floor((y / H) * SIL_BINS);
+      if (bin < 0) bin = 0; else if (bin >= SIL_BINS) bin = SIL_BINS - 1;
+      sig[SIL_BINS + bin] += 1;
+    }
+    let fMax = 0;
+    for (let i = SIL_BINS; i < SIL_BINS * 2; i++) fMax = Math.max(fMax, sig[i]);
+    if (fMax > 0) for (let i = SIL_BINS; i < SIL_BINS * 2; i++) sig[i] /= fMax;
+  }
+  return sig;
+}
+
+/** RMS distance between two silhouette signatures. 0 = structurally identical. */
+export function silhouetteDistance(a: Float32Array, b: Float32Array): number {
+  let s = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) { const d = a[i] - b[i]; s += d * d; }
+  return Math.sqrt(s / n);
+}
+
+// ============================================================================
+// tile + tint selection
+// ============================================================================
+
+/** Bark tile an archetype uses when healthy and unmodified. */
+function defaultBark(a: ArchetypeId): number {
+  switch (a) {
+    case 'matureConifer': return TILE.barkMatureConifer;
+    case 'youngConifer':  return TILE.barkYoungConifer;
+    case 'hardwood':      return TILE.barkHardwood;
+    case 'snag':          return TILE.barkSnag;
+    case 'stormBroken':   return TILE.barkMatureConifer;
+    case 'understory':    return TILE.barkAlder;
+    case 'alder':         return TILE.barkAlder;
+  }
+}
+
+/** Foliage tile an archetype uses when healthy and unmodified. */
+function defaultFoliage(a: ArchetypeId): number {
+  switch (a) {
+    case 'matureConifer': return TILE.needleDense;
+    case 'youngConifer':  return TILE.needleDense;
+    case 'hardwood':      return TILE.leafHardwood;
+    case 'snag':          return TILE.twigsBare;
+    case 'stormBroken':   return TILE.needleDense;
+    case 'understory':    return TILE.leafBroad;
+    case 'alder':         return TILE.leafHardwood;
+  }
+}
+
+/**
+ * Per-*variant* bark overrides.
+ *
+ * Assigning a different bark surface to specific variants rather than to whole
+ * archetypes is deliberate. If every hardwood shared `barkHardwood`, a stand of
+ * hardwoods would be a stand of one bark — the exact defect the diagnosis
+ * flagged. Spreading eight bark surfaces across thirty-five variants buys far
+ * more apparent species diversity than seven archetypes with one bark each,
+ * and costs nothing: it is one integer in a vertex attribute.
+ */
+function variantBarkOverride(a: ArchetypeId, variant: number): number | null {
+  if (a === 'hardwood' && variant === 4) return TILE.barkPale;        // leaning birch
+  if (a === 'alder' && variant === 1) return TILE.barkPale;           // pale straight stem
+  if (a === 'matureConifer' && variant === 4) return TILE.barkMossy;  // weeping wet giant
+  if (a === 'understory' && variant === 2) return TILE.barkHardwood;  // holly stem
+  if (a === 'youngConifer' && variant === 3) return TILE.barkAlder;   // smooth pole
+  return null;
+}
+
+/** Per-variant foliage overrides, for the same reason. */
+function variantFoliageOverride(a: ArchetypeId, variant: number): number | null {
+  if (a === 'hardwood' && variant === 3) return TILE.leafDry;           // gnarled veteran
+  if (a === 'understory' && variant === 1) return TILE.leafDry;         // hazel
+  if (a === 'understory' && variant === 4) return TILE.leafBroad;       // bramble
+  if (a === 'alder' && variant === 4) return TILE.leafBroad;            // suppressed
+  if (a === 'matureConifer' && variant === 1) return TILE.needleSparse; // airy spire
+  if (a === 'stormBroken' && variant === 3) return TILE.needleSparse;   // wind-thrown
+  return null;
+}
+
+// ============================================================================
+// public API
+// ============================================================================
+
+/** Structural variants authored per archetype. Above the 4-5 minimum. */
+export const VARIANTS_PER_ARCHETYPE = 5;
+
+/** Every archetype the factory can build, in a stable order. */
+export const TREE_ARCHETYPES: readonly ArchetypeId[] = [
+  'matureConifer', 'youngConifer', 'hardwood', 'snag', 'stormBroken', 'understory', 'alder',
+];
+
+/** Variant count for an archetype — read from the data, never hardcoded. */
+export function variantCount(a: ArchetypeId): number {
+  switch (a) {
+    case 'matureConifer': return MATURE_CONIFER.length;
+    case 'youngConifer':  return YOUNG_CONIFER.length;
+    case 'hardwood':      return HARDWOOD.length;
+    case 'snag':          return SNAG.length;
+    case 'stormBroken':   return STORM.length;
+    case 'understory':    return UNDERSTORY.length;
+    case 'alder':         return ALDER.length;
+  }
+}
+
+/** Human-readable structural description of a variant, for reports and audits. */
+export function variantLabel(a: ArchetypeId, variant: number): string {
+  const v = variant % variantCount(a);
+  switch (a) {
+    case 'matureConifer': return MATURE_CONIFER[v].label;
+    case 'youngConifer':  return YOUNG_CONIFER[v].label;
+    case 'hardwood':      return HARDWOOD[v].label;
+    case 'snag':          return SNAG[v].label;
+    case 'stormBroken':   return STORM[v].label;
+    case 'understory':    return UNDERSTORY[v].label;
+    case 'alder':         return ALDER[v].label;
+  }
+}
+
+export interface TreeFactoryOpts {
+  /** 0 = full detail, 1 = mid, 2 = far */
+  lod?: number;
+  /** extra seed salt, so two placements of one template can still differ */
+  salt?: number;
+}
+
+function hashStr(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Base vertex tints.
+ *
+ * Kept close to white on purpose: these multiply an already-dark albedo under a
+ * moonlit grade, and a strongly coloured vertex tint is the cheap way to fake
+ * variety that ends up reading as "the same tree with a hue slider". The real
+ * separation lives in geometry and in which atlas tile a vert points at; tint
+ * only nudges.
+ */
+const BASE_BARK_TINT: Record<ArchetypeId, [number, number, number]> = {
+  matureConifer: [1.0, 0.97, 0.94],
+  youngConifer:  [0.96, 0.98, 1.0],
+  hardwood:      [1.0, 0.96, 0.9],
+  snag:          [1.0, 1.0, 1.02],
+  stormBroken:   [0.98, 0.95, 0.92],
+  understory:    [0.94, 1.0, 0.95],
+  alder:         [0.96, 1.0, 0.98],
+};
+
+const BASE_LEAF_TINT: Record<ArchetypeId, [number, number, number]> = {
+  matureConifer: [0.9, 1.0, 0.86],
+  youngConifer:  [0.94, 1.05, 0.88],
+  hardwood:      [1.0, 1.0, 0.82],
+  snag:          [0.86, 0.82, 0.78],
+  stormBroken:   [0.92, 0.98, 0.84],
+  understory:    [0.88, 1.02, 0.86],
+  alder:         [0.9, 1.0, 0.9],
+};
+
+/**
+ * Build one tree template.
+ *
+ * Deterministic in `(seed, archetype, variant, condition, lod)`: the same key
+ * always produces byte-identical geometry. That is what lets the scatter system
+ * cache templates safely and lets the audit harness reproduce a finding exactly
+ * rather than reporting a flake.
+ */
+export function buildTree(
+  seed: number, archetype: ArchetypeId, variant: number, condition: Condition,
+  opts: TreeFactoryOpts = {},
+): TreeTemplate {
+  const lod = Math.round(clamp(opts.lod ?? 0, 0, 2));
+  const v = variant % variantCount(archetype);
+  const key = `${archetype}:${v}:${condition}:${lod}`;
+
+  // The key is folded into the seed so that `matureConifer:0:healthy` and
+  // `matureConifer:0:mossHeavy` do not share a random stream. Without this the
+  // moss variant would be the healthy tree with drapes bolted on — identical
+  // branch angles, identical whorl phases — and the two would be recognisably
+  // the same individual standing twice in one view.
+  const rng = new SeededRandom((seed ^ Math.imul(hashStr(key), 2654435761)) | 0)
+    .fork(opts.salt ?? 0);
+
+  const cond = condSpec(condition, archetype);
+  const barkTile = cond.barkTile ?? variantBarkOverride(archetype, v) ?? defaultBark(archetype);
+  const folTile = cond.foliageTile ?? variantFoliageOverride(archetype, v) ?? defaultFoliage(archetype);
+
+  const ctx: BuildCtx = {
+    bark: new Builder(), fol: new Builder(), rng, cond, lod, segs: RADIAL[lod],
+  };
+
+  const bp = BASE_BARK_TINT[archetype], lp = BASE_LEAF_TINT[archetype];
+  const tint: [number, number, number] = [
+    bp[0] * cond.tint[0], bp[1] * cond.tint[1], bp[2] * cond.tint[2],
+  ];
+  const leaf: [number, number, number] = [
+    lp[0] * cond.leafTint[0], lp[1] * cond.leafTint[1], lp[2] * cond.leafTint[2],
+  ];
+
+  let dims: { height: number; crownBase: number; crownRadius: number; collide: number };
+  switch (archetype) {
+    case 'matureConifer':
+      dims = buildConifer(ctx, MATURE_CONIFER[v], barkTile, folTile, tint, leaf); break;
+    case 'youngConifer':
+      dims = buildConifer(ctx, YOUNG_CONIFER[v], barkTile, folTile, tint, leaf); break;
+    case 'hardwood':
+      dims = buildBroadleaf(ctx, HARDWOOD[v], barkTile, folTile, tint, leaf); break;
+    case 'alder':
+      dims = buildBroadleaf(ctx, ALDER[v], barkTile, folTile, tint, leaf); break;
+    case 'understory':
+      dims = buildBroadleaf(ctx, UNDERSTORY[v], barkTile, folTile, tint, leaf); break;
+    case 'snag':
+      dims = buildSnag(ctx, SNAG[v], tint); break;
+    case 'stormBroken':
+      dims = buildStorm(ctx, STORM[v], barkTile, folTile, tint, leaf); break;
+  }
+
+  const bark = ctx.bark.finish();
+  if (!bark) throw new Error(`TreeFactory: ${key} produced no bark geometry`);
+  const foliage = ctx.fol.finish();
+
+  return {
+    key, archetype, variant: v, condition, lod,
+    label: `${variantLabel(archetype, v)} [${condition}]`,
+    bark, foliage,
+    height: dims.height,
+    crownBase: dims.crownBase,
+    crownRadius: dims.crownRadius,
+    collideRadius: dims.collide,
+    silhouette: silhouetteOf(bark, foliage, dims.height),
+  };
+}
+
+/**
+ * Template cache.
+ *
+ * The scatter system asks for `(archetype, variant, condition, lod)` thousands
+ * of times per world build; rebuilding a third-order oak each time would
+ * dominate boot. Caching by key makes construction cost O(unique combinations),
+ * bounded at 7 x 5 x 5 x 3 = 525 and typically ~120 in a real world.
+ *
+ * Cached `RawGeo`s are **immutable by contract**: the scatter system reads and
+ * transforms them into its own merged buffers and never writes back.
+ */
+export class TreeCache {
+  private map = new Map<string, TreeTemplate>();
+  constructor(private seed: number) {}
+
+  get(archetype: ArchetypeId, variant: number, condition: Condition, lod = 0): TreeTemplate {
+    const v = variant % variantCount(archetype);
+    const key = `${archetype}:${v}:${condition}:${lod}`;
+    let t = this.map.get(key);
+    if (!t) {
+      t = buildTree(this.seed, archetype, v, condition, { lod });
+      this.map.set(key, t);
+    }
+    return t;
+  }
+
+  /** Every template built so far — used by the audit report. */
+  entries(): TreeTemplate[] { return [...this.map.values()]; }
+
+  get size(): number { return this.map.size; }
+
+  /** Resident geometry bytes, for the budget check. */
+  bytes(): number {
+    let n = 0;
+    for (const t of this.map.values()) {
+      n += rawGeoBytes(t.bark);
+      if (t.foliage) n += rawGeoBytes(t.foliage);
+    }
+    return n;
+  }
+
+  clear(): void { this.map.clear(); }
+}
+
+/**
+ * Build the full matrix. Used by the verification harness and the asset report;
+ * never called at runtime, where only placed combinations are built.
+ */
+export function buildAllTemplates(
+  seed: number, conditions: readonly Condition[], lod = 0,
+): TreeTemplate[] {
+  const out: TreeTemplate[] = [];
+  for (const a of TREE_ARCHETYPES) {
+    for (let v = 0; v < variantCount(a); v++) {
+      for (const c of conditions) out.push(buildTree(seed, a, v, c, { lod }));
+    }
+  }
+  return out;
+}
