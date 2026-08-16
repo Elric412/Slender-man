@@ -92,20 +92,34 @@ function watch(page: Page) {
  * This is a host-environment workaround, not a product behaviour: it runs
  * after all assertions, so it cannot mask a real audio defect.
  */
+/**
+ * Every step here is best-effort and hard-bounded.
+ *
+ * Teardown must never be able to fail or hang a test that has already passed
+ * its assertions — that turns an environment problem into a phantom product
+ * failure, which is exactly what this suite spent a long time chasing.
+ */
+function bounded<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  return Promise.race([
+    p.catch(() => undefined),
+    new Promise<undefined>(r => setTimeout(() => r(undefined), ms)),
+  ]);
+}
+
 test.afterEach(async ({ page }) => {
-  await page.evaluate(() => window.__static?.audioShutdown?.()).catch(() => undefined);
-  // Drop the WebGL context explicitly. Playwright reuses one browser process
-  // across the tests in a file, and on a 985 MB runner with no swap the
-  // SwiftShader render targets from finished tests are not reclaimed fast
-  // enough — the renderer is then killed mid-suite ("Target crashed"), so a
-  // test fails for something the previous test allocated.
-  await page.evaluate(() => {
+  // Release the audio device (see the note above) …
+  await bounded(page.evaluate(() => window.__static?.audioShutdown?.()), 5_000);
+  // … and drop the WebGL context. Playwright reuses one browser process across
+  // a file, and on a 985 MB runner with no swap the SwiftShader render targets
+  // from finished tests are not reclaimed fast enough: the renderer is killed
+  // mid-suite ("Target crashed") and a test fails for memory the *previous*
+  // test allocated. Navigating away then frees the page heap.
+  await bounded(page.evaluate(() => {
     const c = document.querySelector('canvas') as HTMLCanvasElement | null;
-    const gl = c?.getContext('webgl2') as WebGL2RenderingContext | null;
+    const gl = (c?.getContext('webgl2') ?? c?.getContext('webgl')) as WebGLRenderingContext | null;
     gl?.getExtension('WEBGL_lose_context')?.loseContext();
-  }).catch(() => undefined);
-  // Navigating away tears down the page's heap before the next test boots.
-  await page.goto('about:blank').catch(() => undefined);
+  }), 5_000);
+  await bounded(page.goto('about:blank'), 10_000);
 });
 
 async function bootToTitle(page: Page, opts: { silentAudio?: boolean } = {}) {
@@ -380,6 +394,8 @@ test('audio: opening act contains genuine near-silence (gate 1)', async ({ page 
   const d = await page.evaluate(() => window.__static.audioDirector());
   const a = await page.evaluate(() => window.__static.audio());
   console.log(`opening: tension=${d.tension.toFixed(3)} silence=${d.silence.toFixed(2)} silentFor=${d.silenceSeconds.toFixed(1)}s lufs=${a.master.lufs.toFixed(1)}`);
+  console.log(`opening buses: ${Object.entries(a.buses).map(([k, m]) => `${k} rms=${m.rms.toFixed(4)} lufs=${m.lufs.toFixed(1)}`).join(' | ')}`);
+  console.log(`opening levels: ${JSON.stringify(a.ambience.levels)}`);
   // With a dormant entity and no detection, the opening must be quiet: tension
   // near the floor and no dread layers engaged.
   expect(d.tension, 'opening act is not quiet').toBeLessThan(0.3);
