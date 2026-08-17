@@ -876,7 +876,10 @@ class StaticGame {
 
     // ---- moon follows player (stabilized shadow window w/ texel snapping) ----
     const dim = this.sky.moonDimAt(time);
-    this.moon.intensity = 0.55 * dim * (1 - this.weather.wetness * 0.45); // cloud cover
+    // Slightly stronger key so trunks/ground get a readable cool rim instead of
+    // collapsing to silhouette; cloud-cover dimming and the exposure clamp above
+    // keep the overall frame dark. Paired with the composite toe-lift.
+    this.moon.intensity = 0.72 * dim * (1 - this.weather.wetness * 0.45); // cloud cover
     const texel = (60 * 2) / this.moon.shadow.mapSize.x;
     const sx = Math.round(this.player.pos.x / texel) * texel;
     const sz = Math.round(this.player.pos.z / texel) * texel;
@@ -953,6 +956,7 @@ class StaticGame {
     // and returns an empty list when the setting is off, so no branch is needed.
     this.menu.setAudioCues(this.audio.cues.map(c => c.text));
     this.menu.setViewfinder(inp.vfHeld, 4);
+    this.menu.setHudChrome(this.runTime, this.flashlight.battery);
     if (this.perfVisible) {
       const st = this.loop.stats();
       const g = this.pipeline.gpuStats;

@@ -288,6 +288,14 @@ export class Menu {
     this.el('hud').classList.toggle('hidden', !on);
   }
 
+  /** Persistent in-game camcorder chrome: elapsed time + battery percentage. */
+  setHudChrome(timeSec: number, battery01: number): void {
+    const hh = Math.floor(timeSec / 3600), mm = Math.floor((timeSec % 3600) / 60), ss = Math.floor(timeSec % 60);
+    this.el('hud-clock').textContent =
+      `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+    this.el('hud-batt').textContent = `${Math.round(battery01 * 100)}%`;
+  }
+
   showTouchUI(on: boolean): void {
     this.el('touch-ui').classList.toggle('hidden', !on);
   }

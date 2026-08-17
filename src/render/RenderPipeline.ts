@@ -797,9 +797,12 @@ export class RenderPipeline {
           }
         }
         float avg = exp(sum / max(n, 1e-4));
-        // deliberately narrow: STATIC must stay dark. This is eye adaptation,
-        // not an exposure meter trying to make the forest legible.
-        float autoE = clamp(0.055 / max(avg, 1e-4), 0.6, 1.55);
+        // STATIC must stay dark, but not *illegible*. The old clamp (0.055, cap
+        // 1.55) crushed the shadow floor to ~8/255 — the forest read as flat
+        // black silhouettes. Opening the ceiling and nudging the key up lets the
+        // eye adapt enough to separate bark, ground and depth, while the slow
+        // dilate / fast close below keeps it feeling like a camcorder at night.
+        float autoE = clamp(0.078 / max(avg, 1e-4), 0.6, 2.15);
         float target = uComp * pow(autoE, 0.65);
         float prev = texture(tPrev, vec2(0.5)).r;
         if (uValid < 0.5) prev = target;
@@ -953,6 +956,14 @@ export class RenderPipeline {
         vec3 shadowTint = col * vec3(0.90, 0.97, 1.14);
         vec3 lightTint  = col * vec3(1.07, 1.00, 0.90);
         col = mix(shadowTint, lightTint, smoothstep(0.22, 0.85, l));
+
+        // ---- toe lift: separate the crushed blacks into readable near-black ----
+        // Only touches the deepest shadows (smooth gate on l), so mids/highlights
+        // and the overall exposure are unchanged — the scene stays dark, but bark,
+        // ground and the entity's silhouette stop collapsing into one flat black.
+        // A faint cool bias keeps the lifted floor from going muddy/warm.
+        float shadowFloor = 1.0 - smoothstep(0.0, 0.085, l);
+        col += vec3(0.016, 0.020, 0.031) * shadowFloor;
 
         // ---- CCD / tape artefacts ----
         float scan = 0.93 + 0.07 * sin(uv.y * 1100.0 + uTime * 8.0);

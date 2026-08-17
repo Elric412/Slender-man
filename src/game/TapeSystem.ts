@@ -128,21 +128,31 @@ export class TapeSystem {
 
   private makeTapeMesh(): { mesh: THREE.Group; glowMat: THREE.MeshStandardMaterial } {
     const g = new THREE.Group();
-    const body = new THREE.Mesh(
-      new THREE.BoxGeometry(0.14, 0.022, 0.09),
-      new THREE.MeshStandardMaterial({ color: 0x18181c, roughness: 0.4, metalness: 0.2 }));
-    const reel = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.02, 0.02, 0.026, 10),
-      new THREE.MeshStandardMaterial({ color: 0x8a8578, roughness: 0.5 }));
-    reel.rotation.x = Math.PI / 2; reel.position.set(-0.03, 0.002, 0);
-    const reel2 = reel.clone(); reel2.position.x = 0.03;
-    // warm label sticker — per-tape emissive pulse marks it as an interactable
+    // A compact cassette that reads at night: a dark shell, a lighter clear
+    // window showing the two reels, and a warm upright spine label whose
+    // emissive pulse is the "I'm an interactable" beacon. Slightly larger and
+    // propped up on edge so its silhouette separates from the leaf litter.
+    const shell = new THREE.MeshStandardMaterial({ color: 0x1b1b20, roughness: 0.42, metalness: 0.25 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.03, 0.105), shell);
+    // clear window strip across the face — catches moon/beam specular
+    const window_ = new THREE.Mesh(
+      new THREE.BoxGeometry(0.10, 0.032, 0.052),
+      new THREE.MeshStandardMaterial({ color: 0x2a2c33, roughness: 0.12, metalness: 0.65 }));
+    window_.position.y = 0.004;
+    const reelMat = new THREE.MeshStandardMaterial({ color: 0x9a9588, roughness: 0.4, metalness: 0.1 });
+    const reel = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.036, 12), reelMat);
+    reel.position.set(-0.032, 0.005, 0);
+    const reel2 = reel.clone(); reel2.position.x = 0.032;
+    // warm spine label — emissive pulse marks it as an interactable. Stands the
+    // cassette on its long edge so the label faces up and is seen from height.
     const glowMat = new THREE.MeshStandardMaterial({
-      color: 0x3a3423, roughness: 0.6, emissive: 0xc8b98a, emissiveIntensity: 0.4,
+      color: 0x4a4028, roughness: 0.55, emissive: 0xe0cf9a, emissiveIntensity: 0.9,
     });
-    const label = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.024, 0.05), glowMat);
-    label.position.y = 0.002;
-    g.add(body, reel, reel2, label);
+    const label = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.034, 0.03), glowMat);
+    label.position.set(0, 0.006, 0.045);
+    g.add(body, window_, reel, reel2, label);
+    // stand the whole cassette on edge, label side up-ish, leaning back a touch
+    g.rotation.x = -0.32;
     return { mesh: g, glowMat };
   }
 
@@ -163,8 +173,9 @@ export class TapeSystem {
       // idle bob/spin so tapes read as interactables
       t.mesh.rotation.y = time * 1.2;
       t.mesh.position.y = t.spawn.y + Math.sin(time * 2 + t.spawn.x) * 0.03;
-      // per-tape emissive pulse — visible beacon in the dark, no light cost
-      t.glowMat.emissiveIntensity = 0.32 + 0.22 * Math.sin(time * 2.6 + t.spawn.x * 1.7);
+      // per-tape emissive pulse — visible beacon in the dark, no light cost.
+      // Modulates around the new 0.9 base (brighter label) without clipping.
+      t.glowMat.emissiveIntensity = 0.7 + 0.45 * (0.5 + 0.5 * Math.sin(time * 2.6 + t.spawn.x * 1.7));
       const d = Math.hypot(t.spawn.x - px, t.spawn.z - pz);
       const dy = Math.abs(t.spawn.y - py);
       if (d < best && dy < 2.2) { best = d; this.nearest = t; }

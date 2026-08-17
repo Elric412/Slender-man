@@ -132,6 +132,17 @@ body.cb .settings-section { color: var(--accent-cb); }
 /* ---------- HUD ---------- */
 #hud { position: absolute; inset: 0; z-index: 20; pointer-events: none; }
 
+/* persistent camcorder chrome during play — mirrors the title-screen REC/BATT
+   so the found-footage identity never drops out in-game. Kept dim and small so
+   it reads as camera metadata, not a dashboard. */
+.hud-chrome {
+  position: absolute; top: calc(20px + env(safe-area-inset-top)); left: calc(28px + env(safe-area-inset-left));
+  font-size: 13px; letter-spacing: 0.3em; color: var(--danger);
+  text-shadow: 0 0 6px rgba(0,0,0,0.9); opacity: 0.85;
+}
+.hud-chrome .rec-dot { animation: recblink 1.6s steps(2) infinite; }
+.hud-chrome #hud-clock, .hud-chrome #hud-batt { color: var(--ink); }
+
 .tape-counter {
   position: absolute; top: calc(26px + env(safe-area-inset-top)); right: calc(30px + env(safe-area-inset-right));
   font-size: 15px; letter-spacing: 0.3em;
