@@ -39,6 +39,7 @@ export class Menu {
       'subtitle', 'viewfinder-overlay', 'vf-time', 'rotate-prompt', 'perf-overlay', 'touch-ui',
       'capture-overlay', 'end-title', 'end-detail', 'end-stats',
       'advisory-screen', 'audio-cue',
+      'hud-chrome', 'hud-clock', 'hud-batt', 'pickup-flash',
       'proximity-tell', 'pt-needle', 'pt-label'];
     for (const id of ids) {
       const el = document.getElementById(id);
@@ -306,6 +307,21 @@ export class Menu {
     tc.classList.remove('hidden');
     tc.classList.add('show');
     this.tapeTimer = 3.5;
+    // count 0 is the run-start counter init, not a pickup — no blink for that.
+    if (count > 0) this.pickupBlink();
+  }
+
+  /**
+   * Camcorder exposure blink on tape pickup — one short class-toggled CSS
+   * animation, so it costs nothing per frame and re-triggers correctly when
+   * pickups happen close together (remove -> reflow -> add restarts it).
+   */
+  private pickupBlink(): void {
+    const el = this.el('pickup-flash');
+    if (!el) return;
+    el.classList.remove('blink');
+    void el.offsetWidth; // force reflow so the animation restarts
+    el.classList.add('blink');
   }
 
   setInteractPrompt(visible: boolean, label = 'E — RECOVER TAPE'): void {

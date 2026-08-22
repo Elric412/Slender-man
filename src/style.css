@@ -150,6 +150,15 @@ body.cb .settings-section { color: var(--accent-cb); }
 }
 .tape-counter.show { opacity: 1; }
 
+/* Pickup exposure blink. Kept deliberately weak (peak ~0.22, sub-400ms) per
+   the readability rule: a tape recovery is the *weakest* class of event, so
+   its feedback must register without hiding the world the player is still
+   scanning. Pure CSS keyframes on a class toggle — zero per-frame JS cost,
+   and re-triggering mid-run just restarts the animation. */
+.pickup-flash { position: absolute; inset: 0; background: #fff8ea; opacity: 0; pointer-events: none; }
+.pickup-flash.blink { animation: pickupblink 0.38s ease-out; }
+@keyframes pickupblink { 0% { opacity: 0; } 12% { opacity: 0.22; } 100% { opacity: 0; } }
+
 .interact-prompt {
   position: absolute; left: 50%; bottom: 22%; transform: translateX(-50%);
   font-size: 13px; letter-spacing: 0.28em; color: var(--ink);

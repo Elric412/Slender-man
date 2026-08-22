@@ -222,6 +222,9 @@
       <span class="rec-dot"></span>REC&nbsp;&nbsp;<span id="hud-clock">00:00:00</span>&nbsp;&nbsp;BATT&nbsp;<span id="hud-batt">100%</span>
     </div>
     <div id="tape-counter" class="tape-counter hidden"><span id="tape-count">0</span> / 8 TAPES</div>
+    <!-- pickup exposure blink: one-frame "the camera noticed" stutter, so a
+         tape recovery reads physically without opening the HUD floodgates -->
+    <div id="pickup-flash" class="pickup-flash" aria-hidden="true"></div>
     <div id="interact-prompt" class="interact-prompt hidden">E &mdash; RECOVER TAPE</div>
     <div id="subtitle" class="subtitle hidden"></div>
     <!--

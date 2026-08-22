@@ -255,12 +255,15 @@ export class DreadToolkit {
     }
 
     let level = 0, alive = true;
+    let lastCmd = -1;
     return {
       get level() { return level; },
       get alive() { return alive; },
       set: (v, tc = 2.2) => {
         if (!alive || !this.ctx) return;
         level = Math.max(0, Math.min(1, v));
+        if (Math.abs(level - lastCmd) < 1e-4) return;
+        lastCmd = level;
         out.gain.setTargetAtTime(level * 0.13, this.ctx.currentTime, tc);
       },
       stop: (fade = 3) => {
@@ -429,24 +432,40 @@ export class DreadToolkit {
         node.connect(out);
         let level = 0, alive = true;
         const nodeRef = node;
+        // Change-gating: setTargetAtTime events are open-ended (they never
+        // complete), so Chrome keeps every one in the AudioParam timeline.
+        // Beds call set()/shape() every frame — unchanged values would grow
+        // that list without bound and show up as a per-frame cost climb over a
+        // long run. Only schedule when the commanded value actually moved.
+        let lastCmd = -1;
+        const shapeCache: Partial<Record<keyof GranularShape, number>> = {};
         return {
           get level() { return level; },
           get alive() { return alive; },
           set: (v, tc = 1.2) => {
             if (!alive || !this.ctx) return;
             level = Math.max(0, Math.min(1, v));
+            if (Math.abs(level - lastCmd) < 1e-4) return;
+            lastCmd = level;
             gp.setTargetAtTime(level, this.ctx.currentTime, tc);
           },
           connectTo,
           shape: (s) => {
             if (!alive || !this.ctx) return;
             const t = this.ctx.currentTime;
-            if (s.density !== undefined) p.get('density')!.setTargetAtTime(s.density, t, 0.5);
-            if (s.grainSize !== undefined) p.get('grainSize')!.setTargetAtTime(s.grainSize, t, 0.5);
-            if (s.centre !== undefined) p.get('centre')!.setTargetAtTime(s.centre, t, 0.6);
-            if (s.scatter !== undefined) p.get('scatter')!.setTargetAtTime(s.scatter, t, 0.6);
-            if (s.resonance !== undefined) p.get('resonance')!.setTargetAtTime(s.resonance, t, 0.6);
-            if (s.spread !== undefined) p.get('spread')!.setTargetAtTime(s.spread, t, 0.6);
+            const chg = (k: keyof GranularShape, v: number | undefined, tc: number, fn: (x: number) => void): void => {
+              if (v === undefined) return;
+              const prev = shapeCache[k];
+              if (prev !== undefined && Math.abs(prev - v) < 1e-3) return;
+              shapeCache[k] = v;
+              fn(v);
+            };
+            chg('density', s.density, 0.5, v => p.get('density')!.setTargetAtTime(v, t, 0.5));
+            chg('grainSize', s.grainSize, 0.5, v => p.get('grainSize')!.setTargetAtTime(v, t, 0.5));
+            chg('centre', s.centre, 0.6, v => p.get('centre')!.setTargetAtTime(v, t, 0.6));
+            chg('scatter', s.scatter, 0.6, v => p.get('scatter')!.setTargetAtTime(v, t, 0.6));
+            chg('resonance', s.resonance, 0.6, v => p.get('resonance')!.setTargetAtTime(v, t, 0.6));
+            chg('spread', s.spread, 0.6, v => p.get('spread')!.setTargetAtTime(v, t, 0.6));
           },
           stop: (fade = 1.5) => {
             if (!alive || !this.ctx) return;
@@ -488,21 +507,32 @@ export class DreadToolkit {
     src.connect(bp).connect(g).connect(out);
     trem.start(); wander.start();
     let level = 0, alive = true;
+    let lastCmd = -1;
+    const shapeCache: Partial<Record<keyof GranularShape, number>> = {};
     return {
       get level() { return level; },
       get alive() { return alive; },
       set: (v, tc = 1.2) => {
         if (!alive || !this.ctx) return;
         level = Math.max(0, Math.min(1, v));
+        if (Math.abs(level - lastCmd) < 1e-4) return;
+        lastCmd = level;
         g.gain.setTargetAtTime(level * 0.5, this.ctx.currentTime, tc);
       },
       connectTo,
       shape: (s) => {
         if (!alive || !this.ctx) return;
         const t = this.ctx.currentTime;
-        if (s.centre !== undefined) bp.frequency.setTargetAtTime(s.centre, t, 0.6);
-        if (s.resonance !== undefined) bp.Q.setTargetAtTime(s.resonance, t, 0.6);
-        if (s.density !== undefined) trem.frequency.setTargetAtTime(Math.max(0.5, s.density / 6), t, 0.6);
+        const chg = (k: keyof GranularShape, v: number | undefined, fn: (x: number) => void): void => {
+          if (v === undefined) return;
+          const prev = shapeCache[k];
+          if (prev !== undefined && Math.abs(prev - v) < 1e-3) return;
+          shapeCache[k] = v;
+          fn(v);
+        };
+        chg('centre', s.centre, v => bp.frequency.setTargetAtTime(v, t, 0.6));
+        chg('resonance', s.resonance, v => bp.Q.setTargetAtTime(v, t, 0.6));
+        chg('density', s.density, v => trem.frequency.setTargetAtTime(Math.max(0.5, v / 6), t, 0.6));
       },
       stop: (fade = 1.5) => {
         if (!alive || !this.ctx) return;

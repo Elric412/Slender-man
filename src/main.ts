@@ -107,6 +107,9 @@ class StaticGame {
   private lastWind = 0.32;
   private entityGaze = new THREE.Vector3();
   private entityWind = new THREE.Vector3();
+  /** reused per-frame so the HUD audio-cue push allocates nothing (GC spikes
+   *  show up as frame hitches; the caption list is at most 3 long) */
+  private cueTexts: string[] = [];
   /**
    * Terrain sampler handed to the foot IK. Bound once as an arrow property so
    * the animator can call it every frame without allocating a closure, and so
@@ -954,7 +957,10 @@ class StaticGame {
     this.updateSubtitles(dt);
     // Audio-cue captions are pushed every frame; the engine owns their lifetime
     // and returns an empty list when the setting is off, so no branch is needed.
-    this.menu.setAudioCues(this.audio.cues.map(c => c.text));
+    const cues = this.audio.cues;
+    this.cueTexts.length = cues.length;
+    for (let i = 0; i < cues.length; i++) this.cueTexts[i] = cues[i].text;
+    this.menu.setAudioCues(this.cueTexts);
     this.menu.setViewfinder(inp.vfHeld, 4);
     this.menu.setHudChrome(this.runTime, this.flashlight.battery);
     if (this.perfVisible) {

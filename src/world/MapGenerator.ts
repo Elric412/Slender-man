@@ -661,33 +661,63 @@ export class MapGenerator {
   }
 
   // ---------- boundary: dense dark treeline ring ----------
+  // Two silhouette layers read as a real forest wall instead of one repeated
+  // cone: a tight near hedge (irregular, varied width/height) and a taller,
+  // sparser emergent layer behind it. Two InstancedMeshes = two draw calls,
+  // same cost class as the single 220-cone ring it replaces.
   private buildBoundary(): void {
     const half = this.hf.layout.size / 2;
     const ring = this.rng.fork(8888);
-    const geo = new THREE.ConeGeometry(2.6, 12, 6);
-    geo.translate(0, 5.5, 0);
     const mat = this.mats.foliage.clone();
     mat.color = new THREE.Color(0x202a20);
-    const count = 220;
-    const mesh = new THREE.InstancedMesh(geo, mat, count);
-    const dummy = new THREE.Object3D();
-    for (let i = 0; i < count; i++) {
+
+    const ringPoint = (i: number, count: number, offJitter: number) => {
       const side = i % 4;
-      const t = (i / count) * 4 % 1;
+      const t = ((i / count) * 4) % 1;
+      const off = half - 4 - ring.range(0, offJitter);
       let x = 0, z = 0;
-      const off = half - 4 - ring.range(0, 10);
       if (side === 0) { x = -half + t * half * 2; z = -off; }
       else if (side === 1) { x = -half + t * half * 2; z = off; }
       else if (side === 2) { x = -off; z = -half + t * half * 2; }
       else { x = off; z = -half + t * half * 2; }
+      return { x, z };
+    };
+
+    const dummy = new THREE.Object3D();
+
+    // near hedge — narrow spruce/conifer profile, dense, ragged heights
+    const hedgeGeo = new THREE.ConeGeometry(2.4, 13, 6);
+    hedgeGeo.translate(0, 6.0, 0);
+    const hedge = new THREE.InstancedMesh(hedgeGeo, mat, 240);
+    for (let i = 0; i < 240; i++) {
+      const { x, z } = ringPoint(i, 240, 9);
       dummy.position.set(x, this.g(x, z) - 0.3, z);
       dummy.rotation.y = ring.range(0, 6.28);
-      dummy.scale.setScalar(ring.range(1.2, 2.2));
+      dummy.scale.set(ring.range(0.9, 1.6), ring.range(0.85, 1.9), ring.range(0.9, 1.6));
       dummy.updateMatrix();
-      mesh.setMatrixAt(i, dummy.matrix);
+      hedge.setMatrixAt(i, dummy.matrix);
     }
-    mesh.instanceMatrix.needsUpdate = true;
-    this.group.add(mesh);
+    hedge.instanceMatrix.needsUpdate = true;
+
+    // emergent back layer — broader bare-crown trunks poking above the hedge,
+    // offset outward and seeded between hedge trees so the skyline isn't a
+    // single flat sawtooth. Wider radius + taller + fewer reads as background.
+    const emGeo = new THREE.ConeGeometry(3.4, 17, 5);
+    emGeo.translate(0, 8.0, 0);
+    const emMat = mat.clone();
+    emMat.color = new THREE.Color(0x1a231c); // slightly darker: sits behind, reads farther
+    const emergent = new THREE.InstancedMesh(emGeo, emMat, 120);
+    for (let i = 0; i < 120; i++) {
+      const { x, z } = ringPoint(i + 60, 120, 22); // half-step offset, wider jitter
+      dummy.position.set(x, this.g(x, z) - 0.3, z);
+      dummy.rotation.y = ring.range(0, 6.28);
+      dummy.scale.set(ring.range(1.1, 1.9), ring.range(1.0, 2.3), ring.range(1.1, 1.9));
+      dummy.updateMatrix();
+      emergent.setMatrixAt(i, dummy.matrix);
+    }
+    emergent.instanceMatrix.needsUpdate = true;
+
+    this.group.add(hedge, emergent);
   }
 
   /** ambient animation — tarps, tents, cables, water, beacons */

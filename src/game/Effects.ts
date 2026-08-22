@@ -17,8 +17,10 @@ import { SoftPoints, RainStreaks } from '../render/Particles';
  */
 export class Effects {
   private fogMat!: THREE.ShaderMaterial;
-  private fogChunks: THREE.Mesh[] = [];
+  /** All wisps in ONE instanced draw: N meshes -> 1 InstancedMesh. */
+  private fogMesh!: THREE.InstancedMesh;
   private fogGeo!: THREE.PlaneGeometry;
+  private fogCam = new THREE.Vector3();
   private fireflies!: SoftPoints;
   private ffPos!: Float32Array;
   private ffBase!: Float32Array;
@@ -43,15 +45,44 @@ export class Effects {
     this.fireflies?.setProjection(renderHeightPx, fovYRadians);
   }
 
+  /**
+   * Fog wisps as ONE instanced draw. The old version made a Mesh per wisp
+   * (6–30 draw calls by quality tier) plus a per-frame CPU loop that moved
+   * them and toggled `visible` at a hard 130 m ring — visible as wisps
+   * popping in/out. Drift now lives in the vertex shader (zero CPU per
+   * frame) and the per-wisp distance fade is computed in the fragment
+   * shader, so far wisps dissolve instead of snapping. Same look, ~29 fewer
+   * draw calls at ultra, and no per-frame JS.
+   */
   private buildFog(count: number): void {
     this.fogMat = new THREE.ShaderMaterial({
       transparent: true, depthWrite: false, side: THREE.DoubleSide,
-      uniforms: { uTime: { value: 0 } },
+      uniforms: {
+        uTime: { value: 0 },
+        uCamPos: { value: this.fogCam },
+      },
       vertexShader: `
         varying vec2 vUv;
-        void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+        varying float vDist;
+        attribute float aDrift;
+        attribute float aPhase;
+        uniform float uTime;
+        uniform vec3 uCamPos;
+        void main(){
+          vUv = uv;
+          // drift the instance offset in world space (same sin/cos churn the
+          // CPU loop used to apply), then let the instance matrix place it.
+          vec4 wp = instanceMatrix * vec4(position, 1.0);
+          wp.x += sin(uTime * 0.05 * aDrift + aPhase) * 0.5;
+          wp.z += cos(uTime * 0.04 * aDrift + aPhase * 2.0) * 0.4;
+          vec4 world = modelMatrix * wp;
+          vDist = distance(world.xyz, uCamPos);
+          gl_Position = projectionMatrix * viewMatrix * world;
+        }`,
       fragmentShader: `
-        varying vec2 vUv; uniform float uTime;
+        varying vec2 vUv;
+        varying float vDist;
+        uniform float uTime;
         float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
         float noise(vec2 p){
           vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
@@ -63,23 +94,37 @@ export class Effects {
           // two octaves drifting against each other so the sheet churns
           float n = noise(vUv * 5.0 + uTime * 0.05) * 0.6 + noise(vUv * 11.0 - uTime * 0.03) * 0.4;
           float a = smoothstep(1.0, 0.15, r) * n * 0.14;
+          // soft distance dissolve instead of the old 130 m visibility pop
+          a *= smoothstep(190.0, 95.0, vDist);
           if (a < 0.002) discard;
           gl_FragColor = vec4(vec3(0.55, 0.62, 0.72) * a, a);   // premultiplied
         }`,
     });
     this.fogGeo = new THREE.PlaneGeometry(26, 26);
     this.fogGeo.rotateX(-Math.PI / 2);
+
+    this.fogMesh = new THREE.InstancedMesh(this.fogGeo, this.fogMat, count);
+    this.fogMesh.frustumCulled = false; // wisps span the map; skip per-frame re-cull
+    this.fogMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+
+    const drift = new Float32Array(count);
+    const phase = new Float32Array(count);
+    const dummy = new THREE.Object3D();
     const size = this.hf.layout.size;
     for (let i = 0; i < count; i++) {
-      const m = new THREE.Mesh(this.fogGeo, this.fogMat);
       const x = this.rng.range(-size / 2 + 30, size / 2 - 30);
       const z = this.rng.range(-size / 2 + 30, size / 2 - 30);
-      m.position.set(x, this.hf.heightAt(x, z) + this.rng.range(0.4, 1.4), z);
-      m.rotation.y = this.rng.range(0, Math.PI);
-      (m as unknown as { drift: number }).drift = this.rng.range(0.2, 0.7);
-      this.fogChunks.push(m);
-      this.scene.add(m);
+      dummy.position.set(x, this.hf.heightAt(x, z) + this.rng.range(0.4, 1.4), z);
+      dummy.rotation.y = this.rng.range(0, Math.PI);
+      dummy.updateMatrix();
+      this.fogMesh.setMatrixAt(i, dummy.matrix);
+      drift[i] = this.rng.range(0.2, 0.7);
+      phase[i] = i; // matches the old `+ i` / `+ i*2` phase offsets
     }
+    this.fogMesh.instanceMatrix.needsUpdate = true;
+    this.fogGeo.setAttribute('aDrift', new THREE.InstancedBufferAttribute(drift, 1));
+    this.fogGeo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
+    this.scene.add(this.fogMesh);
   }
 
   private buildFireflies(count: number): void {
@@ -123,16 +168,10 @@ export class Effects {
   }
 
   update(dt: number, time: number, camX: number, camY: number, camZ: number): void {
+    // Fog drift + distance dissolve run entirely on the GPU now; all we do
+    // per frame is push two uniforms.
     this.fogMat.uniforms.uTime.value = time;
-    for (let i = 0; i < this.fogChunks.length; i++) {
-      const m = this.fogChunks[i];
-      const d = (m as unknown as { drift: number }).drift;
-      m.position.x += Math.sin(time * 0.05 * d + i) * dt * 0.5;
-      m.position.z += Math.cos(time * 0.04 * d + i * 2) * dt * 0.4;
-      // fade with distance — cheap per-chunk visibility
-      const dx = m.position.x - camX, dz = m.position.z - camZ;
-      m.visible = (dx * dx + dz * dz) < 130 * 130;
-    }
+    this.fogCam.set(camX, camY, camZ);
 
     // Fireflies wander around fixed base positions, pulsing out of phase.
     if (this.fireflies.points.visible) {
@@ -153,8 +192,8 @@ export class Effects {
   }
 
   dispose(): void {
-    for (const m of this.fogChunks) this.scene.remove(m);
-    this.fogChunks.length = 0;
+    this.scene.remove(this.fogMesh);
+    this.fogMesh.dispose();
     this.fogGeo.dispose();
     this.fogMat.dispose();
     this.scene.remove(this.fireflies.points);
