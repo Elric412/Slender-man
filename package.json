@@ -1,0 +1,27 @@
+{
+  "name": "static",
+  "private": true,
+  "version": "1.0.0",
+  "description": "STATIC — a browser-native first-person stalker-horror game. Three.js + WebGL2, custom render pipeline, fully procedural audio.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173",
+    "test": "npm run build && playwright test",
+    "typecheck": "tsc --noEmit",
+    "palebark:report": "esbuild tools/mesh-report.ts --bundle --platform=node --format=esm --outfile=.tmp/mesh-report.mjs --external:three && node .tmp/mesh-report.mjs",
+    "tell:report": "esbuild tools/tell-report.ts --bundle --platform=node --format=esm --outfile=.tmp/tell-report.mjs --external:three && node .tmp/tell-report.mjs",
+    "verify:world": "esbuild tools/verify-world.ts --bundle --platform=node --format=esm --outfile=.tmp/verify-world.mjs --external:three && node .tmp/verify-world.mjs",
+    "bench:world": "esbuild tools/worldbench.ts --bundle --platform=node --format=esm --outfile=.tmp/worldbench.mjs --external:three && node .tmp/worldbench.mjs"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/three": "^0.170.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}

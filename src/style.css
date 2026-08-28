@@ -1,0 +1,329 @@
+/* STATIC — UI styling. Analog / worn found-footage presentation. */
+@font-face { font-family: 'vcr-fallback'; src: local('Courier New'); }
+
+:root {
+  --ink: #9aa5ad;
+  --ink-dim: #5b656d;
+  --accent: #c8b98a;      /* old-paper amber */
+  --accent-cb: #6fd3e7;   /* colorblind-safe accent */
+  --danger: #b8543f;
+  --bg: #05070a;
+  --panel: rgba(10, 13, 16, 0.92);
+  --mono: 'Courier New', 'vcr-fallback', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); }
+html, body { height: 100dvh; } /* dvh tracks the mobile URL bar; fallback above */
+body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+body { font-family: var(--mono); color: var(--ink); }
+#app { position: fixed; inset: 0; }
+#game-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+.hidden { display: none !important; }
+
+/* ---------- screens ---------- */
+.screen {
+  position: absolute; inset: 0; z-index: 40;
+  display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(ellipse at 50% 40%, #0a0e12 0%, #05070a 70%);
+}
+.screen.translucent { background: rgba(4, 6, 8, 0.72); backdrop-filter: blur(2px); }
+
+/* subtle scanlines over menus */
+.screen::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(255,255,255,0.018) 0 1px, transparent 1px 3px);
+  mix-blend-mode: overlay;
+}
+
+/* ---------- loading ---------- */
+.load-inner { text-align: center; width: min(480px, 86vw); }
+.load-logo { font-size: clamp(28px, 6vw, 52px); letter-spacing: 0.5em; color: var(--ink); text-shadow: 0 0 18px rgba(154,165,173,0.25); margin-bottom: 12px; }
+.load-sub { font-size: 11px; letter-spacing: 0.25em; color: var(--ink-dim); margin-bottom: 34px; }
+.load-bar-wrap { height: 3px; background: #141a1f; border: 1px solid #1d2429; }
+.load-bar { height: 100%; width: 0%; background: var(--accent); transition: width 0.15s linear; box-shadow: 0 0 8px rgba(200,185,138,0.4); }
+.load-status { margin-top: 12px; font-size: 11px; letter-spacing: 0.18em; color: var(--ink-dim); min-height: 14px; }
+
+/* ---------- title ---------- */
+.title-flicker { position: absolute; inset: 0; background: #05070a; opacity: 0; animation: flicker 7s infinite; pointer-events: none; }
+@keyframes flicker { 0%, 96%, 100% { opacity: 0; } 97% { opacity: 0.55; } 98% { opacity: 0; } 99% { opacity: 0.3; } }
+.title-inner { text-align: center; z-index: 1; padding: 0 16px; }
+.title-rec { font-size: 12px; letter-spacing: 0.3em; color: var(--danger); margin-bottom: 28px; animation: recblink 1.6s steps(2) infinite; }
+.rec-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--danger); margin-right: 8px; vertical-align: 1px; }
+@keyframes recblink { 50% { opacity: 0.35; } }
+.title-logo { font-size: clamp(40px, 9vw, 92px); letter-spacing: 0.42em; text-indent: 0.42em; color: var(--ink);
+  text-shadow: 2px 0 rgba(255,70,40,0.25), -2px 0 rgba(60,180,255,0.25), 0 0 26px rgba(154,165,173,0.2); margin-bottom: 10px; }
+.title-tag { font-size: clamp(11px, 2vw, 14px); letter-spacing: 0.22em; color: var(--ink-dim); margin-bottom: 46px; }
+.title-menu { display: flex; flex-direction: column; gap: 14px; align-items: center; }
+.title-foot { margin-top: 52px; font-size: 10px; letter-spacing: 0.2em; color: #39424a; }
+
+.menu-btn {
+  font-family: var(--mono); font-size: 15px; letter-spacing: 0.3em; text-indent: 0.3em;
+  color: var(--ink); background: transparent; border: 1px solid #232b31;
+  padding: 13px 34px; min-width: 300px; cursor: pointer; position: relative;
+  transition: border-color .18s, color .18s, background .18s;
+}
+.menu-btn:hover, .menu-btn:focus-visible { color: var(--accent); border-color: var(--accent); background: rgba(200,185,138,0.05); outline: none; }
+body.cb .menu-btn:hover, body.cb .menu-btn:focus-visible { color: var(--accent-cb); border-color: var(--accent-cb); }
+.back-btn { margin-top: 26px; min-width: 200px; }
+
+/* ---------- panels ---------- */
+.panel { width: min(560px, 92vw); max-height: 88vh; max-height: 88dvh; overflow-y: auto; background: var(--panel);
+  border: 1px solid #1d2429; padding: 30px 34px; box-shadow: 0 0 60px rgba(0,0,0,0.7); }
+.panel-title { font-size: 14px; letter-spacing: 0.3em; color: var(--accent); border-bottom: 1px solid #1d2429; padding-bottom: 14px; margin-bottom: 18px; }
+body.cb .panel-title { color: var(--accent-cb); }
+.panel-body { font-size: 13px; line-height: 1.85; letter-spacing: 0.06em; }
+.panel-body p { margin-bottom: 12px; }
+.panel-body .dim { color: var(--ink-dim); font-size: 11px; }
+.panel-body em { color: var(--ink); }
+
+.settings-grid { display: grid; grid-template-columns: 1fr auto; gap: 16px 22px; align-items: center; }
+.settings-grid label { font-size: 12px; letter-spacing: 0.12em; color: var(--ink); }
+.settings-grid input[type=range] { width: 180px; accent-color: var(--accent); }
+.settings-grid input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); justify-self: start; }
+.settings-grid select { font-family: var(--mono); background: #0d1114; color: var(--ink); border: 1px solid #232b31; padding: 6px 10px; font-size: 12px; }
+
+/* Section rules inside the settings grid. The audio block is long enough that
+   without headers it reads as one undifferentiated wall of sliders. */
+.settings-section {
+  grid-column: 1 / -1; font-size: 10px; letter-spacing: 0.26em;
+  color: var(--accent); border-bottom: 1px solid #1d2429;
+  padding-bottom: 6px; margin-top: 10px;
+}
+body.cb .settings-section { color: var(--accent-cb); }
+
+/* Explanatory sub-text under an accessibility control. These settings are only
+   useful if the player understands what they do, so the copy is part of the
+   feature rather than decoration. */
+.settings-grid label .hint,
+.advisory-grid label .hint {
+  display: block; margin-top: 4px; font-size: 10px; line-height: 1.6;
+  letter-spacing: 0.04em; color: var(--ink-dim); text-transform: none;
+}
+
+/* ---------- content advisory ---------- */
+.advisory-list { margin: 0 0 14px 18px; padding: 0; }
+.advisory-list li { margin-bottom: 8px; font-size: 12px; line-height: 1.7; }
+.advisory-list strong { color: var(--ink); }
+.advisory-grid {
+  display: grid; grid-template-columns: 1fr auto; gap: 14px 20px;
+  align-items: center; margin: 14px 0 16px;
+  padding: 14px 16px; border: 1px solid #1d2429; background: rgba(8,11,14,0.6);
+}
+.advisory-grid label { font-size: 12px; letter-spacing: 0.12em; color: var(--ink); }
+.advisory-grid input[type=range] { width: 150px; accent-color: var(--accent); }
+.advisory-grid input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); justify-self: start; }
+
+/* ---------- end ---------- */
+.end-inner { text-align: center; z-index: 1; padding: 0 16px; }
+.end-title { font-size: clamp(30px, 7vw, 68px); letter-spacing: 0.4em; text-indent: 0.4em; color: var(--ink); margin-bottom: 18px; }
+.end-title.taken { color: var(--danger); }
+.end-title.escaped { color: var(--accent); }
+.end-detail { font-size: 13px; letter-spacing: 0.15em; line-height: 1.9; color: var(--ink-dim); max-width: 520px; margin: 0 auto 26px; }
+.end-stats { font-size: 12px; letter-spacing: 0.25em; color: var(--ink); margin-bottom: 40px; }
+#end-screen .menu-btn { margin: 6px; }
+
+/* ---------- capture ---------- */
+#capture-overlay {
+  position: absolute; inset: 0; z-index: 60; background: #000; opacity: 0; pointer-events: none;
+}
+
+/* ---------- HUD ---------- */
+#hud { position: absolute; inset: 0; z-index: 20; pointer-events: none; }
+
+/* persistent camcorder chrome during play — mirrors the title-screen REC/BATT
+   so the found-footage identity never drops out in-game. Kept dim and small so
+   it reads as camera metadata, not a dashboard. */
+.hud-chrome {
+  position: absolute; top: calc(20px + env(safe-area-inset-top)); left: calc(28px + env(safe-area-inset-left));
+  font-size: 13px; letter-spacing: 0.3em; color: var(--danger);
+  text-shadow: 0 0 6px rgba(0,0,0,0.9); opacity: 0.85;
+}
+.hud-chrome .rec-dot { animation: recblink 1.6s steps(2) infinite; }
+.hud-chrome #hud-clock, .hud-chrome #hud-batt { color: var(--ink); }
+
+.tape-counter {
+  position: absolute; top: calc(26px + env(safe-area-inset-top)); right: calc(30px + env(safe-area-inset-right));
+  font-size: 15px; letter-spacing: 0.3em;
+  color: var(--accent); text-shadow: 0 0 8px rgba(0,0,0,0.9); opacity: 0; transition: opacity .4s;
+}
+.tape-counter.show { opacity: 1; }
+
+/* Pickup exposure blink. Kept deliberately weak (peak ~0.22, sub-400ms) per
+   the readability rule: a tape recovery is the *weakest* class of event, so
+   its feedback must register without hiding the world the player is still
+   scanning. Pure CSS keyframes on a class toggle — zero per-frame JS cost,
+   and re-triggering mid-run just restarts the animation. */
+.pickup-flash { position: absolute; inset: 0; background: #fff8ea; opacity: 0; pointer-events: none; }
+.pickup-flash.blink { animation: pickupblink 0.38s ease-out; }
+@keyframes pickupblink { 0% { opacity: 0; } 12% { opacity: 0.22; } 100% { opacity: 0; } }
+
+.interact-prompt {
+  position: absolute; left: 50%; bottom: 22%; transform: translateX(-50%);
+  font-size: 13px; letter-spacing: 0.28em; color: var(--ink);
+  background: rgba(5,7,10,0.55); border: 1px solid #232b31; padding: 10px 22px;
+  text-shadow: 0 0 6px #000; animation: promptpulse 2.2s ease-in-out infinite;
+}
+@keyframes promptpulse { 50% { border-color: var(--accent); } }
+
+.subtitle {
+  position: absolute; left: 50%; bottom: 12%; transform: translateX(-50%);
+  max-width: min(680px, 88vw); text-align: center;
+  font-size: 14px; line-height: 1.7; letter-spacing: 0.08em; color: #e8e4d8;
+  background: rgba(3,4,6,0.72); padding: 10px 20px; text-shadow: 0 1px 2px #000;
+}
+
+/*
+  Audio-cue caption (§11). Positioned above the subtitle line and styled as a
+  bracketed system readout rather than speech, because it is describing the world
+  to a player who cannot hear it — conflating it with dialogue would be worse
+  than showing nothing.
+*/
+.audio-cue {
+  position: absolute; left: 50%; bottom: 21%; transform: translateX(-50%);
+  max-width: min(560px, 86vw); text-align: center;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--accent); background: rgba(3,4,6,0.66);
+  border-left: 2px solid var(--accent); border-right: 2px solid var(--accent);
+  padding: 7px 18px; text-shadow: 0 1px 2px #000;
+  animation: cuefade 0.22s ease-out;
+}
+body.cb .audio-cue { color: var(--accent-cb); border-left-color: var(--accent-cb); border-right-color: var(--accent-cb); }
+@keyframes cuefade { from { opacity: 0; transform: translateX(-50%) translateY(4px); } }
+
+/* viewfinder */
+.viewfinder { position: absolute; inset: 0; pointer-events: none; }
+.viewfinder::before { content: ''; position: absolute; inset: 0; box-shadow: inset 0 0 140px rgba(0,0,0,0.85); }
+.vf-corner { position: absolute; width: 46px; height: 46px; border: 2px solid rgba(220,225,230,0.75); }
+.vf-corner.tl { top: 5%; left: 5%; border-right: none; border-bottom: none; }
+.vf-corner.tr { top: 5%; right: 5%; border-left: none; border-bottom: none; }
+.vf-corner.bl { bottom: 5%; left: 5%; border-right: none; border-top: none; }
+.vf-corner.br { bottom: 5%; right: 5%; border-left: none; border-top: none; }
+.vf-label { position: absolute; top: 5.5%; left: 9%; font-size: 15px; letter-spacing: 0.25em; color: rgba(220,225,230,0.85); text-shadow: 0 0 4px #000; }
+.vf-scan { position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(255,255,255,0.03) 0 2px, transparent 2px 4px); }
+
+/* ---------- proximity tell (optional accessibility affordance) ----------
+   Deliberately styled as worn analog instrumentation rather than a game HUD
+   widget: it is an admitted affordance, but it should not look like it belongs
+   to a different game. Bottom-right, out of the flashlight's read area.
+   The needle is rotated by JS; intensity drives opacity + glow, so a faint
+   contact is legible without shouting. */
+.proximity-tell {
+  position: absolute;
+  right: calc(22px + env(safe-area-inset-right));
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  z-index: 28; pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  /* set by JS: 0..1 */
+  --pt: 0;
+  opacity: calc(0.22 + 0.78 * var(--pt));
+  transition: opacity 0.18s linear;
+}
+.pt-dial { position: relative; width: 62px; height: 62px; }
+.pt-ring {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 1px solid rgba(154,165,173,0.30);
+  background:
+    radial-gradient(circle at 50% 50%,
+      rgba(200,185,138,calc(0.05 + 0.20 * var(--pt))) 0%,
+      rgba(6,8,11,0.62) 68%);
+  box-shadow: 0 0 calc(2px + 14px * var(--pt)) rgba(200,185,138,calc(0.10 + 0.34 * var(--pt)));
+}
+/* forward tick — tells the player which way is "ahead" so the needle reads */
+.pt-ring::after {
+  content: ''; position: absolute; left: 50%; top: -3px;
+  width: 1px; height: 6px; margin-left: -0.5px;
+  background: rgba(154,165,173,0.5);
+}
+.pt-needle {
+  position: absolute; left: 50%; top: 50%;
+  width: 2px; height: 25px; margin-left: -1px;
+  transform-origin: 50% 100%;
+  /* rotate(0) points up = dead ahead; JS writes --pt-bearing in degrees */
+  transform: translateY(-100%) rotate(var(--pt-bearing, 0deg));
+  background: linear-gradient(to top, rgba(200,185,138,0.15), var(--accent));
+  transition: transform 0.10s linear;
+}
+.pt-label {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.20em;
+  text-transform: uppercase; color: var(--accent);
+  text-shadow: 0 1px 2px #000;
+}
+/* Bands escalate colour as well as glow: colour alone would fail for the very
+   players most likely to have this setting on. */
+.proximity-tell.pt-close .pt-label,
+.proximity-tell.pt-close .pt-needle { color: #d8c68e; }
+.proximity-tell.pt-imminent .pt-label { color: var(--danger); }
+.proximity-tell.pt-imminent .pt-needle { background: linear-gradient(to top, rgba(184,84,63,0.2), var(--danger)); }
+.proximity-tell.pt-imminent .pt-ring { border-color: rgba(184,84,63,0.55); }
+body.cb .pt-label, body.cb .pt-needle { color: var(--accent-cb); }
+body.cb .proximity-tell.pt-imminent .pt-label { color: #ff9d7a; }
+/* Respect reduced-motion: keep the readout, drop the sweep interpolation. */
+@media (prefers-reduced-motion: reduce) {
+  .pt-needle { transition: none; }
+  .proximity-tell { transition: none; }
+}
+
+.rotate-prompt {
+  position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
+  font-size: 11px; letter-spacing: 0.2em; color: var(--ink-dim); background: rgba(5,7,10,0.7);
+  border: 1px solid #1d2429; padding: 8px 16px; z-index: 30;
+}
+
+.perf-overlay {
+  position: absolute; left: calc(12px + env(safe-area-inset-left)); top: calc(12px + env(safe-area-inset-top));
+  font-size: 11px; line-height: 1.6;
+  color: #7fe0a8; background: rgba(3,5,7,0.75); padding: 8px 12px; white-space: pre;
+}
+
+/* ---------- touch ---------- */
+#touch-ui { position: absolute; inset: 0; pointer-events: none; }
+#stick-zone { position: absolute; left: 0; bottom: 0; width: 45%; height: 55%; pointer-events: auto; }
+#stick-base {
+  position: absolute; left: 60px; bottom: 70px; width: 120px; height: 120px; border-radius: 50%;
+  border: 1px solid rgba(154,165,173,0.3); background: rgba(10,13,16,0.3);
+}
+#stick-nub {
+  position: absolute; left: 50%; top: 50%; width: 48px; height: 48px; border-radius: 50%;
+  background: rgba(154,165,173,0.35); transform: translate(-50%,-50%);
+}
+.touch-buttons { position: absolute; right: calc(14px + env(safe-area-inset-right)); bottom: calc(40px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(2, 64px); gap: 12px; pointer-events: auto; }
+.tbtn {
+  width: 64px; height: 64px; border-radius: 50%; border: 1px solid rgba(154,165,173,0.35);
+  background: rgba(10,13,16,0.45); color: var(--ink); font-size: 22px; font-family: var(--mono);
+  pointer-events: auto; user-select: none;
+}
+.tbtn:active { background: rgba(200,185,138,0.25); border-color: var(--accent); }
+.tbtn.small { font-size: 15px; }
+.tbtn.active { border-color: var(--accent); color: var(--accent); }
+
+@media (max-width: 760px) {
+  .menu-btn { min-width: 240px; padding: 12px 20px; font-size: 13px; }
+  .panel { padding: 22px 20px; }
+  #stick-base { left: 30px; bottom: 50px; width: 104px; height: 104px; }
+}
+
+/* landscape phones are short — tighten HUD so prompts don't collide with thumbs */
+@media (max-height: 480px) and (pointer: coarse) {
+  .interact-prompt { bottom: 30%; }
+  .subtitle { bottom: 18%; font-size: 12px; }
+  /* Keep the cue clear of the subtitle line on short landscape screens. */
+  .audio-cue { bottom: 28%; font-size: 10px; letter-spacing: 0.14em; padding: 5px 12px; }
+  /* The touch buttons own the bottom-right corner on phones, so the dial moves
+     to the top-right and shrinks rather than sitting under the player's thumb. */
+  .proximity-tell {
+    right: calc(12px + env(safe-area-inset-right));
+    bottom: auto; top: calc(46px + env(safe-area-inset-top));
+    gap: 3px;
+  }
+  .pt-dial { width: 44px; height: 44px; }
+  .pt-needle { height: 18px; }
+  .pt-label { font-size: 8px; letter-spacing: 0.14em; }
+  .advisory-grid { grid-template-columns: 1fr; gap: 8px; }
+  .advisory-grid input[type=range] { width: 100%; }
+  #stick-base { bottom: 30px; width: 96px; height: 96px; }
+  .touch-buttons { bottom: calc(16px + env(safe-area-inset-bottom)); grid-template-columns: repeat(3, 56px); }
+  .tbtn { width: 56px; height: 56px; font-size: 18px; }
+}
