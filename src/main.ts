@@ -114,6 +114,13 @@ class StaticGame {
   private aiAcc = 0;
   /** Accumulated time owed to the practicals update since its last tick. */
   private practicalAcc = 0;
+  /** Accumulated time owed to the moon shadow map since its last re-render. */
+  private moonShadowAcc = 0;
+  /** Texel-snapped shadow-window centre at the last actual re-render. */
+  private moonShadowAtX = Infinity;
+  private moonShadowAtZ = Infinity;
+  /** Whether the moon shadow map has ever been rendered (first frame must not skip). */
+  private moonShadowPrimed = false;
   /** Reused perceptibility input — this is a per-frame path, so it must not allocate. */
   private perceptIn: PerceptInput = {
     beamOn: false, beamStrength: 0, staticLevel: 0, desat: 0.2, viewfinder: 0,
@@ -217,7 +224,13 @@ class StaticGame {
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.renderer.shadowMap.autoUpdate = true;
+    // Shadow refresh is scheduled per light, not left to three's global auto-update:
+    // the moon re-renders the whole merged forest and only needs to do so when its
+    // texel-snapped window moves or a dynamic caster is near (brief §1.6, §5.7),
+    // whereas the flashlight is camera-rigid and must refresh every frame. Because
+    // `autoUpdate` is a single global flag it cannot express that, so it stays off
+    // and `updateMoonShadowSchedule()` drives `shadow.needsUpdate` on both lights.
+    this.renderer.shadowMap.autoUpdate = false;
     this.renderer.autoClear = true;
     this.handleResize();
     if (import.meta.env.DEV) console.info('[STATIC] GPU:', probeRenderer());
@@ -640,6 +653,10 @@ class StaticGame {
     this.weather.rain = 0;
     this.weather.wetness = 0;
     this.vfWeight = 0;
+    // Re-prime so the atmosphere snaps to the spawn point instead of lerping in
+    // from wherever the previous run ended.
+    this.zoneAtmoPrimed = false;
+    this.updateZoneAtmosphere(0);
     this.applyWeatherLook(0, true);
     this.subtitleQueue.length = 0;
     this.subtitleTimer = 0;
@@ -774,6 +791,98 @@ class StaticGame {
 
   // ================================================================ look director
   /**
+   * Blended atmospheric state at the listener, smoothed over time.
+   *
+   * Single owner, read by both the moon key light and the fog/grade push. Those
+   * two ran at different points in `update()`, so deriving the zone sample in each
+   * would either sample twice or use a stale value in one of them.
+   */
+  private zoneAtmo = {
+    fog: 1, ambient: 1, moon: 1, wet: 0, warmth: 0,
+    tint: new THREE.Color(1, 1, 1),
+  };
+  private tintScratch: [number, number, number] = [0, 0, 0];
+  private tintTarget = new THREE.Color(1, 1, 1);
+  private zoneAtmoPrimed = false;
+
+  /**
+   * Read the ecology field at the listener and turn it into atmosphere.
+   *
+   * `ZoneSystem` has always computed `fogWeight`, `ambient`, `moonlight`, `wetness`
+   * and a per-zone `fogTint`, and until now **none of it reached the renderer** —
+   * the whole 560 m map shared one fog density and one colour, so a marsh lowland
+   * and a dry upland were photometrically identical. That sameness is the single
+   * strongest "procedurally generated" tell in the frame, and no amount of extra
+   * fog or post can hide it, because it *is* the fog.
+   *
+   * The tint is deliberately reduced to **hue only** (normalised to mean 1, then
+   * pulled partway back toward neutral). The profile tuples are dark absolute
+   * values; multiplying in-scatter by 0.05 would simply delete the fog. Magnitude
+   * is already expressed by `fogWeight` driving density, so letting the tuple carry
+   * brightness too would double-count it.
+   *
+   * Warm practicals bias the medium toward their own colour, because that is what
+   * actually happens: fog near a lantern scatters lantern light. This is what makes
+   * a lit clearing read as a warm pocket in a cold forest rather than a lamp
+   * sitting in front of unrelated grey haze.
+   */
+  private updateZoneAtmosphere(dt: number): void {
+    if (!this.zones || !this.player) return;
+    const px = this.player.pos.x, pz = this.player.pos.z;
+
+    const fogW = this.zones.scalarAt(px, pz, 'fogWeight');
+    const amb = this.zones.scalarAt(px, pz, 'ambient');
+    const mn = this.zones.scalarAt(px, pz, 'moonlight');
+    const zwet = this.zones.scalarAt(px, pz, 'wetness');
+
+    // Canopy is read from the actual scattered trees, not the zone's nominal
+    // closure: a clearing inside old growth should let the moon through even
+    // though the zone says the canopy is shut.
+    const cover = this.map ? this.map.scatter.coverAt(px, pz) : 0;
+    const warmth = this.map
+      ? this.map.practicals.warmthAt(px, this.player.eyeY, pz) : 0;
+
+    const t = this.zones.tupleAt(px, pz, 'fogTint', this.tintScratch);
+    const mean = (t[0] + t[1] + t[2]) / 3 || 1;
+    const SAT = ZoneSystem.TINT_SATURATION;
+    let r = 1 + (t[0] / mean - 1) * SAT;
+    let g = 1 + (t[1] / mean - 1) * SAT;
+    let b = 1 + (t[2] / mean - 1) * SAT;
+
+    // Practical spill warms the medium. Capped well below full replacement so a
+    // campfire tints the haze rather than turning the forest orange.
+    const wmix = Math.min(0.55, warmth * 0.7);
+    r += (1.18 - r) * wmix;
+    g += (0.94 - g) * wmix;
+    b += (0.70 - b) * wmix;
+    this.tintTarget.setRGB(r, g, b);
+
+    const a = this.zoneAtmo;
+    // fogWeight spans 0.24..1.7; map it to a multiplier centred near 1 so the
+    // existing hand-tuned base density stays meaningful.
+    const fogTarget = 0.55 + fogW * 0.55;
+    // Moonlight is attenuated by real canopy occlusion, then by the zone's own
+    // nominal transmission.
+    const moonTarget = mn * (1 - cover * 0.62);
+
+    if (!this.zoneAtmoPrimed) {
+      a.fog = fogTarget; a.ambient = amb; a.moon = moonTarget;
+      a.wet = zwet; a.warmth = warmth; a.tint.copy(this.tintTarget);
+      this.zoneAtmoPrimed = true;
+      return;
+    }
+    // The field is already spatially smooth (tens of metres per transition), so
+    // this only exists to absorb teleports and the debug warp.
+    const k = Math.min(1, dt * 2.2);
+    a.fog += (fogTarget - a.fog) * k;
+    a.ambient += (amb - a.ambient) * k;
+    a.moon += (moonTarget - a.moon) * k;
+    a.wet += (zwet - a.wet) * k;
+    a.warmth += (warmth - a.warmth) * k;
+    a.tint.lerp(this.tintTarget, k);
+  }
+
+  /**
    * Push the weather/fear state into every renderer knob at once.
    *
    * Wetness is deliberately *slow*: rain starts instantly but surfaces take
@@ -793,12 +902,20 @@ class StaticGame {
     this.mats?.setWetness(wet);
     this.staticState.wetness = wet;
 
-    // Fog thickens and hugs the ground as the air saturates.
+    // Fog thickens and hugs the ground as the air saturates — and now also
+    // responds to *where the player is standing*. `zoneAtmo.fog` is the ecology
+    // field's fogWeight; `zoneAtmo.wet` is the terrain's own standing moisture,
+    // which is why a marsh is hazy in clear weather and a dry upland stays
+    // comparatively open even in rain.
+    const atmo = this.zoneAtmo;
+    const localWet = Math.min(1, wet + atmo.wet * 0.45);
     this.pipeline?.setFog({
-      density: 0.020 + wet * 0.016 + this.fear.value * 0.004,
-      baseHeight: 1.2 - wet * 0.5,
-      falloff: 9 - wet * 2.5,
+      density: (0.020 + wet * 0.016 + this.fear.value * 0.004) * atmo.fog,
+      // Ground-hugging in wet hollows, lifted on dry ridges.
+      baseHeight: 1.2 - localWet * 0.5,
+      falloff: 9 - localWet * 2.5,
       turbulence: 0.55 + this.fear.value * 0.35,
+      tint: atmo.tint,
     });
 
     // Grade: rain hazes highlights (more bloom, more in-scatter), fear crushes
@@ -815,12 +932,36 @@ class StaticGame {
       dofRange: [2.4, 34 - wet * 8],
     });
 
-    // Scene fog colour warms slightly under rain (sodium spill from the road).
+    // `scene.fog` is the *aerial perspective* term — it decides how far-tier trunks
+    // separate from the sky, i.e. the depth layering the reference frames rely on.
+    // Its colour used to be a constructor constant despite the comment here claiming
+    // it warmed under rain, so distant forest was the same slab of blue-black
+    // everywhere. Now it carries the zone hue and the practical warmth, which is what
+    // makes a far treeline near the campground read differently from the ravine.
     if (this.scene.fog instanceof THREE.FogExp2) {
-      this.scene.fog.density = 0.0155 + wet * 0.004;
+      this.scene.fog.density = (0.0155 + wet * 0.004) * (0.72 + atmo.fog * 0.34);
+      this.scene.fog.color.setRGB(
+        0x07 / 255 * atmo.tint.r,
+        0x0b / 255 * atmo.tint.g,
+        0x12 / 255 * atmo.tint.b,
+      );
+      // Keep the sky clear-colour locked to the fog so the horizon has no seam.
+      if (this.scene.background instanceof THREE.Color) {
+        this.scene.background.copy(this.scene.fog.color).multiplyScalar(0.62);
+      }
     }
+    // Zone ambient scales the IBL: a closed ravine gets less sky contribution than
+    // an open storm-fall, which is the difference between "dark" and "enclosed".
     if (this.scene.environmentIntensity !== undefined) {
-      this.scene.environmentIntensity = 0.55 - wet * 0.18;
+      this.scene.environmentIntensity =
+        (0.55 - wet * 0.18) * (0.72 + atmo.ambient * 0.4);
+    }
+    // Hemisphere fill follows the same curve. Held to a narrow band: this is the
+    // term that flattens everything if it drifts up, and the one the reference
+    // frames have almost none of.
+    if (this.hemi) {
+      const base = this.spec.envProbe ? 0.12 : 0.32;
+      this.hemi.intensity = base * (0.78 + atmo.ambient * 0.34);
     }
   }
 
@@ -850,6 +991,68 @@ class StaticGame {
     const afford = this.knobs ? this.knobs.drawDistance : this.spec.drawDistance;
     const perceive = Math.max(0.62, this.percept.field.vegetation);
     return Math.round(afford * perceive);
+  }
+
+  /**
+   * Decide whether the moon's shadow map needs re-rendering this frame.
+   *
+   * Consumes `QualityKnobs.shadowRefreshHz`, which the governor produced but
+   * nothing read — so the moon cascade re-rendered the entire merged forest every
+   * frame (brief §1.6, §5.7). That is the largest single GPU line item at the top
+   * tiers, and between texel snaps its output is bit-identical to the previous
+   * frame, because the forest is static merged geometry and the shadow camera is
+   * already snapped to a texel grid.
+   *
+   * `renderer.shadowMap.autoUpdate = false` plus an explicit `needsUpdate` is the
+   * only correct way to do this in three: `autoUpdate` is global, so it is toggled
+   * per frame rather than left off, and `needsUpdate` self-clears after the render.
+   *
+   * Three conditions force a refresh regardless of the scheduled rate, and each one
+   * is a visible artefact if omitted:
+   *
+   *  1. **The snap window moved.** A stale map sampled against a shifted window
+   *     projects shadows at the wrong world offset — far worse than a stale map.
+   *  2. **A dynamic caster is close.** The entity is the one thing in this scene
+   *     that moves and casts; freezing its shadow while it walks is a tell that
+   *     reads instantly. Inside `DYNAMIC_R` we always refresh.
+   *  3. **Nothing has been rendered yet.** Otherwise frame one shows an
+   *     uninitialised map.
+   */
+  private updateMoonShadowSchedule(
+    dt: number, sx: number, sz: number, snap: EntitySnapshot,
+  ): void {
+    // Radius inside which the entity's own movement dominates the map's contents.
+    // The shadow window is 120 m across, so this is a generous fraction of it.
+    const DYNAMIC_R = 46;
+
+    const hz = this.knobs ? this.knobs.shadowRefreshHz : 30;
+    // The perceptibility field's shadow appetite scales the *scheduled* rate only;
+    // it can never suppress a forced refresh below.
+    const eff = Math.max(4, hz * Math.max(0.35, this.percept.field.shadow));
+
+    this.moonShadowAcc += dt;
+
+    const moved = Math.abs(sx - this.moonShadowAtX) > 1e-4
+               || Math.abs(sz - this.moonShadowAtZ) > 1e-4;
+    const dynamicNear = snap.distToPlayer < DYNAMIC_R;
+    const due = this.moonShadowAcc >= 1 / eff;
+
+    const refresh = !this.moonShadowPrimed || moved || dynamicNear || due;
+
+    // `shadowMap.autoUpdate` is GLOBAL, not per light — turning it off to schedule
+    // the moon would also freeze the flashlight, whose shadow is rigidly attached to
+    // the camera and must re-render every single frame. So autoUpdate stays off
+    // permanently (set once at boot) and *both* casters are driven explicitly:
+    // the moon on this schedule, the beam unconditionally.
+    this.moon.shadow.needsUpdate = refresh;
+    this.flashlight.light.shadow.needsUpdate = true;
+
+    if (refresh) {
+      this.moonShadowAcc = 0;
+      this.moonShadowAtX = sx;
+      this.moonShadowAtZ = sz;
+      this.moonShadowPrimed = true;
+    }
   }
 
   /**
@@ -1123,12 +1326,25 @@ class StaticGame {
     this.effects.update(dt, time, this.player.pos.x, this.player.eyeY, this.player.pos.z);
     this.sky.update(time);
 
+    // Must precede both the moon key below and applyWeatherLook() further down —
+    // they are the two consumers, and they sit at different points in the frame.
+    // Runs after updatePracticals() so the warmth term reflects this frame's flicker.
+    this.updateZoneAtmosphere(dt);
+
     // ---- moon follows player (stabilized shadow window w/ texel snapping) ----
     const dim = this.sky.moonDimAt(time);
     // Slightly stronger key so trunks/ground get a readable cool rim instead of
     // collapsing to silhouette; cloud-cover dimming and the exposure clamp above
     // keep the overall frame dark. Paired with the composite toe-lift.
-    this.moon.intensity = 0.72 * dim * (1 - this.weather.wetness * 0.45); // cloud cover
+    // Zone transmission gates the key light: `zoneAtmo.moon` folds the zone's
+    // nominal moonlight with the *measured* canopy occlusion from ScatterSystem, so
+    // stepping out of old growth into a windthrow clearing is a real change in key
+    // rather than only a change in how many trunks are in frame. Floored at 0.3 —
+    // total loss of the key collapses the frame to flat ambient, which reads as a
+    // rendering failure rather than as darkness.
+    this.moon.intensity = 0.72 * dim
+      * (1 - this.weather.wetness * 0.45)
+      * (0.3 + this.zoneAtmo.moon * 0.85);
     const texel = (60 * 2) / this.moon.shadow.mapSize.x;
     const sx = Math.round(this.player.pos.x / texel) * texel;
     const sz = Math.round(this.player.pos.z / texel) * texel;
