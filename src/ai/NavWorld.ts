@@ -64,7 +64,15 @@ export class NavWorld {
       const j1 = Math.min(R - 1, Math.floor((wz + rad + this.half) / this.step));
       for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
         const x = -this.half + (i + 0.5) * this.step, z = -this.half + (j + 0.5) * this.step;
-        if (Math.hypot(x - wx, z - wz) < rad) this.walk[j * R + i] = 1;
+        if (Math.hypot(x - wx, z - wz) >= rad) continue;
+        // Water is never made walkable, no matter who asks. Callers guard their
+        // *centre* point, but a carve writes a whole disc — the dock approach
+        // runs to the very edge of the lake, so a dry centre one cell from the
+        // waterline still reached across it and left walkable cells stranded
+        // out in the water. Enforcing it per-cell here makes the rule a
+        // property of the operation rather than of each call site.
+        if (this.hf.inLake(x, z)) continue;
+        this.walk[j * R + i] = 1;
       }
     };
     // Guarantee the landmarks themselves are reachable — but NEVER carve into
