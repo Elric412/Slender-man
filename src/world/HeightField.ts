@@ -296,6 +296,41 @@ export class HeightField {
       this.flattenZones();
       this.smoothAlongPaths();
     }
+    // Enforced last, because every pass above can raise ground: the creek carve
+    // lifts terrain toward its banks, `smoothAlongPaths` averages the shoreline
+    // with the bank behind it, and `flattenZones` levels the dock apron. Any of
+    // them can push a cell inside the shore polygon back above the waterline,
+    // which reads as a dry patch floating in the lake. Rather than tune each
+    // pass to be individually safe — which breaks again the next time one is
+    // touched — the invariant "inside the shoreline is under water" is asserted
+    // once, at the end, where nothing can subsequently violate it.
+    this.enforceLakeBed();
+  }
+
+  /**
+   * Clamp every cell inside the shoreline to below the waterline.
+   *
+   * The clamp is depth-aware rather than a flat ceiling: right at the shore it
+   * only needs to dip under the surface, so the shelving beach survives, while
+   * further in it must respect the bowl. Only cells that actually violate the
+   * invariant are touched, so this cannot flatten a correctly-carved basin.
+   */
+  private enforceLakeBed(): void {
+    const shore = this.layout.lake.shore;
+    const y = this.layout.lake.y;
+    for (let j = 0; j < this.res; j++) {
+      for (let i = 0; i < this.res; i++) {
+        const x = -this.half + i * this.step;
+        const z = -this.half + j * this.step;
+        const sd = polySdf(shore, x, z);
+        if (sd >= 0) continue;
+        const dep = -sd;
+        // 0.25 m under at the very edge, deepening as you go in
+        const ceil = y - 0.25 - Math.min(6.0, Math.pow(dep, 0.8) * 0.55);
+        const idx = j * this.res + i;
+        if (this.heights[idx] > ceil) this.heights[idx] = ceil;
+      }
+    }
   }
 
   /**
@@ -330,6 +365,18 @@ export class HeightField {
     h += Math.exp(-Math.pow(dr / 78, 2)) * 22.0;
     // and a ridgeline crest running east-west along it, broken by noise
     h += Math.exp(-Math.pow((z - rg.z + 6) / 26, 2)) * (7.5 + r.noise1(x * 0.021) * 4.5);
+
+    // Watchtower knoll. A fire lookout is sited on high ground — that is the
+    // entire point of one, and the survey map puts this tower in the middle of
+    // the valley's old-growth stand where matureConifers run 40-55 m tall. On
+    // flat valley grade the cab tops out around 29 m, i.e. *below its own
+    // canopy*, and the offline sightline check measured it as findable from only
+    // 2.2% of the world — a wayfinding beacon you cannot see. Raising the siting
+    // ground rather than stretching the structure keeps the tower's proportions
+    // believable and gives the climb somewhere to arrive.
+    const tw = landmark('tower');
+    const dt = Math.hypot((x - tw.x) * 0.9, (z - tw.z) * 1.1);
+    h += Math.exp(-Math.pow(dt / 52, 2)) * 15.0;
 
     // Rock Formation: granite outcrop breaking the canopy
     const rk = landmark('rocks');
@@ -513,7 +560,12 @@ export class HeightField {
     // own channel. Rescaling about the source keeps the source fixed, lands the
     // mouth exactly on target, and — because the scale factor is positive —
     // provably preserves the monotonicity of every segment.
-    const target = this.layout.lake.y + 1.1;
+    // The mouth must sit *below* the lake surface, not above it. Targeting
+    // `lake.y + 1.1` put the creek bed 1.1 m proud of the water it drains into,
+    // so the channel carve then lifted the lake bed around the inflow back above
+    // the waterline — dry ground in the middle of the lake. A submerged mouth is
+    // also just correct: a stream enters a lake underwater.
+    const target = this.layout.lake.y - 0.5;
     const src = prof[0], mouth = prof[n - 1];
     if (mouth < target && src > target + 1e-3) {
       const k = (src - target) / (src - mouth);          // > 0, so order-preserving
