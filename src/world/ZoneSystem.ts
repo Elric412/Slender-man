@@ -557,6 +557,46 @@ export class ZoneSystem {
   }
 
   /**
+   * How much of a zone's `fogTint` hue survives into the renderer.
+   *
+   * The profile tuples were authored as *absolute dark colours*, so their channel
+   * ratios are stronger than intended as pure hues — old growth is `[0.05,0.07,0.10]`,
+   * a 2:1 blue-to-red ratio, which normalised to full strength is a distinct blue
+   * cast. The reference frames are near-monochrome; places differ by small hue
+   * shifts, not palettes, and a heavy cool cast is exactly the "generic AI horror
+   * game" look we are avoiding. This scales the normalised hue back toward neutral.
+   *
+   * Lives here, next to the tuples it applies to, because the look director and the
+   * offline verifier both need it and a duplicated literal would silently drift.
+   */
+  static readonly TINT_SATURATION = 0.45;
+
+  /**
+   * Blend a `[r,g,b]` ZoneProfile tuple into `out`, without allocating.
+   *
+   * `sample()` returns the same information but builds a `ZoneSample` (two arrays
+   * plus an object) every call, which is fine for placement-time code and not fine
+   * for the per-frame look director. This exists so the renderer can read
+   * `fogTint`/`groundTint` every frame under the zero-per-frame-allocation rule.
+   *
+   * @param key a ZoneProfile field whose value is a 3-tuple
+   */
+  tupleAt(
+    x: number, z: number, key: 'groundTint' | 'fogTint', out: [number, number, number],
+  ): [number, number, number] {
+    const w = this.scratch;
+    this.weightsAt(x, z, w);
+    out[0] = 0; out[1] = 0; out[2] = 0;
+    for (let k = 0; k < 7; k++) {
+      const wk = w[k];
+      if (wk <= 0) continue;
+      const t = ZONE_PROFILES[ZONE_IDS[k]][key];
+      out[0] += t[0] * wk; out[1] += t[1] * wk; out[2] += t[2] * wk;
+    }
+    return out;
+  }
+
+  /**
    * Pick an archetype using the blended species weights at this point, so
    * species mixes *interpolate* across a zone boundary rather than snapping.
    */
