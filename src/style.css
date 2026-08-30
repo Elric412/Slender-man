@@ -278,6 +278,66 @@ body.cb .proximity-tell.pt-imminent .pt-label { color: #ff9d7a; }
   color: #7fe0a8; background: rgba(3,5,7,0.75); padding: 8px 12px; white-space: pre;
 }
 
+/* ---------- survey map ----------
+   A folded paper sheet held up in front of the camcorder, not a menu. So it sits
+   *inside* the HUD layer under the viewfinder chrome, keeps the game visible and
+   dimmed behind it, and gets a warm paper cast that the rest of the UI (cold
+   ink-on-black) deliberately does not have. The sheet itself is a canvas drawn
+   from world geometry — see src/ui/SurveyMap.ts. Only the chrome is DOM, because
+   letterforms are crisper as text than as canvas fills. */
+.map-overlay {
+  position: absolute; inset: 0; z-index: 26;
+  display: flex; align-items: center; justify-content: center;
+  padding: calc(10px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right))
+           calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
+  background: rgba(3, 5, 7, 0.62);
+  pointer-events: auto;
+  animation: mapopen 0.16s ease-out;
+}
+
+.map-sheet {
+  /* Square-ish, because the sheet is square and letterboxing paper looks wrong.
+     min() against both axes so it never overflows a short landscape phone. */
+  width: min(74vh, 74vw, 720px);
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 16px 18px 13px;
+  background: linear-gradient(158deg, #17190f 0%, #12140f 46%, #0e100b 100%);
+  border: 1px solid #2c2f1f;
+  box-shadow:
+    0 0 0 1px rgba(0,0,0,0.6),
+    0 18px 60px rgba(0,0,0,0.72),
+    inset 0 0 70px rgba(0,0,0,0.5);
+}
+
+.map-head { display: flex; flex-direction: column; gap: 3px; text-align: center; }
+.map-title { font-size: clamp(9px, 1.5vw, 12px); letter-spacing: 0.22em; color: var(--accent); }
+.map-sub { font-size: clamp(7px, 1.1vw, 9px); letter-spacing: 0.3em; color: #6a6a4e; }
+
+.map-canvas {
+  width: 100%; height: auto; display: block;
+  border: 1px solid #23261a;
+  /* The sheet is rendered at a fixed 768² and scaled by CSS. Contour hairlines
+     are 1 px in sheet space, so smoothing is what keeps them from aliasing into
+     dotted lines when the sheet is scaled down on a phone. */
+  image-rendering: auto;
+}
+
+.map-status {
+  font-size: clamp(8px, 1.25vw, 11px); letter-spacing: 0.16em;
+  color: #d6b26a; text-align: center; min-height: 13px;
+}
+.map-foot { font-size: clamp(7px, 1vw, 9px); letter-spacing: 0.18em; color: #575c40; text-align: center; }
+
+@keyframes mapopen { from { opacity: 0; } to { opacity: 1; } }
+
+/* Unfolding paper is motion for its own sake; the readout is the point. */
+@media (prefers-reduced-motion: reduce) {
+  .map-overlay { animation: none; }
+}
+
+body.cb .map-title { color: var(--accent-cb); }
+body.cb .map-status { color: #8fdcea; }
+
 /* ---------- touch ---------- */
 #touch-ui { position: absolute; inset: 0; pointer-events: none; }
 #stick-zone { position: absolute; left: 0; bottom: 0; width: 45%; height: 55%; pointer-events: auto; }
@@ -303,6 +363,7 @@ body.cb .proximity-tell.pt-imminent .pt-label { color: #ff9d7a; }
   .menu-btn { min-width: 240px; padding: 12px 20px; font-size: 13px; }
   .panel { padding: 22px 20px; }
   #stick-base { left: 30px; bottom: 50px; width: 104px; height: 104px; }
+  .map-sheet { width: min(84vh, 94vw); padding: 12px 13px 10px; }
 }
 
 /* landscape phones are short — tighten HUD so prompts don't collide with thumbs */
@@ -321,9 +382,16 @@ body.cb .proximity-tell.pt-imminent .pt-label { color: #ff9d7a; }
   .pt-dial { width: 44px; height: 44px; }
   .pt-needle { height: 18px; }
   .pt-label { font-size: 8px; letter-spacing: 0.14em; }
+  /* Short landscape: vertical space is the constraint, so the sheet is driven
+     by height and the chrome tightens rather than the map shrinking. */
+  .map-sheet { width: min(88vh, 92vw); padding: 9px 11px 7px; gap: 5px; }
+  .map-foot { display: none; }
   .advisory-grid { grid-template-columns: 1fr; gap: 8px; }
   .advisory-grid input[type=range] { width: 100%; }
   #stick-base { bottom: 30px; width: 96px; height: 96px; }
-  .touch-buttons { bottom: calc(16px + env(safe-area-inset-bottom)); grid-template-columns: repeat(3, 56px); }
+  /* 7 buttons at 3 columns would be 3 rows — nearly half the height of a short
+     landscape phone. 4 columns keeps it to 2 rows, same as before the map button
+     existed. */
+  .touch-buttons { bottom: calc(16px + env(safe-area-inset-bottom)); grid-template-columns: repeat(4, 56px); }
   .tbtn { width: 56px; height: 56px; font-size: 18px; }
 }
