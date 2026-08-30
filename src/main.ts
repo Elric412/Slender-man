@@ -1042,10 +1042,15 @@ class StaticGame {
     // `shadowMap.autoUpdate` is GLOBAL, not per light — turning it off to schedule
     // the moon would also freeze the flashlight, whose shadow is rigidly attached to
     // the camera and must re-render every single frame. So autoUpdate stays off
-    // permanently (set once at boot) and *both* casters are driven explicitly:
-    // the moon on this schedule, the beam unconditionally.
+    // permanently (set once at boot) and the moon is driven from here.
+    //
+    // The *beam* is deliberately NOT driven here: this method is only reached from
+    // the `state === 'playing'` branch of update(), whereas the flashlight is also
+    // rendered during warm-up and from the title screen. Flagging it here left the
+    // beam's shadow map never rendered outside gameplay, so the torch appeared
+    // broken. `Flashlight.update()` now owns its own refresh — the caster and the
+    // flag live in one place, which is the only arrangement that cannot desync.
     this.moon.shadow.needsUpdate = refresh;
-    this.flashlight.light.shadow.needsUpdate = true;
 
     if (refresh) {
       this.moonShadowAcc = 0;
@@ -1148,6 +1153,11 @@ class StaticGame {
       // Force three to rebuild the shadow target on the next render.
       this.moon.shadow.map?.dispose();
       this.moon.shadow.map = null;
+      // With autoUpdate off, a freshly allocated map is *blank* until something
+      // asks for a render. Un-prime the schedule so the next frame is forced to
+      // refresh rather than waiting up to 1/4 s for the cadence to come round —
+      // otherwise every quality change flashes a shadowless forest.
+      this.moonShadowPrimed = false;
     }
     this.map.scatter.setLodBias(k.lodBias);
     // Merge budget: a chunk merge is a synchronous CPU transform over up to a
