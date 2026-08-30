@@ -253,6 +253,21 @@
       <div id="pt-label" class="pt-label">NEAR</div>
     </div>
 
+    <!-- survey map overlay. The sheet itself is drawn to canvas from world
+         geometry (see src/ui/SurveyMap.ts); only the chrome is DOM, because
+         text is crisper as text. -->
+    <div id="map-overlay" class="map-overlay hidden">
+      <div class="map-sheet">
+        <div class="map-head">
+          <span class="map-title">PINEWOOD FOREST &mdash; SURVEY SHEET 4C</span>
+          <span class="map-sub">PINEBRIDGE RANGER DISTRICT</span>
+        </div>
+        <canvas id="map-canvas" class="map-canvas"></canvas>
+        <div id="map-status" class="map-status">SURVEYED 0%</div>
+        <div class="map-foot">M &mdash; CLOSE&nbsp;&nbsp;&middot;&nbsp;&nbsp;GRID 40 m&nbsp;&nbsp;&middot;&nbsp;&nbsp;CONTOUR 6 m</div>
+      </div>
+    </div>
+
     <div id="rotate-prompt" class="rotate-prompt hidden">ROTATE DEVICE FOR BEST EXPERIENCE</div>
     <div id="perf-overlay" class="perf-overlay hidden"></div>
 
@@ -265,6 +280,7 @@
         <button id="tb-crouch" class="tbtn" aria-label="crouch">&#11015;</button>
         <button id="tb-sprint" class="tbtn" aria-label="sprint">&#9193;</button>
         <button id="tb-vf" class="tbtn" aria-label="viewfinder">&#8986;</button>
+        <button id="tb-map" class="tbtn" aria-label="survey map">&#128506;</button>
         <button id="tb-pause" class="tbtn small" aria-label="pause">II</button>
       </div>
     </div>
