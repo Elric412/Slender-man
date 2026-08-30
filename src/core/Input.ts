@@ -15,6 +15,7 @@ export interface InputFrame {
   vfHeld: boolean;       // camcorder viewfinder held
   lean: number;          // -1 left, 0, 1 right
   pauseQueued: boolean;
+  mapQueued: boolean;    // toggle the survey map
 }
 
 export class Input {
@@ -28,7 +29,7 @@ export class Input {
 
   private keys = new Set<string>();
   private lookAccX = 0; private lookAccY = 0;
-  private queued = { vault: false, interact: false, flash: false, pause: false };
+  private queued = { vault: false, interact: false, flash: false, pause: false, map: false };
   private canvas: HTMLElement;
   private pointerLocked = false;
   wantPointerLock = false;
@@ -57,7 +58,7 @@ export class Input {
   private freshFrame(): InputFrame {
     return { moveX: 0, moveZ: 0, lookDX: 0, lookDY: 0, sprint: false, crouch: false,
       vaultQueued: false, interactQueued: false, flashQueued: false, vfHeld: false,
-      lean: 0, pauseQueued: false };
+      lean: 0, pauseQueued: false, mapQueued: false };
   }
 
   private gesture(): void {
@@ -76,6 +77,9 @@ export class Input {
         // so a sprinting player tapping near a tape must still get exactly one action
         case 'KeyE': if (!e.shiftKey) this.queued.interact = true; break;
         case 'KeyF': this.queued.flash = true; break;
+        // The survey map. `M` is the convention, and it must not collide with
+        // the sprint/lean Shift modifier the way `E` does.
+        case 'KeyM': this.queued.map = true; break;
         case 'Escape': this.queued.pause = true; break;
       }
     });
@@ -189,6 +193,9 @@ export class Input {
     btn('tb-crouch', () => { this.tb.crouch = !this.tb.crouch; document.getElementById('tb-crouch')!.classList.toggle('active', this.tb.crouch); });
     btn('tb-sprint', () => { this.tb.sprint = true; }, () => { this.tb.sprint = false; });
     btn('tb-vf', () => { this.tb.vf = true; }, () => { this.tb.vf = false; });
+    // A toggle, so no `up` handler — the `active` class is owned by
+    // Menu.setMapVisible, which knows whether the sheet actually opened.
+    btn('tb-map', () => { this.queued.map = true; });
     btn('tb-pause', () => { this.queued.pause = true; });
   }
 
@@ -211,6 +218,7 @@ export class Input {
     if (b(0) && !this.padButtonsPrev[0]) { f.interactQueued = true; f.vaultQueued = true; }
     if (b(2) && !this.padButtonsPrev[2]) f.flashQueued = true;
     if (b(9) && !this.padButtonsPrev[9]) f.pauseQueued = true;
+    if (b(8) && !this.padButtonsPrev[8]) f.mapQueued = true;   // Select/Back
     f.sprint = f.sprint || b(10) || b(5);
     f.crouch = f.crouch || b(1);
     f.vfHeld = f.vfHeld || b(6);
@@ -262,6 +270,7 @@ export class Input {
     f.interactQueued = this.queued.interact; this.queued.interact = false;
     f.flashQueued = this.queued.flash; this.queued.flash = false;
     f.pauseQueued = this.queued.pause; this.queued.pause = false;
+    f.mapQueued = this.queued.map; this.queued.map = false;
 
     this.pollPad(f);
 
