@@ -298,7 +298,23 @@ export class RenderPipeline {
 
   setMoon(light: THREE.DirectionalLight | null): void { this.moon = light; }
 
-  setFog(p: Partial<FogParams>): void { Object.assign(this.fog, p); }
+  /**
+   * `tint` is *copied* into the existing Color rather than assigned.
+   *
+   * `Object.assign` would alias `this.fog.tint` to the caller's instance — and the
+   * caller (`StaticGame.zoneAtmo.tint`) mutates its colour every frame under the
+   * zero-allocation rule. The pipeline would then be holding a live reference into
+   * game state, so the later `uFogTint.copy(this.fog.tint)` becomes a self-copy and
+   * any future clamping or blending done here would silently write back into the
+   * look director. Scalars are safe to assign; object fields are not.
+   */
+  setFog(p: Partial<Omit<FogParams, 'tint'>> & { tint?: THREE.Color }): void {
+    if (p.density !== undefined) this.fog.density = p.density;
+    if (p.baseHeight !== undefined) this.fog.baseHeight = p.baseHeight;
+    if (p.falloff !== undefined) this.fog.falloff = p.falloff;
+    if (p.turbulence !== undefined) this.fog.turbulence = p.turbulence;
+    if (p.tint) this.fog.tint.copy(p.tint);
+  }
 
   /** Exposure compensation goal (stops-ish multiplier around the auto value). */
   setExposureGoal(goal: number): void {
@@ -972,6 +988,13 @@ export class RenderPipeline {
       uniform float uDofStrength;
       uniform float uVignette;
       uniform float uGrain;
+      /**
+       * Master scale over every noise-like artefact: signal noise, film grain,
+       * scanlines and dropout rows. 1 = the tuned camcorder look, 0 = a clean
+       * image. Exposed as an accessibility setting; some players read heavy grain
+       * as blur or motion sickness rather than as texture.
+       */
+      uniform float uNoise;
 
       void main(){
         vec2 uv = vUv;
@@ -1086,23 +1109,45 @@ export class RenderPipeline {
         col += vec3(0.016, 0.020, 0.031) * shadowFloor;
 
         // ---- CCD / tape artefacts ----
-        float scan = 0.93 + 0.07 * sin(uv.y * 1100.0 + uTime * 8.0);
-        col *= mix(1.0, scan, 0.18 + s * 0.55 + uViewfinder * 0.15);
+        // Scanlines are a *permanent* 1100-cycle pattern over the whole frame, so
+        // they cost real resolution everywhere. Kept for the camcorder identity but
+        // pulled back hard outside the viewfinder, where they belong.
+        float scan = 0.96 + 0.04 * sin(uv.y * 1100.0 + uTime * 8.0);
+        col *= mix(1.0, scan, (0.06 + s * 0.16 + uViewfinder * 0.42) * uNoise);
 
+        // ---- signal noise -------------------------------------------------
+        // Was `s * (0.09 + edge * 0.45)`, which at high fear replaced up to 54% of
+        // every peripheral pixel with white noise and 9% of the centre. Stacked on
+        // top of film grain, scanlines and dropout rows, the frame stopped being an
+        // image. Geometry, materials and lighting are supposed to carry this game;
+        // noise was hiding them.
+        //
+        // Three changes: the periphery ramp is cut from 0.45 to 0.10, the whole term
+        // is squared so it stays near zero through the low- and mid-fear states where
+        // most of the playtime is, and the ceiling drops from 0.90 to 0.30 so an
+        // image always survives. `uNoise` scales all of it for the accessibility
+        // setting.
         float n = hash12(uv * vec2(1920.0, 1080.0) + fract(uTime) * 371.0);
         float edge = smoothstep(0.25, 0.85, length(cc) * 1.6);
-        float noiseAmt = s * (0.09 + edge * 0.45) + uGlimpse * 0.45;
-        col = mix(col, vec3(n), clamp(noiseAmt, 0.0, 0.9));
+        float noiseAmt = (s * s * (0.035 + edge * 0.10) + uGlimpse * 0.16) * uNoise;
+        col = mix(col, vec3(n), clamp(noiseAmt, 0.0, 0.30));
 
-        // dropout scratches — sparse, only when the signal is bad
-        float dropRow = step(0.9975, hash12(vec2(floor(uv.y * 240.0), floor(uTime * 12.0))));
-        col = mix(col, vec3(0.75), dropRow * s * 0.5);
+        // dropout scratches — sparse, only when the signal is bad. Rarer (0.9975 ->
+        // 0.9992) and dimmer, so they read as an occasional tape fault rather than
+        // constant streaking.
+        float dropRow = step(0.9992, hash12(vec2(floor(uv.y * 240.0), floor(uTime * 12.0))));
+        col = mix(col, vec3(0.62), dropRow * s * 0.22 * uNoise);
 
         col += vec3(0.11, 0.12, 0.16) * uGlimpse;
 
-        // film grain, luminance-weighted so black stays black-ish but alive
+        // Film grain, luminance-weighted. The weighting is inverted from before:
+        // it used to be *strongest* on dark pixels (mix(0.6,1.4,1-l) = 1.4 at black),
+        // which is exactly backwards — this game is mostly near-black, so grain was
+        // loudest where the image is quietest, and it visibly boiled in the shadows.
+        // Real film grain is most visible in the mid-tones and vanishes in the toe.
         float g = (hash12(uv * 911.0 + fract(uTime * 7.0) * 517.0) - 0.5);
-        col += g * uGrain * mix(0.6, 1.4, 1.0 - l);
+        float grainWeight = smoothstep(0.0, 0.22, l) * mix(1.0, 0.55, smoothstep(0.5, 1.0, l));
+        col += g * uGrain * grainWeight * uNoise;
 
         // peripheral narrowing
         float vig = smoothstep(1.28 - s * 0.34, 0.34, length(cc) * 1.9);
@@ -1125,6 +1170,7 @@ export class RenderPipeline {
       uAoStrength: { value: 0.8 },
       uDofRange: { value: new THREE.Vector2(26, 90) }, uDofStrength: { value: 0.7 },
       uVignette: { value: 0.34 }, uGrain: { value: 0.026 },
+      uNoise: { value: 1 },
     }, {
       USE_BLOOM: 1, USE_AO: 1, USE_VOL: 1, USE_DOF: 1, USE_STREAK: 1,
     });
