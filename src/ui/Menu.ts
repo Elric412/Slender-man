@@ -40,7 +40,8 @@ export class Menu {
       'capture-overlay', 'end-title', 'end-detail', 'end-stats',
       'advisory-screen', 'audio-cue',
       'hud-chrome', 'hud-clock', 'hud-batt', 'pickup-flash',
-      'proximity-tell', 'pt-needle', 'pt-label'];
+      'proximity-tell', 'pt-needle', 'pt-label',
+      'map-overlay', 'map-canvas', 'map-status'];
     for (const id of ids) {
       const el = document.getElementById(id);
       if (el) this.els.set(id, el);
@@ -299,6 +300,39 @@ export class Menu {
 
   showTouchUI(on: boolean): void {
     this.el('touch-ui').classList.toggle('hidden', !on);
+  }
+
+  // ---------- survey map ----------
+  //
+  // The Menu owns only visibility and the status line. The sheet itself is drawn
+  // by SurveyMap straight onto `map-canvas` from world geometry, so there is no
+  // path by which this class could put something on the map that the world does
+  // not contain — which is the brief's rule about not hardcoding UI information.
+
+  /** the canvas SurveyMap renders into; null if the element is missing */
+  get mapCanvas(): HTMLCanvasElement | null {
+    return (this.els.get('map-canvas') as HTMLCanvasElement | undefined) ?? null;
+  }
+
+  /** true while the survey sheet is being read */
+  get mapVisible(): boolean {
+    const el = this.els.get('map-overlay');
+    return !!el && !el.classList.contains('hidden');
+  }
+
+  setMapVisible(on: boolean): void {
+    const el = this.els.get('map-overlay');
+    if (!el) return;
+    el.classList.toggle('hidden', !on);
+    const tb = document.getElementById('tb-map');
+    if (tb) tb.classList.toggle('active', on);
+  }
+
+  setMapStatus(text: string): void {
+    const el = this.els.get('map-status');
+    // Guarded because this is pushed every frame while the sheet is open, and a
+    // DOM text write that changes nothing still costs layout.
+    if (el && el.textContent !== text) el.textContent = text;
   }
 
   flashTapeCounter(count: number): void {
