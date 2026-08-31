@@ -63,6 +63,17 @@ export class SurveyMap {
     this.oy = margin + (WORLD_SIZE / 2) * this.s;
   }
 
+  /**
+   * Point the sheet at a new knowledge set, for a fresh run.
+   *
+   * Only the epistemic half is swapped. The cached base layer is a function of
+   * the terrain alone — contours, shoreline, quarry rim — and the terrain is
+   * seeded and identical across runs, so re-tracing it would be pure waste.
+   */
+  setCartography(carto: Cartography): void {
+    this.carto = carto;
+  }
+
   /** world → sheet coordinates */
   private X(x: number): number { return this.ox + x * this.s; }
   private Y(z: number): number { return this.oy + z * this.s; }
