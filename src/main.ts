@@ -23,6 +23,8 @@ import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';
 import { ZoneSystem } from './world/ZoneSystem';
+import { Cartography } from './world/Cartography';
+import { SurveyMap } from './ui/SurveyMap';
 import { SeededRandom } from './core/SeededRandom';
 import { Menu } from './ui/Menu';
 import { gpuCaps } from './engine/GpuCaps';
@@ -150,6 +152,26 @@ class StaticGame {
   private tell = new ProximityTell();
   private tapes!: TapeSystem;
   private effects!: Effects;
+  /**
+   * The player's knowledge of the forest, and the sheet that draws it.
+   *
+   * `carto` is the only mutable state the world and the map UI share, and the
+   * renderer is handed nothing else — so the map cannot assert a landmark, trail
+   * or discovery the world does not contain (brief: "avoid hardcoding UI
+   * information that does not correspond to the world state").
+   *
+   * `survey` is optional because the canvas element may legitimately be absent
+   * (a stripped host page, or a browser that refuses a 2D context); the game
+   * must still be playable without a map, so every use site is guarded.
+   */
+  private carto!: Cartography;
+  private survey: SurveyMap | null = null;
+  /** true while the sheet is being read — gates redraw work to when it is visible */
+  private mapOpen = false;
+  /** survey accumulator: the reveal disc is stamped on a cadence, not per frame */
+  private surveyAcc = 0;
+  /** redraw accumulator: the 768² sheet is repainted at 10 Hz while open */
+  private mapDrawAcc = 0;
 
   state: GameState = 'loading';
   private runSeed = WORLD_SEED;
@@ -311,6 +333,27 @@ class StaticGame {
     await frame();
     this.bootMark('nav');
 
+    // The survey sheet. Built from the same layout the terrain, collision and nav
+    // grid came from, so it is a projection of the world rather than a drawing of
+    // it. The contour trace in SurveyMap is the expensive part and is cached on
+    // first open, not here — boot is already the longest wait in the game.
+    p(0.53, 'folding the survey sheet…');
+    this.carto = new Cartography(this.hf);
+    const mapCanvas = this.menu.mapCanvas;
+    if (mapCanvas) {
+      try {
+        this.survey = new SurveyMap(mapCanvas, this.carto, this.hf);
+      } catch (err) {
+        // A missing 2D context is not fatal — the forest is navigable by its
+        // landmarks, which is the primary navigation the brief asks for. Losing
+        // the map is a degradation, not a failure.
+        console.warn('[STATIC] survey map unavailable:', err);
+        this.survey = null;
+      }
+    }
+    await frame();
+    this.bootMark('cartography');
+
     p(0.56, 'assembling scene…');
     this.buildScene();
     await frame();
@@ -463,7 +506,7 @@ class StaticGame {
     this.player.update(0.016, {
       moveX: 0, moveZ: 0, lookDX: 0, lookDY: 0, sprint: false, crouch: false,
       vaultQueued: false, interactQueued: false, flashQueued: false, vfHeld: false,
-      lean: 0, pauseQueued: false,
+      lean: 0, pauseQueued: false, mapQueued: false,
     }, 0);
     this.flashlight.on = true;
     this.flashlight.update(0.016, 0);
@@ -632,6 +675,7 @@ class StaticGame {
   // ================================================================ state transitions
   private toTitle(): void {
     this.state = 'title';
+    this.closeMap();
     this.loop.paused = true;
     this.menu.showHud(false);
     this.menu.showTouchUI(false);
@@ -700,6 +744,15 @@ class StaticGame {
       Math.hypot(this.entity.pos.x - this.player.pos.x, this.entity.pos.z - this.player.pos.z));
     this.tapes.spawnAll(this.runSeed);
     this.tapes.onPickup = (zoneId, x, z) => this.onTapePickup(zoneId, x, z);
+    // Forget the forest. Knowledge is per-run: the terrain is seeded and therefore
+    // identical every time, but a second run must start with a blank sheet or the
+    // whole map is pre-filled and the exploration it measures never happens.
+    // Rebuilt rather than cleared because the reachability denominator is derived
+    // from the heightfield and is cheap to recompute (96² one-off).
+    this.carto = new Cartography(this.hf);
+    if (this.survey) this.survey.setCartography(this.carto);
+    this.closeMap();
+    this.surveyAcc = 0; this.mapDrawAcc = 0;
     this.pipeline.invalidateHistory();
     this.state = 'playing';
     this.loop.paused = false;
@@ -720,11 +773,22 @@ class StaticGame {
 
   private pause(): void {
     if (this.state !== 'playing') return;
+    // The sheet lives in the HUD layer, so it would otherwise still be on screen
+    // underneath the pause menu. Closing it here also means unpausing never drops
+    // the player straight back into a blind, movement-locked frame.
+    this.closeMap();
     this.state = 'paused';
     this.audio.suspend();
     this.loop.paused = true;
     this.menu.show('pause');
     this.input.releasePointerLock();
+  }
+
+  /** Force the sheet shut without the open/close sound or a pointer-lock grab. */
+  private closeMap(): void {
+    if (!this.mapOpen) return;
+    this.mapOpen = false;
+    this.menu.setMapVisible(false);
   }
 
   private resume(): void {
@@ -757,6 +821,7 @@ class StaticGame {
 
   private finishRun(): void {
     this.state = this.endKind; // 'escaped' | 'taken' — win/lose is part of the state contract
+    this.closeMap();
     this.audio.endRun();
     this.loop.paused = true;
     this.menu.showHud(false);
@@ -766,8 +831,64 @@ class StaticGame {
     this.menu.showEnd(this.endKind, this.tapes.collected, this.runTime);
   }
 
+  // ---------------------------------------------------------------- survey map
+  /**
+   * Open or close the sheet.
+   *
+   * Pointer lock is released while reading so the player can move the mouse
+   * without spinning the camera underneath the paper, and restored on close.
+   */
+  private setMapOpen(on: boolean): void {
+    if (on === this.mapOpen) return;
+    this.mapOpen = on;
+    this.menu.setMapVisible(on);
+    if (on) {
+      this.input.releasePointerLock();
+      // Draw immediately so the sheet is never presented blank for a frame.
+      this.drawSurvey();
+    } else if (!this.input.isTouch) {
+      this.input.requestPointerLock();
+    }
+    this.audio.uiClick();
+  }
+
+  /**
+   * Fold the player's position into the survey, and redraw if the sheet is open.
+   *
+   * The observation pass is stamped on a ~7 Hz cadence rather than per frame.
+   * Reveal is a 17 m disc with terrain line-of-sight tests inside it, which is
+   * real work, and at walking speed (≈2.6 m/s) 7 Hz means a sample every ~37 cm —
+   * far finer than the 5.8 m exploration cell, so nothing is missed. This also
+   * makes the cost independent of refresh rate, matching how the entity brain and
+   * the rest of the engine are governed.
+   */
+  private updateSurvey(dt: number): void {
+    if (!this.survey) return;
+    this.surveyAcc += dt;
+    if (this.surveyAcc >= 0.14) {
+      this.carto.observe(this.player.pos.x, this.player.pos.z, this.runTime);
+      this.surveyAcc = 0;
+    }
+    // Redrawing a 768² canvas is pointless when nobody is looking at it, and the
+    // sheet only changes as the player moves, so it is capped at 10 Hz.
+    if (!this.mapOpen) return;
+    this.mapDrawAcc += dt;
+    if (this.mapDrawAcc >= 0.1) { this.drawSurvey(); this.mapDrawAcc = 0; }
+  }
+
+  private drawSurvey(): void {
+    if (!this.survey) return;
+    this.survey.draw(this.player.pos.x, this.player.pos.z, this.player.yaw);
+    this.menu.setMapStatus(this.survey.status());
+  }
+
   private onTapePickup(zoneId: string, x: number, z: number): void {
     this.audio.tapePickup();
+    // Mark the recording on the sheet. `zoneId` is the landmark the tape was
+    // spawned at, which is the same key PAGE_ANCHORS uses for `near` — so the
+    // map learns what was recovered without the UI having to know where tapes
+    // live or how many there are.
+    this.carto.markCollected(zoneId);
     this.entity.notifyTapePickup(x, z);
     this.menu.flashTapeCounter(this.tapes.collected);
     const log = TAPE_LOGS[zoneId];
@@ -1193,6 +1314,29 @@ class StaticGame {
     const inp = this.input.poll();
     if (inp.pauseQueued) { this.pause(); return; }
 
+    // ---- survey sheet ----
+    //
+    // Deliberately NOT a pause. A map that stops time is a menu, and it would
+    // dissolve exactly the tension the world is built to create: you could stand
+    // in the open studying contours while the thing that is hunting you is frozen
+    // mid-stride. So the forest keeps running — the entity keeps closing, the
+    // ambience keeps playing, the battery keeps draining — and the cost of
+    // reading the sheet is that you are standing still and blind while you do it.
+    // That makes "do I dare check the map here, or do I get to the treeline
+    // first?" a real decision, which is the kind of pressure the brief asks the
+    // world to generate on its own.
+    if (inp.mapQueued && this.survey) this.setMapOpen(!this.mapOpen);
+    if (this.mapOpen) {
+      // Both hands are on the paper and your eyes are down. Movement and look are
+      // neutralised in place (the frame object is reused, so no allocation), and
+      // the interact/vault edges are swallowed so a queued press cannot fire
+      // blindly at something behind the sheet.
+      inp.moveX = 0; inp.moveZ = 0;
+      inp.lookDX = 0; inp.lookDY = 0;
+      inp.sprint = false;
+      inp.vaultQueued = false; inp.interactQueued = false;
+    }
+
     // ---- player ----
     let p0 = performance.now();
     this.player.update(dt, inp, this.fear.tremor);
@@ -1469,6 +1613,7 @@ class StaticGame {
     this.menu.setAudioCues(this.cueTexts);
     this.menu.setViewfinder(inp.vfHeld, 4);
     this.menu.setHudChrome(this.runTime, this.flashlight.battery);
+    this.updateSurvey(dt);
     if (this.perfVisible) {
       const st = this.loop.stats();
       const g = this.pipeline.gpuStats;
@@ -1795,7 +1940,7 @@ class StaticGame {
         const inp: InputFrame = {
           moveX: 0, moveZ: 1, lookDX: 0, lookDY: 0, sprint: false, crouch: false,
           vaultQueued: false, interactQueued: false, flashQueued: false,
-          vfHeld: false, lean: 0, pauseQueued: false,
+          vfHeld: false, lean: 0, pauseQueued: false, mapQueued: false,
         };
         let walked = 0, maxStep = 0, stuck = 0, vaults = 0;
         let prevX = ax, prevZ = az, prevY = this.player.pos.y;
@@ -1820,14 +1965,45 @@ class StaticGame {
           maxStep = Math.max(maxStep, Math.abs(ny - prevY));
           if (moved < 0.004) { stuck++; if (stuck > 150) break; } else stuck = 0;
           prevX = nx; prevZ = nz; prevY = ny;
+          // Survey as we go, on the same ~7 Hz cadence the real game uses, so a
+          // scripted traversal reveals the map exactly as a player walking that
+          // route would. This is what makes explored%/discovery assertable from
+          // a headless walk rather than only by hand.
+          if ((step % 8) === 0) this.carto.observe(nx, nz, step * dt);
         }
         const finalD = Math.hypot(this.player.pos.x - bx, this.player.pos.z - bz);
         return {
           reached: finalD < 10, walked, maxStep, finalD, vaults,
           navPoints: cells.length,
           endX: this.player.pos.x, endZ: this.player.pos.z,
+          // Map state after the walk, so traversal and cartography are verified
+          // by the same run instead of two that could disagree.
+          explored: this.carto.exploredFraction,
+          discovered: this.carto.discoveredCount,
         };
       },
+
+      /**
+       * The survey sheet's view of the world — what the map would draw right now.
+       *
+       * Exposed so a test can assert that the UI agrees with the world rather
+       * than trusting that it does. Everything here is read back out of
+       * Cartography, which is itself fed only from PinewoodLayout, so a mismatch
+       * between this and `world()`/`pages()` is a genuine bug.
+       */
+      carto: () => ({
+        explored: this.carto.exploredFraction,
+        discovered: this.carto.discoveredCount,
+        collected: this.carto.collectedCount,
+        landmarks: this.carto.landmarks.map(k => ({
+          id: k.lm.id, kind: k.lm.kind, beacon: k.lm.beacon,
+          discovered: k.discovered, seenAtDistance: k.seenAtDistance, atTime: k.atTime,
+        })),
+        pages: this.carto.pages.map(p => ({
+          id: p.id, near: p.near, x: p.x, z: p.z,
+          collected: p.collected, hinted: p.hinted,
+        })),
+      }),
 
       /** every page/tape spawn actually placed in the world */
       pages: () => this.tapes.tapes.map((t, i) => ({
