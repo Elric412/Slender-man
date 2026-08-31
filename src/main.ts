@@ -224,13 +224,25 @@ class StaticGame {
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    // Shadow refresh is scheduled per light, not left to three's global auto-update:
-    // the moon re-renders the whole merged forest and only needs to do so when its
-    // texel-snapped window moves or a dynamic caster is near (brief §1.6, §5.7),
-    // whereas the flashlight is camera-rigid and must refresh every frame. Because
-    // `autoUpdate` is a single global flag it cannot express that, so it stays off
-    // and `updateMoonShadowSchedule()` drives `shadow.needsUpdate` on both lights.
-    this.renderer.shadowMap.autoUpdate = false;
+    // Shadow refresh is scheduled PER LIGHT: the moon re-renders the whole merged
+    // forest and only needs to when its texel-snapped window moves or a dynamic
+    // caster is near (brief §1.6, §5.7), whereas the flashlight is camera-rigid and
+    // must refresh every frame.
+    //
+    // `WebGLShadowMap.render()` has TWO independent gates:
+    //
+    //   1. global   `if (autoUpdate === false && needsUpdate === false) return;`
+    //   2. per light `if (shadow.autoUpdate === false && shadow.needsUpdate === false) continue;`
+    //
+    // Only (2) can express selective scheduling. Clearing the GLOBAL flag returns
+    // before the per-light loop is ever entered, so *no* map is rendered for *any*
+    // light — and an unrendered map is not "no shadow". three binds its zero-filled
+    // 1x1 placeholder, which unpacks to depth 0 and therefore reads as FULLY
+    // OCCLUDED, silently zeroing both the moon key and the torch. That failure
+    // presents as "the game is too dark", not as "shadows are broken", which is
+    // exactly why it is worth this much comment: the global flag must stay ON and
+    // scheduling belongs on each `light.shadow`.
+    this.renderer.shadowMap.autoUpdate = true;
     this.renderer.autoClear = true;
     this.handleResize();
     if (import.meta.env.DEV) console.info('[STATIC] GPU:', probeRenderer());
@@ -1039,17 +1051,20 @@ class StaticGame {
 
     const refresh = !this.moonShadowPrimed || moved || dynamicNear || due;
 
-    // `shadowMap.autoUpdate` is GLOBAL, not per light — turning it off to schedule
-    // the moon would also freeze the flashlight, whose shadow is rigidly attached to
-    // the camera and must re-render every single frame. So autoUpdate stays off
-    // permanently (set once at boot) and the moon is driven from here.
+    // Opt this ONE light out of automatic refresh and drive it by hand. The
+    // per-light `shadow.autoUpdate` is the only flag that skips a single caster;
+    // the renderer-level one skips all of them (see the boot comment).
     //
-    // The *beam* is deliberately NOT driven here: this method is only reached from
-    // the `state === 'playing'` branch of update(), whereas the flashlight is also
-    // rendered during warm-up and from the title screen. Flagging it here left the
-    // beam's shadow map never rendered outside gameplay, so the torch appeared
-    // broken. `Flashlight.update()` now owns its own refresh — the caster and the
-    // flag live in one place, which is the only arrangement that cannot desync.
+    // `needsUpdate` is a one-shot: `WebGLShadowMap` clears it back to false the
+    // moment it renders the map, so we must assert it on every frame we want a
+    // refresh rather than latching it once.
+    //
+    // The *beam* is deliberately not driven from here: this method is only reached
+    // from the `state === 'playing'` branch of update(), whereas the flashlight is
+    // also rendered during shader warm-up and behind the title screen. The torch
+    // keeps three's default per-frame refresh, which is what a camera-rigid caster
+    // needs anyway.
+    this.moon.shadow.autoUpdate = false;
     this.moon.shadow.needsUpdate = refresh;
 
     if (refresh) {
