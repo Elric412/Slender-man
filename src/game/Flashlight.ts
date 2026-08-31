@@ -262,19 +262,13 @@ export class Flashlight {
     this.player.setLensGlow(active ? 2.5 * this.strength : 0);
     this.light.visible = this.spill.visible = this.pool.visible = active;
 
-    // The renderer runs with `shadowMap.autoUpdate = false` so the moon's cascade
-    // over the static forest can be scheduled instead of re-rendered every frame.
-    // That switch is global, so this caster must ask for itself — and it must do so
-    // here rather than from the game's frame loop, because the beam is also rendered
-    // during shader warm-up and behind the title screen, where the gameplay update
-    // path never runs. Owning the flag next to the light that needs it is what keeps
-    // the two from desyncing.
-    //
-    // Unconditional while lit: the spot is rigidly attached to a camera that can
-    // rotate at any speed, so there is no cheap "did it move enough" test that is
-    // also correct. Skipping a frame here reads instantly as the beam's shadows
-    // lagging the view.
-    this.light.shadow.needsUpdate = active;
+    // No shadow scheduling here on purpose. The beam is rigidly attached to a
+    // camera that can rotate arbitrarily fast, so there is no cheap "did it move
+    // enough" test that is also correct — skipping a frame reads instantly as the
+    // torch's shadows lagging the view. three's default per-light `autoUpdate`
+    // already refreshes it every frame, and `light.visible = false` skips it for
+    // free while the torch is off, so the correct action is to leave the flags
+    // alone. Only the moon opts out (see `updateMoonShadowSchedule`).
     this.dust.visible = active;
     this.dustMat.uniforms.uBeamStrength.value = this.strength;
 
