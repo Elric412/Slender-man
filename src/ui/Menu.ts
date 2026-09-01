@@ -111,6 +111,7 @@ export class Menu {
       this.commit();
       this.onAdvisoryAck?.();
     });
+    bindRange('set-filmnoise', v => { s.filmNoise = v / 100; });
     bindRange('set-sens', v => { s.sensitivity = v / 100; });
     bindRange('set-fov', v => { s.fov = v; });
     bindCheck('set-inverty', v => { s.invertY = v; });
@@ -157,6 +158,7 @@ export class Menu {
     setCheck('set-audiocues', s.audio.audioCues);
     setRange('adv-lowfreq', s.audio.lowFreq);
     setCheck('adv-audiocues', s.audio.audioCues);
+    setRange('set-filmnoise', s.filmNoise);
     (document.getElementById('set-sens') as HTMLInputElement).value = String(s.sensitivity * 100);
     (document.getElementById('set-fov') as HTMLInputElement).value = String(s.fov);
     (document.getElementById('set-inverty') as HTMLInputElement).checked = s.invertY;
