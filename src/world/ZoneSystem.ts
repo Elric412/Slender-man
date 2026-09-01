@@ -275,6 +275,19 @@ interface Influence {
   /** falloff distance beyond r */
   feather: number;
   strength: number;
+  /**
+   * Negative influence: multiply this zone's accumulated weight down instead of
+   * voting for it. 0 erases the zone here, 1 is no effect.
+   *
+   * Additive influence alone cannot express "something keeps this clear". The
+   * only way to weaken a zone was to out-vote it with another, which forces you
+   * to claim the ground *is* something else — and a maintained clearing is not a
+   * different biome, it is the same forest with the trees taken out. Without
+   * this, the creek ravine (the densest canopy in the game, closure 0.96) rolled
+   * straight over the fire lookout 28 m away and buried the tallest navigation
+   * landmark in the world under its own thicket.
+   */
+  suppress?: number;
 }
 
 export class ZoneSystem {
@@ -417,6 +430,37 @@ export class ZoneSystem {
       const p = this.creek[i];
       inf.push({ zone: 'ravine', x: p.x, z: p.z, r: 13, feather: 17, strength: 1.7 });
     }
+
+    // ── the lookout's cleared fireground ─────────────────────────────────────
+    //
+    // A fire lookout only functions if it can see, so the first thing rangers do
+    // is fell the stand around it — and the first thing that happens when the
+    // district is abandoned is that the clearing starts closing in again. That
+    // is the state this models: felled, then half-reclaimed.
+    //
+    // It is also load-bearing for navigation. The creek passes 28 m from the
+    // tower, and `ravine` has the densest canopy in the game (closure 0.96), so
+    // without this the single tallest landmark in Pinewood — the one the player
+    // is supposed to orient by from across the basin — sat in a closed thicket
+    // with zero open bearings. Suppressing the ravine and thicket votes here
+    // opens the sightlines without pretending the ground is a different biome,
+    // and without touching the structure's own proportions.
+    //
+    // Deliberately elliptical and off-centre rather than a clean disc: a felled
+    // area follows the slope and the crew's access, and a perfect circle of
+    // clear ground around a tower is exactly the "obvious generation pattern"
+    // the brief says to avoid. The regrowth is what the ring of understory at
+    // the edge reads as.
+    inf.push({ zone: 'ravine', x: tower.x + 4, z: tower.z - 2, r: 30, feather: 26, strength: 0, suppress: 0.12 });
+    inf.push({ zone: 'thicket', x: tower.x + 4, z: tower.z - 2, r: 26, feather: 30, strength: 0, suppress: 0.3 });
+    // A little dry upland on the cleared knoll: sun reaches the floor now, so it
+    // is grassier and stonier than the wet corridor 30 m downhill. This is what
+    // makes the approach *read* as maintained ground rather than simply thinner.
+    inf.push({ zone: 'dryUpland', x: tower.x + 6, z: tower.z + 4, r: 20, feather: 30, strength: 1.25 });
+    // The two service trails the crew cut in are already going over — storm-fall
+    // debris and snapped tops, on the up-slope side only.
+    inf.push({ zone: 'stormFall', x: tower.x - 24, z: tower.z - 20, r: 13, feather: 22, strength: 0.85 });
+
     return inf;
   }
 
@@ -446,12 +490,27 @@ export class ZoneSystem {
         w[uplandIdx] = 0.34 + alt * alt * 0.62;
 
         for (const s of inf) {
+          if (s.suppress !== undefined) continue;   // second pass, below
           const d = Math.hypot(x - s.x, z - s.z);
           if (d > s.r + s.feather) continue;
           const t = d <= s.r ? 1 : 1 - (d - s.r) / s.feather;
           // smoothstep the falloff so blends have no linear kink
           const f = t * t * (3 - 2 * t);
           w[ZONE_IDS.indexOf(s.zone)] += f * s.strength;
+        }
+
+        // Suppression runs *after* every additive vote, because it has to act on
+        // the total. Applied before, an influence added later would simply
+        // re-fill the ground that was meant to be kept clear.
+        for (const s of inf) {
+          if (s.suppress === undefined) continue;
+          const d = Math.hypot(x - s.x, z - s.z);
+          if (d > s.r + s.feather) continue;
+          const t = d <= s.r ? 1 : 1 - (d - s.r) / s.feather;
+          const f = t * t * (3 - 2 * t);
+          // f=1 at the core → full suppression; f=0 at the edge → untouched.
+          const k = ZONE_IDS.indexOf(s.zone);
+          w[k] *= 1 - f * (1 - s.suppress);
         }
 
         // normalise
