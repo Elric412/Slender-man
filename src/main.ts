@@ -628,6 +628,12 @@ class StaticGame {
       this.input.gyroEnabled = s.gyro;
     }
     if (this.player) this.player.baseFov = s.fov;
+    // The grade is normally re-pushed every frame by applyWeatherLook(), but that
+    // only runs during gameplay — the settings screen is usually opened from the
+    // title or while paused, where no gameplay frames are produced. Pushing the
+    // noise scale here means dragging the slider changes the image the player is
+    // actually looking at, instead of appearing to do nothing until the run starts.
+    this.pipeline?.setGrade({ noise: s.filmNoise });
     // Switching away from `explicit` must also clear whatever the dial was last
     // showing; Menu owns that, and the call is idempotent.
     this.tell.mode = s.proximityTell;
@@ -1060,6 +1066,11 @@ class StaticGame {
       volumetric: 0.9 + wet * 0.45,
       ao: 0.85 + fear * 0.2,
       grain: 0.035 + fear * 0.09 + this.vfWeight * 0.05,
+      // Player-facing accessibility scale over grain/noise/scanlines/dropouts.
+      // Pushed here rather than once at settings-change time because `setGrade`
+      // overwrites the whole grade block every frame, so a one-shot write would
+      // be clobbered on the next weather update.
+      noise: this.settings.filmNoise,
       vignette: 0.30 + fear * 0.28 + this.vfWeight * 0.12,
       dof: this.spec.dof ? 0.35 + this.vfWeight * 0.4 : 0,
       dofRange: [2.4, 34 - wet * 8],
