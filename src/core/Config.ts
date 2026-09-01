@@ -54,6 +54,19 @@ export interface Settings {
    * See `src/world/ProximityTell.ts`.
    */
   proximityTell: TellMode;
+  /**
+   * Master scale over every noise-like artefact in the composite: signal noise,
+   * film grain, scanlines and tape dropout rows. 1 = the tuned camcorder look,
+   * 0 = a completely clean image.
+   *
+   * This is an accessibility control, not a quality slider — the artefacts cost
+   * effectively nothing to render. Heavy grain is read by some players as blur,
+   * eye strain or motion sickness rather than as texture, and the found-footage
+   * identity is carried by the viewfinder, chromatic aberration and the AgX
+   * grade regardless of where this sits. Defaults to 1 because the camcorder
+   * look is the intended art direction.
+   */
+  filmNoise: number;
   /** set once the player has acknowledged the content advisory */
   advisoryAck: boolean;
 }
@@ -138,6 +151,13 @@ export function loadSettings(): Settings {
       if (merged.proximityTell !== 'subtle' && merged.proximityTell !== 'explicit') {
         merged.proximityTell = 'off';
       }
+      // Same reasoning as above, for the same reason: a non-finite value here
+      // would propagate straight into a shader uniform, where NaN does not fail
+      // loudly — it silently turns the whole composite black on some drivers.
+      if (typeof merged.filmNoise !== 'number' || !Number.isFinite(merged.filmNoise)) {
+        merged.filmNoise = def.filmNoise;
+      }
+      merged.filmNoise = Math.min(1, Math.max(0, merged.filmNoise));
       return merged;
     }
   } catch { /* ignore */ }
@@ -170,6 +190,7 @@ export function defaultSettings(): Settings {
     sensitivity: 1.0, invertY: false,
     subtitles: true, colorblind: false, gyro: false, fov: 75,
     proximityTell: 'off',
+    filmNoise: 1,
     advisoryAck: false,
   };
 }
