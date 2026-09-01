@@ -1116,7 +1116,11 @@ export class RenderPipeline {
         col *= mix(1.0, scan, (0.06 + s * 0.16 + uViewfinder * 0.42) * uNoise);
 
         // ---- signal noise -------------------------------------------------
-        // Was `s * (0.09 + edge * 0.45)`, which at high fear replaced up to 54% of
+        // NOTE: no backticks anywhere in this shader source — it lives inside a JS
+        // template literal, so a stray backtick silently terminates the string and
+        // the file stops parsing.
+        //
+        // Was s * (0.09 + edge * 0.45), which at high fear replaced up to 54% of
         // every peripheral pixel with white noise and 9% of the centre. Stacked on
         // top of film grain, scanlines and dropout rows, the frame stopped being an
         // image. Geometry, materials and lighting are supposed to carry this game;
@@ -1125,7 +1129,7 @@ export class RenderPipeline {
         // Three changes: the periphery ramp is cut from 0.45 to 0.10, the whole term
         // is squared so it stays near zero through the low- and mid-fear states where
         // most of the playtime is, and the ceiling drops from 0.90 to 0.30 so an
-        // image always survives. `uNoise` scales all of it for the accessibility
+        // image always survives. uNoise scales all of it for the accessibility
         // setting.
         float n = hash12(uv * vec2(1920.0, 1080.0) + fract(uTime) * 371.0);
         float edge = smoothstep(0.25, 0.85, length(cc) * 1.6);
@@ -1627,6 +1631,7 @@ export class RenderPipeline {
   setGrade(opts: {
     bloom?: number; streak?: number; volumetric?: number; ao?: number;
     grain?: number; vignette?: number; dofRange?: [number, number]; dof?: number;
+    noise?: number;
   }): void {
     const u = this.compositePass.u;
     if (opts.bloom !== undefined) u.uBloomStrength.value = opts.bloom;
@@ -1634,6 +1639,7 @@ export class RenderPipeline {
     if (opts.volumetric !== undefined) u.uVolStrength.value = opts.volumetric;
     if (opts.ao !== undefined) u.uAoStrength.value = opts.ao;
     if (opts.grain !== undefined) u.uGrain.value = opts.grain;
+    if (opts.noise !== undefined) u.uNoise.value = opts.noise;
     if (opts.vignette !== undefined) u.uVignette.value = opts.vignette;
     if (opts.dof !== undefined) u.uDofStrength.value = opts.dof;
     if (opts.dofRange) (u.uDofRange.value as THREE.Vector2).set(opts.dofRange[0], opts.dofRange[1]);
