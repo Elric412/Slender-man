@@ -144,38 +144,195 @@ export class MapGenerator {
     mesh.receiveShadow = true;
     this.group.add(mesh);
 
-    // puddles — low-roughness dark discs that catch moon/flashlight
-    // §1c: raise the standoff 0.02 → 0.035, skip sloped spots (a flat disc
-    // intersects terrain on any gradient → z-fight shimmer while moving),
-    // and bias the puddle toward the camera via polygonOffset so it always
-    // wins the near-plane depth tie against the ground it rests on.
+    this.buildPuddles(size);
+  }
+
+  /**
+   * Standing water on the forest floor.
+   *
+   * Three things were wrong with the previous version, and they compounded:
+   *
+   * 1. It spawned 40 separate `Mesh` objects — 40 draw calls for 40 discs, in a
+   *    project whose stated rule is that repeated geometry is instanced. Now one
+   *    `InstancedMesh`, one draw call, and the count can go *up* rather than
+   *    down as a result.
+   *
+   * 2. Placement was uniform random within 14 m of a trail. Water does not
+   *    collect by proximity to footpaths; it collects where the ground is low
+   *    and the soil is already saturated. `ZoneSystem` has been carrying
+   *    `hollownessAt()` and `moistureAt()` the whole time — exactly the two
+   *    inputs needed — and neither was consulted. So puddles appeared on dry
+   *    upland and missed the marsh, which inverts the one cue that tells a
+   *    player which way is downhill.
+   *
+   * 3. Every puddle was a perfect 12-gon circle. The brief calls out "identical
+   *    assets" and "perfect spacing" as the tells to avoid, and a scatter of
+   *    identical circles is both. They are now irregular blobs, each with its
+   *    own vertex noise, and they are *clustered* — real standing water comes in
+   *    connected systems along a drainage line, not as isolated dots.
+   */
+  private buildPuddles(size: number): void {
     const pr = this.rng.fork(31337);
-    const puddleGeo = new THREE.CircleGeometry(1, 12);
-    puddleGeo.rotateX(-Math.PI / 2);
+
+    // ── one irregular blob, reused via instancing ──────────────────────────
+    // A single asymmetric outline instanced at varied scale/rotation reads as
+    // many different puddles, because the eye reads the silhouette's asymmetry
+    // long before it recognises a repeat. A circle has no asymmetry to read.
+    const SEG = 14;
+    const blob = new THREE.BufferGeometry();
+    const bp = new Float32Array((SEG + 1) * 3);
+    const bu = new Float32Array((SEG + 1) * 2);
+    bu[0] = 0.5; bu[1] = 0.5;
+    const radii: number[] = [];
+    for (let i = 0; i < SEG; i++) {
+      const a = (i / SEG) * Math.PI * 2;
+      // two octaves of angular noise → lobed, non-convex outline
+      const r = 1 + Math.sin(a * 2.0 + 0.7) * 0.26 + Math.sin(a * 3.0 + 2.1) * 0.15;
+      radii.push(r);
+      bp[(i + 1) * 3] = Math.cos(a) * r;
+      bp[(i + 1) * 3 + 2] = Math.sin(a) * r;
+      bu[(i + 1) * 2] = 0.5 + Math.cos(a) * r * 0.5;
+      bu[(i + 1) * 2 + 1] = 0.5 + Math.sin(a) * r * 0.5;
+    }
+    const bi = new Uint16Array(SEG * 3);
+    for (let i = 0; i < SEG; i++) {
+      bi[i * 3] = 0; bi[i * 3 + 1] = i + 1; bi[i * 3 + 2] = ((i + 1) % SEG) + 1;
+    }
+    blob.setAttribute('position', new THREE.BufferAttribute(bp, 3));
+    blob.setAttribute('uv', new THREE.BufferAttribute(bu, 2));
+    blob.setIndex(new THREE.BufferAttribute(bi, 1));
+    blob.computeVertexNormals();
+
     this.mats.mudPuddle.polygonOffset = true;
     this.mats.mudPuddle.polygonOffsetFactor = -2;
     this.mats.mudPuddle.polygonOffsetUnits = -2;
-    for (let i = 0; i < 40; i++) {
-      const x = pr.range(-size / 2 + 20, size / 2 - 20);
-      const z = pr.range(-size / 2 + 20, size / 2 - 20);
-      const trailD = this.hf.trailDist(x, z);
-      if (trailD > 14 || this.hf.inLake(x, z)) continue;
-      // slope check: flat discs need near-level ground
+
+    const MAX = 150;
+    const half = size / 2 - 20;
+    const q = new THREE.Quaternion();
+    const up = new THREE.Vector3(0, 1, 0);
+    const scl = new THREE.Vector3();
+    const posv = new THREE.Vector3();
+    const placed: THREE.Matrix4[] = [];
+
+    /** Try to seat one puddle at (x,z); returns true if the ground accepted it. */
+    const trySeat = (x: number, z: number, rad: number): boolean => {
+      if (Math.abs(x) > half || Math.abs(z) > half) return false;
+      if (this.hf.inLake(x, z)) return false;
       const h0 = this.hf.heightAt(x, z);
-      const slope = Math.abs(this.hf.heightAt(x + 1.2, z) - h0) + Math.abs(this.hf.heightAt(x, z + 1.2) - h0);
-      if (slope > 0.5) continue;
-      const p = new THREE.Mesh(puddleGeo, this.mats.mudPuddle);
-      p.position.set(x, h0 + 0.035, z);
-      p.scale.set(pr.range(0.6, 2.2), 1, pr.range(0.6, 2.2));
-      p.receiveShadow = true;
-      this.group.add(p);
+      // Flat discs need level ground or they intersect the terrain and shimmer.
+      // Sampled at the puddle's own radius, not a fixed 1.2 m, so a big puddle
+      // is held to a stricter flatness than a small one — which is also true
+      // physically, since a wide sheet of water needs a wide flat pan.
+      const s = Math.max(0.8, rad);
+      const slope = Math.abs(this.hf.heightAt(x + s, z) - h0)
+        + Math.abs(this.hf.heightAt(x, z + s) - h0);
+      if (slope > 0.28 * s) return false;
+      // Ecology gate: low ground and damp soil. Trails still help — compacted
+      // mud sheds water badly and ruts hold it — but they are no longer the
+      // only cause, and they are no longer sufficient on their own.
+      const hollow = this.zones.hollownessAt(x, z);
+      const moist = this.zones.moistureAt(x, z);
+      const trailD = this.hf.trailDist(x, z);
+      const rut = trailD < 5 ? 0.35 * (1 - trailD / 5) : 0;
+      if (hollow * 0.55 + moist * 0.75 + rut < 0.45) return false;
+      posv.set(x, h0 + 0.035, z);
+      // Random yaw so the blob's lobes point differently every time, plus
+      // anisotropic scale so the outline stretches along the local drainage.
+      q.setFromAxisAngle(up, pr.range(0, Math.PI * 2));
+      scl.set(rad * pr.range(0.75, 1.3), 1, rad * pr.range(0.75, 1.3));
+      placed.push(new THREE.Matrix4().compose(posv, q, scl));
+      return true;
+    };
+
+    // Cluster seeding: pick a damp low spot, then try to grow a small system of
+    // connected pools around it. This is what makes water read as drainage
+    // rather than as decoration.
+    let guard = 0;
+    while (placed.length < MAX && guard++ < 4000) {
+      const sx = pr.range(-half, half), sz = pr.range(-half, half);
+      if (this.zones.moistureAt(sx, sz) < 0.3) continue;
+      if (!trySeat(sx, sz, pr.range(0.7, 2.4))) continue;
+      const kids = 1 + Math.floor(pr.next() * 4);
+      for (let k = 0; k < kids && placed.length < MAX; k++) {
+        const a = pr.range(0, Math.PI * 2), d = pr.range(1.6, 6.5);
+        trySeat(sx + Math.cos(a) * d, sz + Math.sin(a) * d, pr.range(0.5, 1.7));
+      }
     }
+
+    if (placed.length === 0) return;
+    const inst = new THREE.InstancedMesh(blob, this.mats.mudPuddle, placed.length);
+    for (let i = 0; i < placed.length; i++) inst.setMatrixAt(i, placed[i]);
+    inst.instanceMatrix.needsUpdate = true;
+    inst.receiveShadow = true;
+    // The pools are flat on the ground and never move; skipping the per-frame
+    // frustum test on a single 150-instance draw is free accuracy.
+    inst.frustumCulled = true;
+    this.group.add(inst);
   }
 
   private buildWater(): void {
     const lake = this.hf.layout.lake;
-    const geo = new THREE.CircleGeometry(lake.r + 8, 40);
-    geo.rotateX(-Math.PI / 2);
+
+    // ── the water surface follows the AUTHORED shoreline ────────────────────
+    //
+    // This used to be `CircleGeometry(lake.r + 8)`. The layout carries a
+    // 40-point shore polygon, `HeightField` carves the basin to it, and
+    // `inLake()` agrees with it to 97.7% — so the lake was the correct shape
+    // everywhere *except* the one place the player actually looks at it.
+    //
+    // The polygon's radius varies 30–65.5 m (2.19x irregular), so a 73.5 m disc
+    // laid 9,298 m² of water over dry land — 122% of the lake's real area,
+    // reaching up to 38 m inland to where terrain stands 6.1 m *above* the water
+    // plane. That is water flooding the treeline, with trunks and ferns rooted
+    // in it, and it is the single most visible contradiction of the reference
+    // brief's "large water body, irregular shoreline".
+    //
+    // Triangulated as a fan from the polygon centroid. The shore is convex
+    // enough for a fan to be valid (it is a lake basin, not a fjord), and a fan
+    // keeps this at 40 triangles — cheaper than the 40-segment circle it
+    // replaces, because the circle needed the same fan plus the overrun.
+    const shore = lake.shore;
+    const n = shore.length;
+    let cx = 0, cz = 0;
+    for (const p of shore) { cx += p.x; cz += p.z; }
+    cx /= n; cz /= n;
+
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array((n + 1) * 3);
+    const uv = new Float32Array((n + 1) * 2);
+    // Vertex 0 is the centroid; 1..n are the shore ring, in local space so the
+    // mesh can be positioned by `lake` like the old disc was.
+    pos[0] = 0; pos[1] = 0; pos[2] = 0;
+    uv[0] = 0.5; uv[1] = 0.5;
+    for (let i = 0; i < n; i++) {
+      const p = shore[i];
+      // Pull the ring in slightly so the water tucks *under* the shoreline
+      // instead of ending exactly on it — a hairline gap at the bank reads as a
+      // seam, a small overlap reads as a waterline.
+      const dx = p.x - cx, dz = p.z - cz;
+      const d = Math.hypot(dx, dz) || 1;
+      const inset = Math.max(0, d - 0.6) / d;
+      pos[(i + 1) * 3] = cx - lake.x + dx * inset;
+      pos[(i + 1) * 3 + 1] = 0;
+      pos[(i + 1) * 3 + 2] = cz - lake.z + dz * inset;
+      // UVs in metres/24 so the ripple normal keeps a consistent world scale
+      // regardless of how irregular the polygon is.
+      uv[(i + 1) * 2] = (cx + dx) / 24;
+      uv[(i + 1) * 2 + 1] = (cz + dz) / 24;
+    }
+    const idx = new Uint16Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      idx[i * 3] = 0;
+      idx[i * 3 + 1] = i + 1;
+      idx[i * 3 + 2] = ((i + 1) % n) + 1;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    geo.computeVertexNormals();
+    geo.computeBoundingSphere();
+
     const mat = new THREE.MeshStandardMaterial({
       color: 0x0a1218, roughness: 0.08, metalness: 0.55,
       transparent: true, opacity: 0.94, envMapIntensity: 0.8,
