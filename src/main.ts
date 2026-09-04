@@ -868,6 +868,40 @@ class StaticGame {
    * makes the cost independent of refresh rate, matching how the entity brain and
    * the rest of the engine are governed.
    */
+  /**
+   * Mirror real game state onto the on-screen touch controls' indicator rings.
+   *
+   * The input layer cannot do this correctly. It only knows a finger landed on
+   * a button, not whether the action took effect — tapping LAMP with a flat
+   * battery, or MAP while the survey sheet is refused, changes nothing — so
+   * rings driven from touch events report intent and then drift. The previous
+   * implementation had exactly that failure: the flashlight ring latched on at
+   * the first tap and stayed lit while the lamp was off, dead and recharging.
+   *
+   * Driving it from here instead means the ring is a readout, not a button
+   * highlight, and it cannot disagree with the world. `setToggleState` uses
+   * forced `classList.toggle`, which is a no-op when the class already matches,
+   * so calling this per frame costs a handful of string compares and touches
+   * the DOM only on genuine transitions.
+   *
+   * Guarded by `input.isTouch` at the call site so desktop pays nothing at all.
+   */
+  private pushTouchIndicators(inp: InputFrame): void {
+    // The lamp is "spent" once the cell is too flat to strike the filament. The
+    // Flashlight's own electrical model gives up below ~2%, so showing the
+    // control as unavailable there matches what pressing it would actually do.
+    this.menu.setToggleState('tb-flash', this.flashlight.on, this.flashlight.battery <= 0.02);
+    this.menu.setToggleState('tb-crouch', this.player.crouched);
+    // Sprint reflects the *player*, not the button: holding RUN while standing
+    // still, while crouched, or with no stamina left does not sprint, and the
+    // ring should not claim otherwise.
+    this.menu.setToggleState('tb-sprint', this.player.sprinting);
+    this.menu.setToggleState('tb-vf', inp.vfHeld);
+    // tb-map is owned by Menu.setMapVisible, which is the only place that knows
+    // whether the sheet actually opened. tb-interact and tb-pause are momentary
+    // and have no latched state to report.
+  }
+
   private updateSurvey(dt: number): void {
     if (!this.survey) return;
     this.surveyAcc += dt;
@@ -1624,6 +1658,7 @@ class StaticGame {
     this.menu.setAudioCues(this.cueTexts);
     this.menu.setViewfinder(inp.vfHeld, 4);
     this.menu.setHudChrome(this.runTime, this.flashlight.battery);
+    if (this.input.isTouch) this.pushTouchIndicators(inp);
     this.updateSurvey(dt);
     if (this.perfVisible) {
       const st = this.loop.stats();

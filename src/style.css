@@ -266,10 +266,31 @@ body.cb .proximity-tell.pt-imminent .pt-label { color: #ff9d7a; }
   .proximity-tell { transition: none; }
 }
 
+/* This prompt only ever appears on a portrait phone, which is precisely the
+   viewport where a horizontally-centred box at `top: 12px` runs straight
+   through `.hud-chrome` — that lives at `top: 20px; left: 28px` and spells out
+   "REC 00:00:00 BATT nn%" at 13px with 0.3em tracking, so on a ~390px-wide
+   screen the two overlap into an unreadable smear of interleaved words.
+   Neither element can be made narrower enough to fix that, because the collision
+   is horizontal and both strings are fixed-length.
+   So it is resolved vertically instead: the prompt is parked on its own line
+   *below* the camcorder chrome, which also reads better — it becomes another
+   line of camera status rather than a floating banner. `max-width` and wrapping
+   keep it inside the narrowest phone; `pointer-events: none` keeps it from
+   eating a look-drag that starts near the top of the screen. */
 .rotate-prompt {
-  position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
+  position: absolute;
+  left: 50%; transform: translateX(-50%);
+  top: calc(48px + env(safe-area-inset-top));
+  max-width: calc(100vw - 24px);
+  text-align: center; text-wrap: balance;
   font-size: 11px; letter-spacing: 0.2em; color: var(--ink-dim); background: rgba(5,7,10,0.7);
   border: 1px solid #1d2429; padding: 8px 16px; z-index: 30;
+  pointer-events: none;
+}
+/* Very narrow phones: drop the tracking before dropping the legibility. */
+@media (max-width: 400px) {
+  .rotate-prompt { font-size: 10px; letter-spacing: 0.1em; padding: 6px 10px; }
 }
 
 .perf-overlay {
@@ -350,14 +371,49 @@ body.cb .map-status { color: #8fdcea; }
   background: rgba(154,165,173,0.35); transform: translate(-50%,-50%);
 }
 .touch-buttons { position: absolute; right: calc(14px + env(safe-area-inset-right)); bottom: calc(40px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(2, 64px); gap: 12px; pointer-events: auto; }
+/* Sized for the four-letter TEXT labels the buttons now carry (LAMP/TAKE/CRCH/
+   RUN/VIEW/MAP), not for the emoji glyphs they used to. 22px was chosen when a
+   single pictogram had to fill the disc; four mono characters at 22px overflow a
+   64px circle. 11px with a little tracking centres four characters inside the
+   disc with breathing room, and matches the 11-13px scale the rest of the HUD
+   chrome already uses so the controls read as part of the same camera overlay.
+   Deliberately dim by default: these sit over the darkest part of the frame and
+   must never out-brighten the flashlight. `:active`/`.active` are the only
+   states that reach for the amber accent. */
 .tbtn {
   width: 64px; height: 64px; border-radius: 50%; border: 1px solid rgba(154,165,173,0.35);
-  background: rgba(10,13,16,0.45); color: var(--ink); font-size: 22px; font-family: var(--mono);
+  background: rgba(10,13,16,0.45); color: var(--ink); font-family: var(--mono);
+  font-size: 11px; letter-spacing: 0.06em; line-height: 1;
+  text-shadow: 0 0 4px rgba(0,0,0,0.9);
   pointer-events: auto; user-select: none;
 }
-.tbtn:active { background: rgba(200,185,138,0.25); border-color: var(--accent); }
-.tbtn.small { font-size: 15px; }
-.tbtn.active { border-color: var(--accent); color: var(--accent); }
+.tbtn.small { font-size: 14px; letter-spacing: 0.12em; }
+
+/* Transient press feedback. `:active` alone is unreliable for touch — some
+   mobile browsers only apply it after a delay, or drop it while a scroll
+   gesture is being disambiguated — so Input.ts mirrors it with an explicit
+   `.pressed` class that is added on touchstart and removed on both touchend
+   and touchcancel. Both selectors are listed so mouse/stylus and touch behave
+   identically. This says "your finger landed", nothing more. */
+.tbtn:active,
+.tbtn.pressed { background: rgba(200,185,138,0.25); border-color: var(--accent); }
+
+/* Latched state: the thing this button controls is genuinely ON right now.
+   Written only by Menu.setToggleState from the game's own state — never from
+   the input layer — so a lit ring always means a lit lamp, an open map or a
+   crouched player. Brighter than `.pressed` and it also fills, because it has
+   to be readable at a glance in peripheral vision while the player is looking
+   at the forest rather than at their thumb. */
+.tbtn.active {
+  border-color: var(--accent); color: var(--accent);
+  background: rgba(200,185,138,0.14);
+  box-shadow: 0 0 8px rgba(200,185,138,0.18);
+}
+
+/* Depleted/unavailable — e.g. the lamp with a flat battery. Reads as "this
+   control exists but will not do anything", which is more honest than leaving
+   it looking identical to a working button. */
+.tbtn.spent { opacity: 0.4; border-color: rgba(154,165,173,0.18); }
 
 @media (max-width: 760px) {
   .menu-btn { min-width: 240px; padding: 12px 20px; font-size: 13px; }
@@ -393,5 +449,6 @@ body.cb .map-status { color: #8fdcea; }
      landscape phone. 4 columns keeps it to 2 rows, same as before the map button
      existed. */
   .touch-buttons { bottom: calc(16px + env(safe-area-inset-bottom)); grid-template-columns: repeat(4, 56px); }
-  .tbtn { width: 56px; height: 56px; font-size: 18px; }
+  .tbtn { width: 56px; height: 56px; font-size: 10px; letter-spacing: 0.03em; }
+  .tbtn.small { font-size: 13px; }
 }
