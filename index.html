@@ -285,13 +285,25 @@
     <!-- touch controls -->
     <div id="touch-ui" class="hidden">
       <div id="stick-zone"><div id="stick-base"><div id="stick-nub"></div></div></div>
+      <!--
+        Labels are TEXT, not emoji. The codepoints these buttons used to carry
+        (U+1F526 torch, U+270B raised hand, U+2B07 down arrow, U+23E9
+        fast-forward, U+231A watch, U+1F5FA map) are drawn by the OS from its
+        own colour emoji font, so they arrive as saturated blue/yellow/orange
+        cartoon discs sitting on top of a near-black forest. On a phone they
+        were the brightest pixels on screen — brighter than the moon, brighter
+        than the flashlight — and they read as a toy app rather than found
+        footage. Short stencil words in the HUD's own mono face cost nothing,
+        inherit the amber/ink palette, sit visually with the REC/BATT chrome
+        that is already on screen, and stay localisable through aria-label.
+      -->
       <div class="touch-buttons">
-        <button id="tb-flash" class="tbtn" aria-label="flashlight">&#128294;</button>
-        <button id="tb-interact" class="tbtn" aria-label="interact">&#9995;</button>
-        <button id="tb-crouch" class="tbtn" aria-label="crouch">&#11015;</button>
-        <button id="tb-sprint" class="tbtn" aria-label="sprint">&#9193;</button>
-        <button id="tb-vf" class="tbtn" aria-label="viewfinder">&#8986;</button>
-        <button id="tb-map" class="tbtn" aria-label="survey map">&#128506;</button>
+        <button id="tb-flash" class="tbtn" aria-label="flashlight">LAMP</button>
+        <button id="tb-interact" class="tbtn" aria-label="interact">TAKE</button>
+        <button id="tb-crouch" class="tbtn" aria-label="crouch">CRCH</button>
+        <button id="tb-sprint" class="tbtn" aria-label="sprint">RUN</button>
+        <button id="tb-vf" class="tbtn" aria-label="viewfinder">VIEW</button>
+        <button id="tb-map" class="tbtn" aria-label="survey map">MAP</button>
         <button id="tb-pause" class="tbtn small" aria-label="pause">II</button>
       </div>
     </div>
