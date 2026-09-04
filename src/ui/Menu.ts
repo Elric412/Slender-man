@@ -304,6 +304,31 @@ export class Menu {
     this.el('touch-ui').classList.toggle('hidden', !on);
   }
 
+  /**
+   * Push the latched state of a touch button's indicator ring.
+   *
+   * The input layer deliberately does not do this. It only knows that a finger
+   * touched a button, not whether the resulting action succeeded — tapping the
+   * lamp with a dead battery, or the map while a cutscene owns the screen, both
+   * change nothing — so a ring driven from touch events reports *intent* and
+   * drifts out of sync with reality. That is precisely the bug this replaces:
+   * the flashlight ring latched on at the first tap and stayed lit through the
+   * lamp being off, flat and recharging.
+   *
+   * Cheap enough to call every frame: `classList.toggle` with an explicit force
+   * argument is a no-op when the class is already in the wanted state, so this
+   * touches the DOM only on actual transitions.
+   *
+   * @param on      the control is currently engaged
+   * @param spent   the control exists but cannot act (e.g. flat battery)
+   */
+  setToggleState(id: string, on: boolean, spent = false): void {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle('active', on);
+    el.classList.toggle('spent', spent);
+  }
+
   // ---------- survey map ----------
   //
   // The Menu owns only visibility and the status line. The sheet itself is drawn
@@ -326,8 +351,7 @@ export class Menu {
     const el = this.els.get('map-overlay');
     if (!el) return;
     el.classList.toggle('hidden', !on);
-    const tb = document.getElementById('tb-map');
-    if (tb) tb.classList.toggle('active', on);
+    this.setToggleState('tb-map', on);
   }
 
   setMapStatus(text: string): void {
