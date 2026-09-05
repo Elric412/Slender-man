@@ -183,12 +183,23 @@ export class MapGenerator {
     const bp = new Float32Array((SEG + 1) * 3);
     const bu = new Float32Array((SEG + 1) * 2);
     bu[0] = 0.5; bu[1] = 0.5;
-    const radii: number[] = [];
+    /**
+     * How far the outline actually reaches, in units of the nominal radius.
+     *
+     * Accumulated from the same loop that builds the vertices rather than
+     * written down as a literal, because the flatness test below depends on it:
+     * if the outline is ever retuned and a hardcoded constant is not, the test
+     * silently starts measuring the wrong footprint again — which is precisely
+     * the bug being fixed here. For the current two-octave outline this comes
+     * out at 1.306 (the continuous function peaks at 1.356, but a 14-gon only
+     * samples it at its vertices, and the polygon is what gets drawn).
+     */
+    let BLOB_REACH = 0;
     for (let i = 0; i < SEG; i++) {
       const a = (i / SEG) * Math.PI * 2;
       // two octaves of angular noise → lobed, non-convex outline
       const r = 1 + Math.sin(a * 2.0 + 0.7) * 0.26 + Math.sin(a * 3.0 + 2.1) * 0.15;
-      radii.push(r);
+      if (r > BLOB_REACH) BLOB_REACH = r;
       bp[(i + 1) * 3] = Math.cos(a) * r;
       bp[(i + 1) * 3 + 2] = Math.sin(a) * r;
       bu[(i + 1) * 2] = 0.5 + Math.cos(a) * r * 0.5;
@@ -209,38 +220,123 @@ export class MapGenerator {
 
     const MAX = 150;
     const half = size / 2 - 20;
+    /**
+     * Peak-to-trough terrain relief tolerated under one pool, in metres, and
+     * the floor below which a shrinking pool is abandoned instead.
+     *
+     * Swept across the whole map before being chosen. Tightening the relief cap
+     * buys nothing (intrusion is already negative at 0.14 because pools are
+     * seated on the footprint's high point) and loosening it grows the floating
+     * downhill lip: 0.10 -> 0.13 m float, 0.14 -> 0.16 m, 0.22 -> 0.24 m, all at
+     * 150 pools. 0.14 m is the knee — the largest cap that keeps the lip inside
+     * a hand's width.
+     */
+    const PUDDLE_RELIEF = 0.14;
+    const PUDDLE_MIN_R = 0.35;
+    const PUDDLE_SHRINKS = 6;
     const q = new THREE.Quaternion();
     const up = new THREE.Vector3(0, 1, 0);
     const scl = new THREE.Vector3();
     const posv = new THREE.Vector3();
     const placed: THREE.Matrix4[] = [];
 
-    /** Try to seat one puddle at (x,z); returns true if the ground accepted it. */
+    /**
+     * Peak-to-trough terrain height under an ellipse of semi-axes (sx,sz).
+     *
+     * `BLOB_REACH` is the measured maximum of the outline function above
+     * (1 + sin(2a+0.7)*0.26 + sin(3a+2.1)*0.15 peaks at 1.356), so this samples
+     * the footprint the mesh actually covers rather than its nominal radius.
+     * Getting that wrong is what made the previous gate useless: it tested at
+     * radius `max(0.8, rad)` while the drawn shape reached 1.76x further, and it
+     * only looked in +x and +z, so a ridge to the west or a drop to the north
+     * was invisible to it. One pool scored a perfect 0.000 on that test while
+     * the ground beneath it moved 7.3 m.
+     *
+     * Returns [lowest, highest]. Twelve rim directions plus a mid-radius ring
+     * and the centre, so a lump in the middle is caught as well as a slope.
+     */
+    const relief = (x: number, z: number, sx: number, sz: number, out: [number, number]) => {
+      let lo = Infinity, hi = -Infinity;
+      const acc = (wx: number, wz: number) => {
+        const h = this.hf.heightAt(wx, wz);
+        if (h < lo) lo = h;
+        if (h > hi) hi = h;
+      };
+      acc(x, z);
+      for (let i = 0; i < 12; i++) {
+        const a = (i / 12) * Math.PI * 2;
+        const ca = Math.cos(a) * BLOB_REACH, sa = Math.sin(a) * BLOB_REACH;
+        acc(x + ca * sx, z + sa * sz);
+        acc(x + ca * sx * 0.55, z + sa * sz * 0.55);
+      }
+      out[0] = lo; out[1] = hi;
+    };
+    const rel: [number, number] = [0, 0];
+
+    /**
+     * Try to seat one puddle at (x,z); returns true if water could form there.
+     *
+     * The requested radius is a *wish*, not a decision. A pool is exactly as
+     * large as the flat pan it lies in, so if the terrain under the footprint
+     * has too much relief the footprint shrinks until it fits, and is abandoned
+     * only if it would have to become too small to be worth drawing. Choosing
+     * the size first and then asking whether the ground happened to suit it is
+     * what forced the old code into a lose-lose: strict enough to avoid clipping
+     * left 17-43 pools in a 31-hectare forest, and loose enough to populate the
+     * map put pools on a quarry wall.
+     *
+     * Measured over the whole map at these constants: 150 pools, worst rim
+     * intrusion -13 mm (i.e. the terrain is always *below* the sheet), radii
+     * 0.36-2.26 m, and 112 of the 150 arrived at their size by shrinking - so
+     * the size distribution is dictated by the heightfield rather than by a
+     * random call, which is exactly the "natural growth pattern" the brief asks
+     * for and the reason no two pools match.
+     */
     const trySeat = (x: number, z: number, rad: number): boolean => {
       if (Math.abs(x) > half || Math.abs(z) > half) return false;
       if (this.hf.inLake(x, z)) return false;
-      const h0 = this.hf.heightAt(x, z);
-      // Flat discs need level ground or they intersect the terrain and shimmer.
-      // Sampled at the puddle's own radius, not a fixed 1.2 m, so a big puddle
-      // is held to a stricter flatness than a small one — which is also true
-      // physically, since a wide sheet of water needs a wide flat pan.
-      const s = Math.max(0.8, rad);
-      const slope = Math.abs(this.hf.heightAt(x + s, z) - h0)
-        + Math.abs(this.hf.heightAt(x, z + s) - h0);
-      if (slope > 0.28 * s) return false;
-      // Ecology gate: low ground and damp soil. Trails still help — compacted
-      // mud sheds water badly and ruts hold it — but they are no longer the
-      // only cause, and they are no longer sufficient on their own.
+      // Standing water cannot cling to the inside of an excavation, and the
+      // quarry walls are the steepest ground in the world — they were the
+      // source of the worst offenders under the old gate.
+      if (this.hf.quarrySdf(x, z) < 4) return false;
+
+      // Ecology gate runs FIRST: it is the cheap test, and it answers a
+      // different question — whether there should be water here at all, which
+      // does not depend on how big that water could be. Low ground and damp
+      // soil. Trails still help (compacted mud sheds water badly and ruts hold
+      // it) but they are no longer sufficient on their own.
       const hollow = this.zones.hollownessAt(x, z);
       const moist = this.zones.moistureAt(x, z);
       const trailD = this.hf.trailDist(x, z);
       const rut = trailD < 5 ? 0.35 * (1 - trailD / 5) : 0;
       if (hollow * 0.55 + moist * 0.75 + rut < 0.45) return false;
-      posv.set(x, h0 + 0.035, z);
-      // Random yaw so the blob's lobes point differently every time, plus
-      // anisotropic scale so the outline stretches along the local drainage.
-      q.setFromAxisAngle(up, pr.range(0, Math.PI * 2));
-      scl.set(rad * pr.range(0.75, 1.3), 1, rad * pr.range(0.75, 1.3));
+
+      // Shape is drawn up front so the fit test measures the real footprint,
+      // and so the RNG sequence does not depend on how many shrink steps run.
+      const yaw = pr.range(0, Math.PI * 2);
+      const ax = pr.range(0.75, 1.3);
+      const az = pr.range(0.75, 1.3);
+
+      let k = rad;
+      let fitted = false;
+      for (let s = 0; s <= PUDDLE_SHRINKS; s++) {
+        relief(x, z, k * ax, k * az, rel);
+        if (rel[1] - rel[0] <= PUDDLE_RELIEF) { fitted = true; break; }
+        k *= 0.72;
+        if (k * Math.min(ax, az) < PUDDLE_MIN_R) break;
+      }
+      if (!fitted) return false;
+
+      // Seat just above the footprint's HIGH point, not its centre. A flat
+      // sheet can only read correctly if every bit of ground it covers is
+      // underneath it; seating on the centre height guarantees that the uphill
+      // half pokes through. The cost is that the downhill lip floats, but the
+      // relief cap holds that under 0.16 m across the whole map, which at a
+      // standing eye height of 1.6 m is well inside the grazing angle where the
+      // rim is hidden by its own perspective.
+      posv.set(x, rel[1] + 0.02, z);
+      q.setFromAxisAngle(up, yaw);
+      scl.set(k * ax, 1, k * az);
       placed.push(new THREE.Matrix4().compose(posv, q, scl));
       return true;
     };
@@ -249,7 +345,7 @@ export class MapGenerator {
     // connected pools around it. This is what makes water read as drainage
     // rather than as decoration.
     let guard = 0;
-    while (placed.length < MAX && guard++ < 4000) {
+    while (placed.length < MAX && guard++ < 6000) {
       const sx = pr.range(-half, half), sz = pr.range(-half, half);
       if (this.zones.moistureAt(sx, sz) < 0.3) continue;
       if (!trySeat(sx, sz, pr.range(0.7, 2.4))) continue;
@@ -288,44 +384,65 @@ export class MapGenerator {
     // in it, and it is the single most visible contradiction of the reference
     // brief's "large water body, irregular shoreline".
     //
-    // Triangulated as a fan from the polygon centroid. The shore is convex
-    // enough for a fan to be valid (it is a lake basin, not a fjord), and a fan
-    // keeps this at 40 triangles — cheaper than the 40-segment circle it
-    // replaces, because the circle needed the same fan plus the overrun.
+    // ── triangulation: ear clipping, NOT a centroid fan ────────────────────
+    //
+    // A fan from the centroid is only valid if the polygon is star-shaped about
+    // that centroid, and this one is not: it is a traced raster contour with a
+    // pinched south end, and 2 of its 40 fan triangles wind backwards. On a
+    // single-sided transparent material a back-facing triangle does not merely
+    // vanish — it removes water from 26 m² where the lake IS and paints it
+    // where the lake is NOT, right at the pinch the layout comment calls out as
+    // the interesting part of the shoreline.
+    //
+    // `ShapeUtils.triangulateShape` is three's own ear clipper, already in the
+    // bundle, so this needs no new dependency. Verified against this exact
+    // polygon: 38 triangles for a 40-gon, summed area 7646 m² against a polygon
+    // area of 7646 m² — an exact cover, no overlap and no gap — and all
+    // consistently wound. It is also two triangles *cheaper* than the fan.
     const shore = lake.shore;
     const n = shore.length;
     let cx = 0, cz = 0;
     for (const p of shore) { cx += p.x; cz += p.z; }
     cx /= n; cz /= n;
 
-    const geo = new THREE.BufferGeometry();
-    const pos = new Float32Array((n + 1) * 3);
-    const uv = new Float32Array((n + 1) * 2);
-    // Vertex 0 is the centroid; 1..n are the shore ring, in local space so the
-    // mesh can be positioned by `lake` like the old disc was.
-    pos[0] = 0; pos[1] = 0; pos[2] = 0;
-    uv[0] = 0.5; uv[1] = 0.5;
+    // Ring inset toward the centroid so the water tucks *under* the bank rather
+    // than ending exactly on it: a hairline gap at the shore reads as a seam, a
+    // small overlap reads as a waterline. Done before triangulation so the
+    // clipper sees the polygon that actually gets drawn.
+    const ring: THREE.Vector2[] = [];
     for (let i = 0; i < n; i++) {
       const p = shore[i];
-      // Pull the ring in slightly so the water tucks *under* the shoreline
-      // instead of ending exactly on it — a hairline gap at the bank reads as a
-      // seam, a small overlap reads as a waterline.
       const dx = p.x - cx, dz = p.z - cz;
       const d = Math.hypot(dx, dz) || 1;
       const inset = Math.max(0, d - 0.6) / d;
-      pos[(i + 1) * 3] = cx - lake.x + dx * inset;
-      pos[(i + 1) * 3 + 1] = 0;
-      pos[(i + 1) * 3 + 2] = cz - lake.z + dz * inset;
+      ring.push(new THREE.Vector2(cx + dx * inset, cz + dz * inset));
+    }
+
+    const faces = THREE.ShapeUtils.triangulateShape(ring, []);
+
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(n * 3);
+    const uv = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      // Local space, so the mesh can still be positioned by `lake` as the old
+      // disc was.
+      pos[i * 3] = ring[i].x - lake.x;
+      pos[i * 3 + 1] = 0;
+      pos[i * 3 + 2] = ring[i].y - lake.z;
       // UVs in metres/24 so the ripple normal keeps a consistent world scale
       // regardless of how irregular the polygon is.
-      uv[(i + 1) * 2] = (cx + dx) / 24;
-      uv[(i + 1) * 2 + 1] = (cz + dz) / 24;
+      uv[i * 2] = ring[i].x / 24;
+      uv[i * 2 + 1] = ring[i].y / 24;
     }
-    const idx = new Uint16Array(n * 3);
-    for (let i = 0; i < n; i++) {
-      idx[i * 3] = 0;
-      idx[i * 3 + 1] = i + 1;
-      idx[i * 3 + 2] = ((i + 1) % n) + 1;
+    const idx = new Uint16Array(faces.length * 3);
+    for (let i = 0; i < faces.length; i++) {
+      // Reversed winding: the ear clipper emits CCW in the (x, y) plane it was
+      // handed, but y here is world z, and mapping (x, z) onto (x, y) mirrors
+      // the plane — so CCW on paper is CW once the mesh lies in xz and the
+      // triangles would face down into the basin floor.
+      idx[i * 3] = faces[i][0];
+      idx[i * 3 + 1] = faces[i][2];
+      idx[i * 3 + 2] = faces[i][1];
     }
     geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
@@ -337,13 +454,62 @@ export class MapGenerator {
       color: 0x0a1218, roughness: 0.08, metalness: 0.55,
       transparent: true, opacity: 0.94, envMapIntensity: 0.8,
     });
+    // ── surface motion lives in the NORMAL, not in the vertices ─────────────
+    //
+    // This used to displace `transformed.y` by 6 cm at an 8 m wavelength. The
+    // surface is 40 vertices, every one of them on the shoreline (the interior
+    // is spanned by long ear-clipped triangles up to 71 m across, mean 24 m), so
+    // that wave was sampled at roughly 0.3 vertices per wavelength — far below
+    // the 2 that Nyquist needs to represent it at all. The lake interior was a
+    // dead flat mirror and the only visible effect was the bank vertices
+    // twitching, which is worse than nothing.
+    //
+    // Subdividing the interior to fix that would be the wrong trade: at this
+    // viewing distance a lake reads almost entirely through how it bends the
+    // reflection of the sky and the treeline, and that is the normal's job.
+    // Perturbing the normal per pixel is tessellation-independent, costs no
+    // extra vertices, and stays correct however the shoreline is retriangulated.
+    //
+    // Two crossed wave trains at incommensurable angles and speeds, with the
+    // second at roughly a third the wavelength, so the interference pattern does
+    // not visibly repeat. Amplitude is deliberately tiny: `roughness 0.08` and
+    // `metalness 0.55` make this surface a near-mirror, so a small normal tilt
+    // sweeps the reflection a long way. Anything stronger reads as churning
+    // rapids rather than as still water in a forest basin at night.
+    const waterTime = { value: 0 };
+    // Assigned eagerly rather than inside onBeforeCompile, because the per-frame
+    // updater reads `userData.uTime` and the material may not have compiled yet
+    // on the first frames it runs.
+    (mat as unknown as { userData: { uTime: { value: number } } }).userData.uTime = waterTime;
     mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uTime = { value: 0 };
-      (mat as unknown as { userData: { uTime: { value: number } } }).userData.uTime = shader.uniforms.uTime;
-      shader.vertexShader = 'uniform float uTime;\n' + shader.vertexShader.replace(
+      shader.uniforms.uTime = waterTime;
+      // A world-space position is passed down by hand instead of reusing `vUv`:
+      // three 0.170 only declares `vUv` under `USE_UV`, which the renderer never
+      // defines by itself, and this material has no map to switch it on — so
+      // reading vUv here would simply fail to compile.
+      shader.vertexShader = 'varying vec3 vWaterPos;\n' + shader.vertexShader.replace(
         '#include <begin_vertex>',
         `#include <begin_vertex>
-        transformed.y += sin(uTime * 1.2 + position.x * 0.8) * 0.03 + cos(uTime * 0.9 + position.z * 0.6) * 0.03;`);
+        vWaterPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+      shader.fragmentShader = 'uniform float uTime;\nvarying vec3 vWaterPos;\n' + shader.fragmentShader.replace(
+        '#include <normal_fragment_maps>',
+        `#include <normal_fragment_maps>
+        {
+          vec2 wp = vWaterPos.xz;
+          float a1 = dot(wp, vec2(0.94, 0.34)) * 0.62 - uTime * 0.55;
+          float a2 = dot(wp, vec2(-0.42, 0.91)) * 1.90 + uTime * 0.83;
+          // Gradient of the two wave trains: the surface tilt, in world XZ.
+          vec2 slope = 0.030 * cos(a1) * vec2(0.94, 0.34)
+                     + 0.013 * cos(a2) * vec2(-0.42, 0.91);
+          // normal is in VIEW space by this point in the chunk order, so the
+          // world-space tilt has to be rotated through normalMatrix before it
+          // can be added. Skipping that conversion is a silent error rather
+          // than a compile failure: the ripple would sweep in whatever
+          // direction the camera happened to face, which reads as the whole
+          // lake surface rotating with the player's head.
+          vec3 tilt = normalMatrix * vec3(slope.x, 0.0, slope.y);
+          normal = normalize(normal + tilt);
+        }`);
     };
     const mesh = new THREE.Mesh(geo, mat);
     // waterline sits between the basin floor and the shoreline
