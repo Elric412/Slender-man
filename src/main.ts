@@ -1747,6 +1747,71 @@ class StaticGame {
   // ================================================================ debug/test hooks
   get debugApi() {
     return {
+      /** Deterministic visual QA: freezes simulation, not rendering features.
+       * Invoke only from tooling; reload to return to normal gameplay. */
+      visualFrame: async (o: {
+        x: number; z: number; yaw: number; pitch?: number; wet?: number;
+        light?: boolean; time?: number; monster?: { x: number; z: number };
+        frames?: number; tier?: 'low' | 'medium' | 'high' | 'ultra';
+      }) => {
+        if (this.warmupPromise) await this.warmupPromise;
+        this.loop.stop();
+        this.audio.suspend();
+        if (o.tier) {
+          this.spec = { ...QUALITY_SPECS[o.tier] };
+          this.pipeline.setQuality(this.spec);
+        }
+        const time = o.time ?? 24;
+        this.player.reset(o.x, o.z);
+        this.player.yaw = o.yaw; this.player.pitch = o.pitch ?? -0.08;
+        this.player.camera.position.set(o.x, this.hf.heightAt(o.x, o.z) + 1.62, o.z);
+        this.player.camera.rotation.set(this.player.pitch, o.yaw, 0, 'YXZ');
+        this.player.camera.fov = 75;
+        this.player.camera.updateMatrixWorld(true);
+        this.fear.reset();
+        this.zoneAtmoPrimed = false;
+        this.updateZoneAtmosphere(0);
+        this.weather.rain = o.wet ?? 0;
+        this.applyWeatherLook(0, true);
+        this.staticState = { level: 0, glimpse: 0, desat: 0.2, time, viewfinder: 0, wetness: o.wet ?? 0 };
+        this.flashlight.battery = 1;
+        this.flashlight.on = o.light ?? true;
+        this.flashlight.warp();
+        for (let i = 0; i < 45; i++) this.flashlight.update(1 / 60, time);
+        this.flashlight.setProjection(this.renderer.domElement.height * this.pipeline.renderScale, Math.PI * 75 / 180);
+        this.pipeline.setBeam(this.flashlight.light, this.flashlight.beamStrength);
+        this.pipeline.setExposureGoal(0.94 + this.flashlight.beamStrength * 0.36 - this.weather.wetness * 0.08);
+        this.sky.update(time);
+        this.moon.intensity = 0.72 * this.sky.moonDimAt(time)
+          * (1 - this.weather.wetness * 0.45) * (0.3 + this.zoneAtmo.moon * 0.85);
+        this.moonTarget.position.copy(this.player.pos);
+        this.moon.position.copy(this.player.pos).addScaledVector(this.sky.moonDir, 140);
+        this.moon.shadow.needsUpdate = true;
+        updateWind({ strength: 0.32, dirX: 0.8, dirZ: 0.6, time });
+        this.map.update(time, 0.32);
+        this.map.veg.setDrawDistance(o.x, o.z, this.spec.drawDistance);
+        for (let i = 0; i < 45; i++) this.map.scatter.setViewer(o.x, o.z, this.spec.drawDistance);
+        this.map.updatePracticals(2, this.player.camera.position, this.player.camera.quaternion);
+        this.effects.setRain(false);
+        this.rig.group.visible = !!o.monster;
+        if (o.monster) this.rig.reset(o.monster.x, this.hf.heightAt(o.monster.x, o.monster.z), o.monster.z,
+          Math.atan2(o.x - o.monster.x, o.z - o.monster.z), Math.hypot(o.x - o.monster.x, o.z - o.monster.z));
+        this.pipeline.invalidateHistory();
+        const times: number[] = [];
+        for (let i = 0; i < (o.frames ?? 8); i++) {
+          const t0 = performance.now();
+          this.pipeline.render(this.scene, this.player.camera, this.staticState, 1 / 60);
+          // QA only: fence software rendering so wall time includes completed work.
+          this.renderer.getContext().finish();
+          times.push(performance.now() - t0);
+          if (i < (o.frames ?? 8) - 1) await frame();
+        }
+        return { image: this.canvas.toDataURL('image/png'), times,
+          gpu: { ...this.pipeline.gpuStats }, seed: WORLD_SEED,
+          camera: this.player.camera.position.toArray(),
+          beam: { position: this.flashlight.light.position.toArray(), target: this.flashlight.target.position.toArray(),
+            intensity: this.flashlight.light.intensity, shadow: this.flashlight.light.shadow.mapSize.x } };
+      },
       state: () => this.state,
       tapes: () => this.tapes.collected,
       look: (yaw: number, pitch: number) => { this.player.yaw = yaw; this.player.pitch = pitch; },
@@ -1845,6 +1910,7 @@ class StaticGame {
       entity: (): EntitySnapshot | null => {
         if (!this.entitySnap) return null;
         return {
+          ...this.entitySnap,
           state: this.entity.state,
           detection: this.entity.detection,
           x: this.entity.pos.x, y: this.entity.pos.y, z: this.entity.pos.z,
