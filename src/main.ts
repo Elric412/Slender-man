@@ -17,8 +17,12 @@ import { Player } from './game/Player';
 import { Flashlight } from './game/Flashlight';
 import { PalebarkEntity } from './entity/PalebarkEntity';
 import type { AnimState } from './entity/PalebarkAnimator';
-import { FearSystem } from './game/FearSystem';
 import { ProximityTell } from './world/ProximityTell';
+import { HorrorProgression } from './horror/HorrorProgression';
+import { ThreatModel } from './horror/ThreatModel';
+import { PlayerBehaviorModel } from './horror/PlayerBehaviorModel';
+import { HorrorDirector } from './horror/HorrorDirector';
+import { EncounterDirector, type CueRequest, type SightingRequest } from './horror/EncounterDirector';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';
@@ -144,7 +148,42 @@ class StaticGame {
   private flashlight!: Flashlight;
   private entity!: EntityBrain;
   private rig!: PalebarkEntity;
-  private fear = new FearSystem();
+  /**
+   * The horror stack, in dependency order.
+   *
+   * These modules existed but were entirely unreachable: `EncounterDirector` is
+   * the root of the graph and nothing imported it, so `HorrorDirector`,
+   * `ThreatModel`, `EncounterMemory` and `PlayerBehaviorModel` were all dead
+   * code. Worse, `EntityBrain` had already been rewritten to *consume* them, and
+   * with nobody calling `setProgression`/`setDirective`/`setBehaviour`/
+   * `setPredictionTargets` it ran on its constructor defaults: a frozen
+   * `pressure: 0.3`, a fabricated average player, and an empty landmark list, so
+   * `prog` stayed the snapshot taken at construction. The entity was locked in
+   * act 0 with `confrontationUnlocked` false for the whole run — the escalation
+   * arc could never fire, and route prediction had nothing to snap to.
+   *
+   *   progression  owns the act arc (tapes + elapsed time). One authority.
+   *   behaviour    rolling model of how this player actually plays.
+   *   threat       splits "how dangerous is this" from "how afraid am I".
+   *   director     tension phases; publishes the brain's directive.
+   *   encounters   decides when a beat may fire, and refuses most of them.
+   */
+  private progression = new HorrorProgression(Object.keys(TAPE_LOGS).length);
+  private behaviour = new PlayerBehaviorModel();
+  /**
+   * Replaces `FearSystem`.
+   *
+   * Deliberately API-compatible with it — `value`, `staticLevel`, `desat`,
+   * `tremor`, `glimpse` all carry the same meaning and range — so the wind, fog,
+   * exposure grade, camera tremor and static overlay keep reading a scalar and
+   * did not have to be rewritten. The difference is upstream: dread is now
+   * derived from a threat model that separates real danger from felt danger,
+   * which is the whole point of a horror game where the entity is usually
+   * absent.
+   */
+  private fear = new ThreatModel();
+  private director = new HorrorDirector(WORLD_SEED);
+  private encounters = new EncounterDirector(WORLD_SEED);
   /**
    * Optional proximity signalling. Off by default; the mode is pushed in from
    * settings rather than read here, so this object never touches localStorage.
@@ -1844,17 +1883,26 @@ class StaticGame {
       // tick — under slow renderers QA could read a pre-change state).
       entity: (): EntitySnapshot | null => {
         if (!this.entitySnap) return null;
+        // Start from the brain's own snapshot and override only the fields that
+        // are genuinely live, rather than re-listing every field by hand.
+        //
+        // Hand-listing is what broke this hook: EntitySnapshot gained intent,
+        // knowledgeConfidence, contactAge, hasLos, intercepting and intentDanger,
+        // and because this object was built field-by-field it stopped compiling.
+        // Spreading means new brain fields arrive here automatically and are
+        // reported as of the last AI tick, which is the honest answer for
+        // anything the brain derives internally.
         return {
+          ...this.entitySnap,
+          // These four are cheap to read live, and the entity's transform is
+          // interpolated every frame while the AI ticks at aiHz — so a cached
+          // position could be several frames stale under a slow renderer.
           state: this.entity.state,
           detection: this.entity.detection,
           x: this.entity.pos.x, y: this.entity.pos.y, z: this.entity.pos.z,
-          visibleToPlayer: this.entitySnap.visibleToPlayer,
           distToPlayer: Math.hypot(
             this.entity.pos.x - this.player.pos.x,
             this.entity.pos.z - this.player.pos.z),
-          speed: this.entitySnap.speed,
-          act: this.entity.currentAct,
-          extensionEligible: this.entity.extensionEligible,
           // A request is a single-frame edge owned by the brain's own tick, so a
           // debug read outside that tick must report false rather than
           // resurrecting a stale edge.
