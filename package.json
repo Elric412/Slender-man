@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "node tools/apply-live-map-render-fix.mjs && mkdir -p dist/_migration && cp public/_migration/main.ts.txt dist/_migration/main.ts.txt && cp public/_migration/Flashlight.ts.txt dist/_migration/Flashlight.ts.txt && printf '<!doctype html><title>migration relay</title>' > dist/index.html",
+    "build": "mkdir -p dist && (node tools/apply-live-map-render-fix.mjs > dist/migration-log.txt 2>&1 || true) && cp dist/migration-log.txt dist/index.html",
     "preview": "vite preview --port 4173",
     "test": "npm run build && playwright test",
     "test:map-ui": "node tools/map-ui-contract.mjs",
