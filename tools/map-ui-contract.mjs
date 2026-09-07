@@ -7,18 +7,14 @@ const required = Array.from({ length: 6 }, (_, i) => [
 ]);
 
 const failures = [];
-
 for (const [path, label] of required) {
   try { await access(path); }
   catch { failures.push(`${label} missing: ${path}`); }
 }
 
-const [survey, menu, main, html, css] = await Promise.all([
+const [survey, css] = await Promise.all([
   readFile('src/ui/SurveyMap.ts', 'utf8'),
-  readFile('src/ui/Menu.ts', 'utf8'),
-  readFile('src/main.ts', 'utf8'),
-  readFile('index.html', 'utf8'),
-  readFile('src/ui-polish.css', 'utf8'),
+  readFile('public/ui/map-reference.css', 'utf8'),
 ]);
 
 const expectText = (text, needle, label) => {
@@ -31,10 +27,11 @@ expectText(survey, 'REFERENCE_H = 683', 'SurveyMap reference height');
 expectText(survey, 'loadReferenceArt', 'SurveyMap reference loader');
 expectText(survey, 'drawReferenceArt', 'SurveyMap live reference rendering');
 expectText(survey, 'drawExplorationVeil', 'SurveyMap exploration veil');
-expectText(menu, 'onMapClose', 'Menu close callback');
-expectText(main, 'onMapClose', 'game map-close wiring');
-expectText(html, 'id="map-close"', 'accessible map close control');
+expectText(survey, 'enhanceMapChrome', 'responsive map chrome');
+expectText(survey, "foot.id = 'map-close'", 'accessible close control');
+expectText(survey, "new KeyboardEvent('keydown'", 'close action uses normal map input path');
 expectText(css, 'aspect-ratio: 1024 / 683', 'reference map responsive aspect ratio');
+expectText(css, '.map-close', 'map close touch/focus styling');
 
 if (failures.length) {
   console.error('Map UI contract failed:');
