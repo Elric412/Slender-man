@@ -1,0 +1,712 @@
+/* STATIC UI polish pass.
+   Additive overrides only: gameplay/rendering CSS stays in style.css.
+   The signal grain is a verified seamless stitched tile. */
+
+:root {
+  --ui-edge: #263038;
+  --ui-edge-hi: #3a4650;
+  --ui-surface: rgba(8, 11, 14, 0.90);
+  --ui-surface-pressed: rgba(3, 5, 7, 0.96);
+  --ui-focus: #ded19f;
+  --ui-shadow: rgba(0, 0, 0, 0.72);
+  --grain-tile: url('/ui/signal-grain.svg');
+}
+
+.screen {
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.screen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: var(--grain-tile);
+  background-repeat: repeat;
+  background-size: 64px 64px;
+  opacity: 0.055;
+  mix-blend-mode: soft-light;
+}
+
+.screen::after {
+  z-index: 3;
+  opacity: 0.75;
+}
+
+.screen > :not(.title-flicker) {
+  z-index: 1;
+}
+
+.title-flicker {
+  z-index: 2;
+}
+
+/* ---------- icon contract ----------
+   Every icon: 24x24 viewBox, 1.8px outline, no fill, rounded joins/caps,
+   same optical box. The same source geometry is used in every interaction state. */
+.ui-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* ---------- title ---------- */
+.title-inner {
+  width: min(980px, 90vw);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  gap: clamp(42px, 8vw, 110px);
+  align-items: end;
+  text-align: left;
+  padding: 0;
+}
+
+.title-copy {
+  min-width: 0;
+}
+
+.title-rec {
+  margin: 0 0 28px;
+  width: fit-content;
+  padding: 7px 10px;
+  border-left: 2px solid var(--danger);
+  background: rgba(5, 7, 10, 0.54);
+  letter-spacing: 0.22em;
+}
+
+.title-logo {
+  font-size: clamp(50px, 9vw, 100px);
+  letter-spacing: 0.30em;
+  text-indent: 0;
+  line-height: 0.96;
+  margin-bottom: 18px;
+}
+
+.title-tag {
+  max-width: 640px;
+  margin: 0;
+  font-size: clamp(11px, 1.5vw, 14px);
+  line-height: 1.8;
+  letter-spacing: 0.16em;
+}
+
+.title-rail {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.title-menu {
+  gap: 10px;
+  align-items: stretch;
+}
+
+.title-foot {
+  margin: 22px 2px 0;
+  line-height: 1.7;
+  letter-spacing: 0.13em;
+  color: #4d5860;
+}
+
+/* ---------- button system ----------
+   Normal, hover/focus and pressed keep exactly the same box geometry.
+   State changes are color + illumination/inset only. */
+.menu-btn {
+  min-width: 0;
+  width: 100%;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 13px;
+  padding: 13px 16px;
+  text-indent: 0;
+  letter-spacing: 0.18em;
+  text-align: left;
+  border: 1px solid var(--ui-edge);
+  background: rgba(8, 11, 14, 0.54);
+  box-shadow: inset 0 0 0 0 transparent;
+  transition:
+    color 120ms linear,
+    border-color 120ms linear,
+    background-color 120ms linear,
+    box-shadow 120ms linear;
+}
+
+.menu-btn .ui-icon {
+  color: var(--ink-dim);
+  transition: color 120ms linear;
+}
+
+.menu-btn.primary {
+  color: #e1ddd0;
+  border-color: rgba(200, 185, 138, 0.52);
+  background: rgba(200, 185, 138, 0.075);
+  box-shadow: inset 3px 0 0 rgba(200, 185, 138, 0.76);
+}
+
+.menu-btn.primary .ui-icon {
+  color: var(--accent);
+}
+
+.menu-btn.danger {
+  border-color: rgba(184, 84, 63, 0.34);
+}
+
+.menu-btn.danger .ui-icon {
+  color: rgba(184, 84, 63, 0.72);
+}
+
+@media (hover: hover) {
+  .menu-btn:hover {
+    color: var(--accent);
+    border-color: rgba(200, 185, 138, 0.74);
+    background: rgba(200, 185, 138, 0.08);
+  }
+  .menu-btn:hover .ui-icon {
+    color: var(--accent);
+  }
+  .menu-btn.danger:hover {
+    color: #d9907d;
+    border-color: rgba(184, 84, 63, 0.72);
+    background: rgba(184, 84, 63, 0.08);
+  }
+  .menu-btn.danger:hover .ui-icon {
+    color: #d9907d;
+  }
+}
+
+.menu-btn:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 3px;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.menu-btn:active {
+  background: var(--ui-surface-pressed);
+  box-shadow:
+    inset 0 0 0 1px rgba(200, 185, 138, 0.18),
+    inset 0 8px 18px rgba(0, 0, 0, 0.36);
+}
+
+.menu-btn.primary:active {
+  box-shadow:
+    inset 3px 0 0 rgba(200, 185, 138, 0.90),
+    inset 0 8px 18px rgba(0, 0, 0, 0.38);
+}
+
+.menu-btn.danger:active {
+  background: rgba(50, 15, 12, 0.44);
+  box-shadow:
+    inset 0 0 0 1px rgba(184, 84, 63, 0.24),
+    inset 0 8px 18px rgba(0, 0, 0, 0.38);
+}
+
+body.cb .menu-btn.primary {
+  border-color: rgba(111, 211, 231, 0.56);
+  box-shadow: inset 3px 0 0 rgba(111, 211, 231, 0.78);
+}
+body.cb .menu-btn.primary .ui-icon { color: var(--accent-cb); }
+
+.back-btn {
+  width: auto;
+  min-width: 180px;
+  margin-top: 24px;
+}
+
+/* ---------- panels ---------- */
+.panel {
+  position: relative;
+  width: min(620px, 92vw);
+  background:
+    linear-gradient(rgba(8, 11, 14, 0.94), rgba(8, 11, 14, 0.94)),
+    var(--grain-tile);
+  border-color: var(--ui-edge);
+  padding: 30px 34px;
+  box-shadow:
+    0 22px 72px rgba(0,0,0,0.72),
+    inset 0 0 0 1px rgba(255,255,255,0.018);
+  scrollbar-color: #3a444b #090c0f;
+  scrollbar-width: thin;
+}
+
+.panel::before,
+.panel::after {
+  content: '';
+  position: absolute;
+  width: 17px;
+  height: 17px;
+  pointer-events: none;
+  opacity: 0.75;
+}
+
+.panel::before {
+  left: 8px;
+  top: 8px;
+  border-left: 1px solid var(--accent);
+  border-top: 1px solid var(--accent);
+}
+
+.panel::after {
+  right: 8px;
+  bottom: 8px;
+  border-right: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  color: #d8cda9;
+  border-bottom-color: #273038;
+  letter-spacing: 0.24em;
+}
+
+.settings-panel {
+  width: min(760px, 94vw);
+}
+
+.settings-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 230px);
+  gap: 14px 26px;
+}
+
+.settings-section {
+  margin-top: 18px;
+  padding: 9px 0 8px;
+  border-top: 1px solid rgba(200,185,138,0.10);
+  border-bottom: 1px solid #242c32;
+  background: linear-gradient(90deg, rgba(200,185,138,0.055), transparent 70%);
+  color: #bfb48f;
+}
+
+.settings-grid label {
+  line-height: 1.45;
+}
+
+.settings-grid label .hint,
+.advisory-grid label .hint {
+  max-width: 480px;
+  margin-top: 5px;
+  line-height: 1.55;
+}
+
+.settings-grid select {
+  width: 100%;
+  min-height: 40px;
+  border-color: var(--ui-edge);
+  background: #0b0f12;
+  padding: 8px 10px;
+}
+
+.settings-grid select:focus-visible,
+.settings-grid input:focus-visible,
+.advisory-grid input:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 3px;
+}
+
+/* Range bars keep the browser-native progress fill so the current value is
+   legible at a glance on both Chromium and Firefox. Geometry never changes
+   across hover/focus/drag states; only the accent treatment does. */
+.settings-grid input[type=range],
+.advisory-grid input[type=range] {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  accent-color: var(--accent);
+  cursor: ew-resize;
+}
+
+body.cb .settings-grid input[type=range],
+body.cb .advisory-grid input[type=range] {
+  accent-color: var(--accent-cb);
+}
+
+.settings-grid input[type=checkbox],
+.advisory-grid input[type=checkbox] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 20px;
+  height: 20px;
+  border: 1px solid #46525b;
+  background: #0a0e11;
+  box-shadow: inset 0 0 0 4px #0a0e11;
+  justify-self: start;
+}
+
+.settings-grid input[type=checkbox]:checked,
+.advisory-grid input[type=checkbox]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+body.cb .settings-grid input[type=checkbox]:checked,
+body.cb .advisory-grid input[type=checkbox]:checked {
+  border-color: var(--accent-cb);
+  background: var(--accent-cb);
+}
+
+/* ---------- advisory ---------- */
+#advisory-screen .panel {
+  width: min(700px, 94vw);
+}
+
+.advisory-list {
+  list-style: none;
+  margin-left: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.advisory-list li {
+  margin: 0;
+  padding: 9px 12px 9px 14px;
+  border-left: 2px solid #353f46;
+  background: rgba(255,255,255,0.015);
+}
+
+.advisory-grid {
+  border-color: #293139;
+  background: rgba(4,7,9,0.66);
+}
+
+/* ---------- HUD ---------- */
+.hud-chrome {
+  padding: 7px 10px;
+  border-left: 2px solid rgba(184,84,63,0.62);
+  background: linear-gradient(90deg, rgba(2,4,6,0.58), transparent);
+  letter-spacing: 0.22em;
+}
+
+.tape-counter {
+  min-width: 142px;
+  padding: 8px 10px;
+  text-align: right;
+  border-right: 2px solid rgba(200,185,138,0.70);
+  background: linear-gradient(270deg, rgba(2,4,6,0.62), transparent);
+  letter-spacing: 0.20em;
+}
+
+.interact-prompt {
+  min-width: min(360px, 86vw);
+  text-align: center;
+  bottom: 18%;
+  padding: 11px 18px;
+  border-color: rgba(200,185,138,0.34);
+  background: rgba(3,5,7,0.76);
+  box-shadow: 0 10px 28px rgba(0,0,0,0.30);
+}
+
+.subtitle {
+  border-left: 2px solid rgba(232,228,216,0.46);
+  border-right: 2px solid rgba(232,228,216,0.46);
+}
+
+.audio-cue {
+  box-shadow: 0 10px 28px rgba(0,0,0,0.24);
+}
+
+/* ---------- touch controls ----------
+   Icon + short code-native label. 32px squint test stays readable because
+   the pictogram carries the action even when the caption is peripheral. */
+#stick-base {
+  border-color: rgba(154,165,173,0.28);
+  background:
+    radial-gradient(circle, rgba(154,165,173,0.06) 0 34%, transparent 35%),
+    rgba(7,10,12,0.34);
+  box-shadow: inset 0 0 30px rgba(0,0,0,0.32);
+}
+
+#stick-base::before,
+#stick-base::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  background: rgba(154,165,173,0.12);
+  transform: translate(-50%, -50%);
+}
+#stick-base::before { width: 1px; height: 78%; }
+#stick-base::after { width: 78%; height: 1px; }
+
+#stick-nub {
+  width: 50px;
+  height: 50px;
+  border: 1px solid rgba(154,165,173,0.38);
+  background: rgba(154,165,173,0.20);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.28);
+}
+
+.touch-buttons {
+  grid-template-columns: repeat(2, 70px);
+  gap: 10px;
+}
+
+.tbtn {
+  width: 70px;
+  height: 70px;
+  border-radius: 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid rgba(154,165,173,0.32);
+  background: rgba(6,9,11,0.58);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 0 transparent, 0 8px 20px rgba(0,0,0,0.15);
+  transition:
+    color 100ms linear,
+    border-color 100ms linear,
+    background-color 100ms linear,
+    box-shadow 100ms linear,
+    opacity 100ms linear;
+}
+
+.tbtn .ui-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.tbtn-label {
+  font-size: 8px;
+  line-height: 1;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.tbtn.small {
+  font-size: inherit;
+  letter-spacing: inherit;
+}
+
+.tbtn:active,
+.tbtn.pressed {
+  background: rgba(3,5,7,0.90);
+  border-color: rgba(200,185,138,0.64);
+  box-shadow:
+    inset 0 0 0 1px rgba(200,185,138,0.10),
+    inset 0 8px 18px rgba(0,0,0,0.42);
+}
+
+.tbtn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(200,185,138,0.10);
+  box-shadow:
+    inset 0 0 0 1px rgba(200,185,138,0.12),
+    0 0 12px rgba(200,185,138,0.14);
+}
+
+.tbtn.spent {
+  opacity: 0.34;
+  filter: saturate(0.3);
+}
+
+/* ---------- end screen ---------- */
+.end-inner {
+  width: min(720px, 92vw);
+}
+
+.end-stats {
+  display: inline-block;
+  padding: 9px 12px;
+  border-top: 1px solid #2a3339;
+  border-bottom: 1px solid #2a3339;
+}
+
+/* ---------- responsive ---------- */
+@media (max-width: 760px) {
+  .title-inner {
+    width: min(92vw, 560px);
+    grid-template-columns: 1fr;
+    gap: 34px;
+    align-items: center;
+  }
+
+  .title-logo {
+    font-size: clamp(48px, 15vw, 76px);
+    letter-spacing: 0.24em;
+  }
+
+  .title-tag {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+  }
+
+  .title-rail {
+    align-self: auto;
+  }
+
+  .menu-btn {
+    min-width: 0;
+    min-height: 50px;
+    padding: 12px 14px;
+    font-size: 12px;
+  }
+
+  .panel,
+  .settings-panel {
+    width: min(94vw, 620px);
+    padding: 22px 20px;
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
+
+  .settings-grid label {
+    margin-top: 8px;
+  }
+
+  .settings-grid select,
+  .settings-grid input[type=range] {
+    width: 100%;
+  }
+
+  .settings-section {
+    margin-top: 16px;
+  }
+
+  .advisory-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .title-foot {
+    margin-top: 16px;
+  }
+
+  .hud-chrome {
+    left: calc(14px + env(safe-area-inset-left));
+    top: calc(12px + env(safe-area-inset-top));
+    font-size: 11px;
+    letter-spacing: 0.16em;
+  }
+
+  .tape-counter {
+    top: calc(12px + env(safe-area-inset-top));
+    right: calc(14px + env(safe-area-inset-right));
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 420px) {
+  .title-inner {
+    gap: 26px;
+  }
+
+  .title-rec {
+    margin-bottom: 20px;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+  }
+
+  .title-logo {
+    font-size: 48px;
+    letter-spacing: 0.18em;
+  }
+
+  .touch-buttons {
+    right: calc(10px + env(safe-area-inset-right));
+    grid-template-columns: repeat(2, 64px);
+  }
+
+  .tbtn {
+    width: 64px;
+    height: 64px;
+    border-radius: 16px;
+  }
+
+  .tbtn .ui-icon {
+    width: 22px;
+    height: 22px;
+  }
+}
+
+@media (max-height: 480px) and (pointer: coarse) {
+  .title-inner {
+    width: min(92vw, 920px);
+    grid-template-columns: minmax(0, 1fr) minmax(250px, 340px);
+    gap: 30px;
+  }
+
+  .title-rec {
+    margin-bottom: 12px;
+  }
+
+  .title-logo {
+    font-size: clamp(40px, 9vw, 64px);
+    margin-bottom: 8px;
+  }
+
+  .title-tag {
+    font-size: 10px;
+    line-height: 1.5;
+  }
+
+  .title-foot {
+    display: none;
+  }
+
+  .menu-btn {
+    min-height: 42px;
+    padding: 8px 12px;
+  }
+
+  .touch-buttons {
+    grid-template-columns: repeat(4, 58px);
+  }
+
+  .tbtn {
+    width: 58px;
+    height: 58px;
+    border-radius: 14px;
+  }
+
+  .tbtn-label {
+    font-size: 7px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .title-flicker,
+  .title-rec,
+  .hud-chrome .rec-dot,
+  .interact-prompt,
+  .pickup-flash,
+  .audio-cue {
+    animation: none !important;
+  }
+
+  .menu-btn,
+  .menu-btn .ui-icon,
+  .tbtn {
+    transition: none !important;
+  }
+}
