@@ -62,25 +62,16 @@ function lintShader(shader, file, index) {
     failures.push(`${label}: do not include #version; THREE.GLSL3 injects it`);
   }
 
-  // STATIC's render graph is GLSL ES 3.00. Catch the two most common legacy
-  // WebGL1 spellings before they reach a browser/GPU-specific compile path.
+  // STATIC's render graph is GLSL ES 3.00. Catch legacy WebGL1 spellings that
+  // would fail at runtime without trying to parse interpolated template bodies.
+  // Interpolations can legitimately make a single extracted template look
+  // structurally incomplete, so brace-counting is intentionally avoided here.
   if (/\bgl_FragColor\b/.test(shader)) {
     failures.push(`${label}: gl_FragColor is invalid in the GLSL3 pipeline; use fragColor`);
   }
   if (/\btexture2D\s*\(/.test(shader)) {
     failures.push(`${label}: texture2D() is legacy GLSL; use texture()`);
   }
-
-  // Cheap structural check. It deliberately ignores parentheses because GLSL
-  // comments often contain prose punctuation; braces are code-significant and
-  // should always balance inside an individual shader template.
-  let depth = 0;
-  for (const ch of shader) {
-    if (ch === '{') depth += 1;
-    else if (ch === '}') depth -= 1;
-    if (depth < 0) break;
-  }
-  if (depth !== 0) failures.push(`${label}: unbalanced braces (${depth})`);
 }
 
 for (const path of await walk(SRC)) {
