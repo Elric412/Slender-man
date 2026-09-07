@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { access, readFile } from 'node:fs/promises';
 
-const required = [
-  ['public/ui/pinewood-survey-map.webp', 'reference survey artwork'],
-];
+const required = Array.from({ length: 6 }, (_, i) => [
+  `public/ui/pinewood-map/map.${i}.b64`,
+  `reference survey artwork chunk ${i + 1}`,
+]);
 
 const failures = [];
 
@@ -24,9 +25,10 @@ const expectText = (text, needle, label) => {
   if (!text.includes(needle)) failures.push(`${label}: expected ${JSON.stringify(needle)}`);
 };
 
-expectText(survey, "pinewood-survey-map.webp", 'SurveyMap reference art source');
+expectText(survey, 'pinewood-map/map.', 'SurveyMap reference art source');
 expectText(survey, 'REFERENCE_W = 1024', 'SurveyMap reference width');
 expectText(survey, 'REFERENCE_H = 683', 'SurveyMap reference height');
+expectText(survey, 'loadReferenceArt', 'SurveyMap reference loader');
 expectText(survey, 'drawReferenceArt', 'SurveyMap live reference rendering');
 expectText(survey, 'drawExplorationVeil', 'SurveyMap exploration veil');
 expectText(menu, 'onMapClose', 'Menu close callback');
