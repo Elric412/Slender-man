@@ -20,9 +20,12 @@ import type { AnimState } from './entity/PalebarkAnimator';
 import { ProximityTell } from './world/ProximityTell';
 import { HorrorProgression } from './horror/HorrorProgression';
 import { ThreatModel, type ThreatInput } from './horror/ThreatModel';
-import { PlayerBehaviorModel } from './horror/PlayerBehaviorModel';
-import { HorrorDirector } from './horror/HorrorDirector';
-import { EncounterDirector, type CueRequest, type SightingRequest } from './horror/EncounterDirector';
+import { PlayerBehaviorModel, type BehaviorSample } from './horror/PlayerBehaviorModel';
+import { HorrorDirector, type DirectorInput } from './horror/HorrorDirector';
+import {
+  EncounterDirector, type CueRequest, type SightingRequest,
+  type WorldProbe, type PlayerProbe,
+} from './horror/EncounterDirector';
 import { TapeSystem, TAPE_LOGS } from './game/TapeSystem';
 import { Effects } from './game/Effects';
 import { AudioEngine } from './audio/AudioEngine';
@@ -196,6 +199,71 @@ class StaticGame {
   };
   private director = new HorrorDirector(WORLD_SEED);
   private encounters = new EncounterDirector(WORLD_SEED);
+  /**
+   * Reusable input structs for the director/behaviour/encounter ticks.
+   *
+   * Same reason as `threatIn` above: these are written every frame in the AI
+   * hot path, and AGENTS.md forbids per-frame allocation there. Declared as
+   * fields and mutated in place rather than rebuilt as object literals.
+   */
+  private dirIn: DirectorInput = {
+    progression: new HorrorProgression(Object.keys(TAPE_LOGS).length).snapshot,
+    threat: new ThreatModel().current,
+    quietSeconds: 0, sinceSighting: 999, intentDanger: 0,
+    entityVisible: false, knowledgeConfidence: 0, entityDistance: 999, exposure: 0.5,
+  };
+  private behSample: BehaviorSample = {
+    x: 0, z: 0, yaw: 0, sprinting: false, moving: false, lightOn: false, trailDistance: 0,
+  };
+  /**
+   * Uncollected objective positions, handed to the encounter director so a
+   * `blocked` beat can aim at somewhere the player actually wants to go, and to
+   * the brain so route prediction has real destinations to snap to.
+   *
+   * Rebuilt only when the tape count changes, not every frame — the set is
+   * static between pickups.
+   */
+  private objectivePoints: { x: number; z: number }[] = [];
+  /** Same set, in the shape `EntityBrain.setPredictionTargets` wants. */
+  private predictionTargets: { x: number; z: number; id: string }[] = [];
+  private objectivesForTapes = -1;
+  /**
+   * Read-only view of the world for the encounter director.
+   *
+   * A thin adapter rather than a copy: every method forwards straight to the
+   * system that owns the answer, so the director cannot form a belief about the
+   * terrain, cover or line of sight that disagrees with what the player is
+   * standing in. Built lazily on first use because `hf`/`map`/`col` are all
+   * created in `buildScene`, after field initialisers run.
+   */
+  private worldProbeCache: WorldProbe | null = null;
+  private get worldProbe(): WorldProbe {
+    if (!this.worldProbeCache) {
+      this.worldProbeCache = {
+        heightAt: (x, z) => this.hf.heightAt(x, z),
+        losClear: (x0, y0, z0, x1, y1, z1) => this.col.losClear(x0, y0, z0, x1, y1, z1),
+        coverAt: (x, z) => this.map.scatter.coverAt(x, z),
+        trailDist: (x, z) => this.hf.trailDist(x, z),
+        inLake: (x, z) => this.hf.inLake(x, z),
+        worldHalf: this.hf.layout.size / 2,
+      };
+    }
+    return this.worldProbeCache;
+  }
+  /** Reused so the per-frame encounter tick allocates nothing. */
+  private playerProbeState: PlayerProbe = {
+    x: 0, z: 0, eyeY: 1.62, fwdX: 0, fwdZ: 1, yaw: 0, moving: false, lightOn: false,
+  };
+  private playerProbe(): PlayerProbe {
+    const p = this.playerProbeState;
+    p.x = this.player.pos.x; p.z = this.player.pos.z;
+    p.eyeY = this.player.eyeY;
+    p.fwdX = this.player.forward.x; p.fwdZ = this.player.forward.z;
+    p.yaw = this.player.yaw;
+    p.moving = this.player.moving;
+    p.lightOn = this.flashlight.on;
+    return p;
+  }
   /**
    * Optional proximity signalling. Off by default; the mode is pushed in from
    * settings rather than read here, so this object never touches localStorage.
@@ -648,6 +716,53 @@ class StaticGame {
     this.entity.onFootfall = (x, z, dist) => {
       this.audio.entityCue(dist, dist < 20 ? 'footfall' : 'snap',
         x, this.hf.heightAt(x, z) + 1.2, z);
+    };
+    this.wireEncounters();
+  }
+
+  /**
+   * Realise the encounter director's four outputs.
+   *
+   * The director decides *whether* a beat happens and refuses most of them; it
+   * deliberately knows nothing about audio, rendering or the entity's transform.
+   * Without these callbacks it did all that arbitration and then discarded the
+   * result, which is why the subsystem could be entirely unwired and still
+   * compile — the failure mode was silence, not an error.
+   */
+  private wireEncounters(): void {
+    // Ambiguous world sounds. The `genuine` flag is the whole design: some of
+    // these really are Palebark and some are the forest, and the player is not
+    // told which. `localisability` is inverted into positional error so a
+    // low-localisability cue arrives from roughly the right direction but
+    // cannot be pinned — careful listening yields a bearing, never a fix.
+    this.encounters.onCue = (c: CueRequest) => {
+      this.audio.entityCue(c.distance, c.kind, c.x, c.y, c.z);
+      // A false cue must still cost the player something, or ambiguity has no
+      // teeth: it feeds uncertainty rather than dread, so the world feels less
+      // legible without the player believing they were actually hunted.
+      this.fear.notifyCue(c.genuine ? 0.55 : 0.3, 1 - c.localisability);
+    };
+
+    // A composed sighting. Routed through the same `notifySighting` the brain's
+    // own glimpse uses, so a directed sighting and an emergent one are scored
+    // identically — the player must not be able to tell them apart.
+    this.encounters.onSighting = (s: SightingRequest) => {
+      this.fear.notifySighting(s.distance, s.completeness);
+      this.audio.sighting(s.distance);
+    };
+
+    // An absence beat: the world goes quiet and stays quiet. Handed to the
+    // audio director rather than implemented here, because "quiet" means
+    // suppressing scheduled ambience, which only it can do.
+    this.encounters.onAbsence = (seconds: number) => {
+      this.audio.requestQuiet(seconds);
+    };
+
+    // Something changed that the player may notice later. Reported to the
+    // threat model as unease with no accompanying event, which is the one
+    // input that raises dread while *lowering* confidence in what is real.
+    this.encounters.onWrongness = () => {
+      this.fear.notifyWrongness(0.4);
     };
   }
 
@@ -1582,8 +1697,77 @@ class StaticGame {
     ti.lightOn = this.flashlight.on;
     ti.battery = this.flashlight.battery;
     ti.progression = progSnap;
-    this.fear.update(dt, ti);
+    const threatState = this.fear.update(dt, ti);
     this.profMark('fear', p0);
+
+    // ---- behaviour model, director, encounters ----
+    //
+    // Order matters and is the reverse of how it reads: the behaviour model
+    // describes the player, the director decides how much pressure that player
+    // should be under, and only then may the encounter director spend a beat.
+    // Running the director before progression/threat would make it decide on
+    // last frame's world.
+    p0 = performance.now();
+    const bs = this.behSample;
+    bs.x = this.player.pos.x; bs.z = this.player.pos.z;
+    bs.yaw = this.player.yaw;
+    bs.sprinting = this.player.sprinting;
+    bs.moving = this.player.moving;
+    bs.lightOn = this.flashlight.on;
+    bs.trailDistance = this.hf.trailDist(this.player.pos.x, this.player.pos.z);
+    this.behaviour.observe(dt, bs, this.player.vel.x, this.player.vel.z);
+    const behSnap = this.behaviour.sample(bs);
+
+    const di = this.dirIn;
+    di.progression = progSnap;
+    di.threat = threatState;
+    di.quietSeconds = this.fear.quietSeconds;
+    di.sinceSighting = this.fear.secondsSinceSighting;
+    di.intentDanger = snap.intentDanger;
+    di.entityVisible = snap.visibleToPlayer;
+    di.knowledgeConfidence = snap.knowledgeConfidence;
+    di.entityDistance = snap.distToPlayer;
+    di.exposure = ti.exposure;
+    this.director.update(dt, di);
+
+    // Objectives change only on pickup, so this is rebuilt on the edge rather
+    // than every frame. They are the strongest signal about where a player is
+    // *going*, which is what makes interception feel like intelligence rather
+    // than like the entity walking at the player.
+    if (this.objectivesForTapes !== this.tapes.collected) {
+      this.objectivesForTapes = this.tapes.collected;
+      this.objectivePoints.length = 0;
+      this.predictionTargets.length = 0;
+      for (const t of this.tapes.tapes) {
+        if (t.collected) continue;
+        this.objectivePoints.push({ x: t.spawn.x, z: t.spawn.z });
+        this.predictionTargets.push({ x: t.spawn.x, z: t.spawn.z, id: t.zoneId });
+      }
+      this.entity.setPredictionTargets(this.predictionTargets);
+    }
+
+    // Push everything the brain reads but does not own. Without these it ran on
+    // its constructor defaults — a frozen pressure of 0.3, a fabricated average
+    // player, and the progression snapshot captured at construction — so the act
+    // arc could never advance and `confrontationUnlocked` stayed false for the
+    // entire run.
+    this.entity.setProgression(progSnap);
+    this.entity.setDirective(this.director.brainDirective);
+    this.entity.setBehaviour(behSnap);
+
+    this.encounters.update(dt, {
+      progression: progSnap,
+      threat: threatState,
+      director: this.director,
+      behaviour: behSnap,
+      brain: this.entity,
+      world: this.worldProbe,
+      player: this.playerProbe(),
+      entityDistance: snap.distToPlayer,
+      entityVisible: snap.visibleToPlayer,
+      objectives: this.objectivePoints,
+    });
+    this.profMark('horror', p0);
 
     // The brain owns the "extension / reach" beat: a rare late-act moment where
     // the entity asserts presence without moving. It is the only gameplay hook
