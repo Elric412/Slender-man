@@ -1,18 +1,25 @@
 /* Pinewood reference-map presentation. Loaded lazily by SurveyMap so the main
    HUD stylesheet remains independent of the optional authored map artwork. */
 
+.map-overlay {
+  /* The sheet owns gestures; the transparent surround should not become a giant
+     dead touch layer over the game controls. */
+  pointer-events: none;
+}
+
 .map-sheet.map-sheet-reference {
   position: relative;
   width: min(96vw, 146vh, 1420px);
   padding: 0;
   gap: 0;
   overflow: hidden;
-  background: #050706;
-  border: 1px solid rgba(139, 143, 128, 0.28);
+  pointer-events: auto;
+  background: #070a08;
+  border: 1px solid rgba(139, 143, 128, 0.34);
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.72),
     0 20px 72px rgba(0, 0, 0, 0.78),
-    inset 0 0 80px rgba(0, 0, 0, 0.34);
+    inset 0 0 58px rgba(0, 0, 0, 0.22);
 }
 
 .map-sheet-reference .map-head {
@@ -25,8 +32,23 @@
   height: auto;
   aspect-ratio: 1024 / 683;
   border: 0;
-  background: #050706;
+  background: #070a08;
   image-rendering: auto;
+}
+
+.map-sheet-reference .map-canvas.map-interactive {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+
+.map-sheet-reference .map-canvas.map-interactive:active {
+  cursor: grabbing;
+}
+
+.map-sheet-reference .map-canvas.map-interactive:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--ui-focus, #ded19f);
 }
 
 /* SurveyMap paints the readable status into the sheet itself. Keep this DOM
@@ -55,9 +77,9 @@
   justify-content: center;
   gap: 10px;
   padding: 9px 14px;
-  border: 1px solid rgba(184, 186, 173, 0.36);
-  background: rgba(3, 5, 4, 0.82);
-  color: rgba(222, 218, 204, 0.84);
+  border: 1px solid rgba(184, 186, 173, 0.42);
+  background: rgba(3, 5, 4, 0.78);
+  color: rgba(232, 228, 214, 0.90);
   font: 11px/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -73,8 +95,8 @@
   place-items: center;
   width: 24px;
   height: 24px;
-  border: 1px solid rgba(206, 202, 185, 0.46);
-  color: rgba(222, 218, 204, 0.92);
+  border: 1px solid rgba(206, 202, 185, 0.52);
+  color: rgba(232, 228, 214, 0.96);
   letter-spacing: 0;
 }
 
@@ -94,6 +116,22 @@
     border-color: rgba(200, 185, 138, 0.72);
     color: var(--accent, #c8b98a);
     background: rgba(11, 12, 8, 0.90);
+  }
+}
+
+/* While the sheet is open on touch devices the movement stick stays live above
+   it, but action buttons disappear so a map gesture cannot accidentally fire a
+   lamp/interact/pause action through the paper. Chromium/Safari support :has(). */
+@media (pointer: coarse) {
+  #touch-ui { z-index: 27; }
+  #hud:has(.map-overlay:not(.hidden)) #stick-zone {
+    z-index: 28;
+    opacity: 0.68;
+    pointer-events: auto;
+  }
+  #hud:has(.map-overlay:not(.hidden)) .touch-buttons {
+    opacity: 0;
+    pointer-events: none;
   }
 }
 
