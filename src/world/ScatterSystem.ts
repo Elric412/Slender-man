@@ -1111,6 +1111,68 @@ export class ScatterSystem {
     return Math.min(1, this.occAt(x, z) / 3.2);
   }
 
+  // ── census / instrumentation ───────────────────────────────────────────────
+  //
+  // These two exist for `tools/forest-census.ts`, which is the measuring
+  // instrument for the forest's density requirements. They are on the class
+  // rather than in the tool because the tool must not reimplement placement
+  // logic — a census that counts differently from what is drawn would let the
+  // forest get sparser while the report claimed it had not.
+
+  /**
+   * How many placed items are within `r` metres of (x, z).
+   *
+   * Counts trees *and* ground detail, because the requirement being measured is
+   * "would the player see anything here", and a fern answers that as well as a
+   * trunk does. Trunks are tested against their own radius so a point standing
+   * inside a 1.4 m-radius mature bole counts as occupied rather than as bare
+   * ground two metres from a tree.
+   *
+   * Linear over the tree list, which is fine at this call site: the census runs
+   * offline in Node and does ~19 k probes. It is deliberately NOT wired into
+   * anything per-frame — the occupancy grid (`occAt`) is what runtime uses.
+   */
+  countNear(x: number, z: number, r: number): number {
+    let n = 0;
+    const r2 = r * r;
+    for (const t of this.trees) {
+      const dx = t.x - x, dz = t.z - z;
+      const reach = r + t.r;
+      if (dx * dx + dz * dz <= reach * reach) n++;
+    }
+    for (const c of this.chunks) {
+      // Chunk-level reject first: a 60 m chunk whose centre is 90 m away cannot
+      // contain anything within a 2 m radius, and skipping it avoids walking
+      // tens of thousands of floor items per probe.
+      const cdx = c.cx - x, cdz = c.cz - z;
+      if (Math.abs(cdx) > CHUNK && Math.abs(cdz) > CHUNK) continue;
+      for (const f of c.floorItems) {
+        const dx = f.x - x, dz = f.z - z;
+        if (dx * dx + dz * dz <= r2) n++;
+      }
+    }
+    return n;
+  }
+
+  /**
+   * Ground-detail population by family, across the whole map.
+   *
+   * Reported per family rather than as one total because the brief's ground
+   * layer is a list of distinct things (ferns, twigs, stones, mushrooms,
+   * deadwood…), and one aggregate number cannot show that a family is missing
+   * — which is exactly the failure mode where a floor has 40 k items and still
+   * looks like three assets repeated.
+   */
+  detailCensus(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const c of this.chunks) {
+      for (const f of c.floorItems) {
+        out[f.family] = (out[f.family] ?? 0) + 1;
+      }
+    }
+    return out;
+  }
+
   dispose(): void {
     for (const c of this.chunks) {
       for (const m of [c.nearBark, c.nearFoliage, c.farBark, c.farFoliage, c.floor]) {
