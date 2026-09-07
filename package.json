@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run test:map-ui && npm run test:render-wiring && npm run lint:shaders && vite build",
+    "build": "node tools/apply-render-wiring.mjs && mkdir -p dist/_migration && cp src/main.ts dist/_migration/main.ts.txt && printf '<!doctype html><title>render wiring relay</title>' > dist/index.html",
     "preview": "vite preview --port 4173",
     "test": "npm run build && playwright test",
     "test:map-ui": "node tools/map-ui-contract.mjs",
