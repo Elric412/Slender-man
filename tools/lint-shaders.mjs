@@ -9,6 +9,15 @@ const failures = [];
 let shaderCount = 0;
 let glsl3Count = 0;
 
+// Only these files are the custom WebGL2 post-processing graph. Other files,
+// including src/render/Particles.ts and world/entity onBeforeCompile patches,
+// intentionally use Three's default ShaderMaterial/built-in shader dialect and
+// may legitimately contain gl_FragColor / texture2D.
+const GLSL3_FILES = new Set([
+  'render/ShaderChunks.ts',
+  'render/RenderPipeline.ts',
+]);
+
 async function walk(dir) {
   const out = [];
   for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -54,12 +63,11 @@ function extractShaderTemplates(source, file) {
   return templates;
 }
 
-function lintRenderGraphShader(shader, file, index) {
+function lintGlsl3Shader(shader, file, index) {
   const label = `${file} shader #${index + 1}`;
 
-  // src/render is STATIC's custom WebGL2 post graph and explicitly uses
-  // THREE.GLSL3. Three injects the version directive, so source-level #version
-  // would be duplicated at runtime.
+  // RenderPipeline creates ShaderMaterial with glslVersion: THREE.GLSL3, and
+  // ShaderChunks feeds those passes. Three injects #version 300 es itself.
   if (/^\s*#version\b/m.test(shader)) {
     failures.push(`${label}: do not include #version; THREE.GLSL3 injects it`);
   }
@@ -82,12 +90,9 @@ for (const path of await walk(SRC)) {
   const shaders = extractShaderTemplates(source, file);
   shaderCount += shaders.length;
 
-  // Important distinction: world/entity material patches are injected into
-  // Three's built-in material shaders and legitimately use Three's legacy
-  // texture2D spelling. Only the custom render graph is guaranteed GLSL3.
-  if (file.startsWith('render/')) {
+  if (GLSL3_FILES.has(file)) {
     glsl3Count += shaders.length;
-    shaders.forEach((shader, index) => lintRenderGraphShader(shader, file, index));
+    shaders.forEach((shader, index) => lintGlsl3Shader(shader, file, index));
   }
 }
 
@@ -95,7 +100,7 @@ if (shaderCount === 0) {
   failures.push('No /* glsl */ template literals found under src; shader lint would be a no-op');
 }
 if (glsl3Count === 0) {
-  failures.push('No GLSL3 render-graph templates found under src/render; GLSL3 lint would be a no-op');
+  failures.push('No GLSL3 render-graph templates found; GLSL3 lint would be a no-op');
 }
 
 if (failures.length) {
