@@ -1,0 +1,35 @@
+name: Apply render ownership wiring
+
+on:
+  push:
+    branches:
+      - render/night-shadow-wiring
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.event.head_commit.message == 'run render wiring migration'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: render/night-shadow-wiring
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: node tools/apply-render-wiring.mjs
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Commit transformed source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main.ts
+          git diff --cached --quiet && { echo "No migration changes to commit"; exit 0; }
+          git commit -m "wire NightLighting and ShadowQuality into runtime"
+          git push origin HEAD:render/night-shadow-wiring
