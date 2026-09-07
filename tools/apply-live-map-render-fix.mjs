@@ -18,7 +18,7 @@ main = mustReplace(
 
 main = mustReplace(
   main,
-  `  /** Accumulated time owed to the moon map since its last re-render. */\n  private moonShadowAcc = 0;\n  /** Texel-snapped shadow-window centre at the last actual re-render. */\n  private moonShadowAtX = Infinity;\n  private moonShadowAtZ = Infinity;\n  /** Whether the moon shadow map has ever been rendered (first frame must not skip). */\n  private moonShadowPrimed = false;\n`,
+  `  /** Accumulated time owed to the moon shadow map since its last re-render. */\n  private moonShadowAcc = 0;\n  /** Texel-snapped shadow-window centre at the last actual re-render. */\n  private moonShadowAtX = Infinity;\n  private moonShadowAtZ = Infinity;\n  /** Whether the moon shadow map has ever been rendered (first frame must not skip). */\n  private moonShadowPrimed = false;\n`,
   '',
   'legacy moon shadow state',
 );
@@ -129,10 +129,6 @@ await Promise.all([
   writeFile('src/game/Flashlight.ts', flashlight),
 ]);
 
-// Temporary migration relay: Vercel copies public/ into dist. Serving the exact
-// transformed sources lets the repository connector commit them once the build
-// proves they compile. These files are generated only in the isolated build and
-// are never committed to the branch.
 await mkdir('public/_migration', { recursive: true });
 await Promise.all([
   writeFile('public/_migration/main.ts.txt', main),
