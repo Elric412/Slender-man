@@ -431,6 +431,17 @@ export class AudioEngine {
 
   setRain(on: boolean): void { this.ambience.setRain(on); }
 
+  /**
+   * The world should go quiet and stay quiet (`absence` encounter beat).
+   *
+   * Delegated straight to the Director because "quiet" means suppressing
+   * *scheduled* ambience and layer voices, and it is the only object that knows
+   * what is scheduled. Safe before `init()`: the Director exists from the
+   * constructor, so an absence beat requested during boot is simply honoured
+   * once the graph comes up.
+   */
+  requestQuiet(seconds: number): void { this.director.requestQuiet(seconds); }
+
   /** Legacy shim retained for call-site compatibility. */
   setFearLevel(_f: number): void { /* fear now flows through update() */ }
   owl(): void { this.entityCue(this.rng.range(40, 90), 'call'); }

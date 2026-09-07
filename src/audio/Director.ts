@@ -428,6 +428,29 @@ export class AudioDirector {
   get tensionAmount(): number { return this.tension; }
   get currentAct(): DirectorState['act'] { return this.act; }
 
+  /**
+   * Externally-commanded silence — the `absence` encounter beat.
+   *
+   * Distinct from the director's own cut-to-quiet on purpose. A cut-to-quiet is
+   * *rationed* out of the cliché budget because it is a startle-adjacent device
+   * (pull the bed at the moment the player expects a swell). An absence beat is
+   * the opposite instrument: the EncounterDirector has decided the world should
+   * simply stop for a while, with no payoff attached, and that must not compete
+   * for the same budget or it would starve the device that does have a payoff.
+   *
+   * Takes the longer of the two windows rather than overwriting, so a director
+   * cut already in flight is never shortened by an absence request.
+   */
+  requestQuiet(seconds: number): void {
+    const s = Math.max(0, Math.min(30, seconds));
+    if (s <= this.cutRemaining) return;
+    this.cutRemaining = s;
+    // Push the director's own next cut out past this window: two silences
+    // back to back read as an audio bug, not as an absence.
+    this.cutTimer = Math.max(this.cutTimer, s + 25);
+    this.reason = `absence beat ${s.toFixed(1)}s (external)`;
+  }
+
   /** Ask permission to fire a budgeted stinger-class event. */
   requestSpend(kind: string): boolean {
     if (!this.canSpend(kind)) return false;
