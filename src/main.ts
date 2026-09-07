@@ -19,7 +19,7 @@ import { PalebarkEntity } from './entity/PalebarkEntity';
 import type { AnimState } from './entity/PalebarkAnimator';
 import { ProximityTell } from './world/ProximityTell';
 import { HorrorProgression } from './horror/HorrorProgression';
-import { ThreatModel } from './horror/ThreatModel';
+import { ThreatModel, type ThreatInput } from './horror/ThreatModel';
 import { PlayerBehaviorModel } from './horror/PlayerBehaviorModel';
 import { HorrorDirector } from './horror/HorrorDirector';
 import { EncounterDirector, type CueRequest, type SightingRequest } from './horror/EncounterDirector';
@@ -182,6 +182,18 @@ class StaticGame {
    * absent.
    */
   private fear = new ThreatModel();
+  /**
+   * Reused `ThreatInput`. Pre-allocated because it is filled every frame, and
+   * AGENTS.md forbids per-frame allocation in the hot loop; `progression` is a
+   * reference to the progression system's own snapshot, not a copy.
+   */
+  private threatIn: ThreatInput = {
+    entityDistance: 999, detection: 0, entityHasLos: false, entityVisible: false,
+    intentDanger: 0, intercepting: false, knowledgeConfidence: 0, contactAge: 999,
+    darkness: 0.5, exposure: 0.5, silence: 0, sprinting: false, lightOn: false,
+    battery: 1,
+    progression: new HorrorProgression(Object.keys(TAPE_LOGS).length).snapshot,
+  };
   private director = new HorrorDirector(WORLD_SEED);
   private encounters = new EncounterDirector(WORLD_SEED);
   /**
@@ -615,9 +627,20 @@ class StaticGame {
     // The sting is round-robin'd inside EntityAudio, so no two sightings in a
     // run share a recipe (brief §8 / quality gate 3).
     this.entity.onGlimpse = () => {
-      this.fear.triggerGlimpse();
       const s = this.entitySnap;
-      this.audio.sighting(s ? s.distToPlayer : 30);
+      // ThreatModel replaced `triggerGlimpse()` with `notifySighting`, which
+      // additionally takes how *resolvable* the figure was. That second argument
+      // is the point of the newer model: a shape three-quarters behind a trunk
+      // raises less dread and far more uncertainty than a clean full-body
+      // silhouette, and the composition system deliberately prefers the former.
+      //
+      // We do not have a real occlusion measure at this call site, so
+      // completeness is estimated from distance — a figure at 8 m fills the
+      // frame and is unambiguous, one at 70 m is a smudge in the fog.
+      const d = s ? s.distToPlayer : 30;
+      const completeness = THREE.MathUtils.clamp(1 - (d - 8) / 62, 0.15, 1);
+      this.fear.notifySighting(d, completeness);
+      this.audio.sighting(d);
     };
     // Footfalls carry true world position so the spatialiser can place them;
     // EntityAudio adds its own distance-scaled positional error on top, so
@@ -762,6 +785,10 @@ class StaticGame {
     this.subtitleQueue.length = 0;
     this.subtitleTimer = 0;
     this.fear.reset();
+    // The act arc is per-run state too. Without this a second run in the same
+    // session opens at the previous run's act, so the narrative dread floor and
+    // every capability gate (stalking, prediction, confrontation) start unlocked.
+    this.progression.reset();
     // Carry the mode across but drop the accumulated value, so a fresh run never
     // opens with a warning inherited from the previous one's final moments.
     this.tell.reset();
@@ -1512,9 +1539,50 @@ class StaticGame {
       this.player.forward.x, this.player.forward.z);
     if (this.tell.mode === 'explicit') this.menu.setProximityTell(tellState);
 
-    // ---- fear / static ----
+    // ---- progression / threat ----
+    //
+    // `ThreatModel` takes a struct, not the four positional scalars the old
+    // `FearSystem` took. That mismatch was not a compile-time nuisance — it
+    // threw `undefined.normalizedProgress` every frame, and because this call
+    // sits *before* the environment block, the throw aborted the rest of the
+    // update: wind, vegetation streaming, draw distance, the audio bed and the
+    // moon shadow schedule all silently stopped running. The forest rendered
+    // whatever state it happened to be in when the first frame died.
+    //
+    // Progression must tick first, because the threat model reads its snapshot
+    // and a stale act would hold the narrative dread floor at its opening value
+    // for the whole run.
     p0 = performance.now();
-    this.fear.update(dt, snap.detection, snap.visibleToPlayer, snap.distToPlayer);
+    this.progression.setTapes(this.tapes.collected);
+    this.progression.tick(dt);
+    const progSnap = this.progression.snapshot;
+
+    const ti = this.threatIn;
+    ti.entityDistance = snap.distToPlayer;
+    ti.detection = snap.detection;
+    ti.entityHasLos = snap.hasLos;
+    ti.entityVisible = snap.visibleToPlayer;
+    ti.intentDanger = snap.intentDanger;
+    ti.intercepting = snap.intercepting;
+    ti.knowledgeConfidence = snap.knowledgeConfidence;
+    ti.contactAge = snap.contactAge;
+    // Darkness is what the *player* can see, so it is canopy closure minus
+    // whatever the moon and the beam put back — the same terms the perceptibility
+    // field uses, reused rather than re-derived so the two can never disagree.
+    const closure = this.zones.scalarAt(this.player.pos.x, this.player.pos.z, 'canopyClosure');
+    const moonHere = this.sky.moonDimAt(this.staticState.time)
+      * this.zones.scalarAt(this.player.pos.x, this.player.pos.z, 'moonlight');
+    ti.darkness = THREE.MathUtils.clamp(
+      closure * 0.85 + 0.15
+      - moonHere * 0.45
+      - (this.flashlight.on ? this.flashlight.beamStrength * 0.4 : 0), 0, 1);
+    ti.exposure = THREE.MathUtils.clamp(1 - closure, 0, 1);
+    ti.silence = this.audio.directorState.silence;
+    ti.sprinting = this.player.sprinting;
+    ti.lightOn = this.flashlight.on;
+    ti.battery = this.flashlight.battery;
+    ti.progression = progSnap;
+    this.fear.update(dt, ti);
     this.profMark('fear', p0);
 
     // The brain owns the "extension / reach" beat: a rare late-act moment where
@@ -1788,7 +1856,26 @@ class StaticGame {
     return {
       state: () => this.state,
       tapes: () => this.tapes.collected,
-      look: (yaw: number, pitch: number) => { this.player.yaw = yaw; this.player.pitch = pitch; },
+      /**
+       * Aim the camera for an art-direction capture.
+       *
+       * Setting yaw/pitch alone is not enough for a capture harness: the
+       * flashlight cone lerps toward the aim over several frames and the
+       * pipeline is temporally accumulated, so a frame grabbed right after a
+       * look change is a smear of the previous angle with an unlit cone. Warping
+       * the light and dropping the TAA/motion-blur history makes the very next
+       * settled frame a true image of where the camera actually points.
+       *
+       * Pitch is clamped to the same limits the real look input uses — a capture
+       * from an angle the player can never reach would be reviewing an image the
+       * game cannot produce.
+       */
+      look: (yaw: number, pitch: number) => {
+        this.player.yaw = yaw;
+        this.player.pitch = Math.max(-1.45, Math.min(1.45, pitch));
+        this.flashlight?.warp();
+        this.pipeline.invalidateHistory();
+      },
       dustStats: () => this.flashlight.dustStats(),
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),
       stats: () => this.loop.stats(),
@@ -1863,6 +1950,32 @@ class StaticGame {
         return buckets;
       },
       bootTimes: () => ({ ...this.bootTimes }),
+      /**
+       * Renderer diagnostics for the density budget.
+       *
+       * Density decisions have to be made against measured draw calls,
+       * triangles and resident GPU resources, not against how a screenshot
+       * feels — "it still looks fine" is how a scene ends up at 900 draw calls
+       * and nobody notices until it ships. `renderer.info` resets each frame,
+       * so this is read right after a rendered frame.
+       *
+       * `programs` is included because it is the one number that reveals
+       * accidental material proliferation: the forest is designed around a
+       * handful of shared atlas materials, so a climbing program count means
+       * something is cloning materials per instance and silently destroying
+       * batching.
+       */
+      renderer: () => {
+        const info = this.renderer.info;
+        return {
+          calls: info.render.calls,
+          triangles: info.render.triangles,
+          geometries: info.memory.geometries,
+          textures: info.memory.textures,
+          programs: info.programs?.length ?? 0,
+          pixelRatio: +this.renderer.getPixelRatio().toFixed(2),
+        };
+      },
       warp: (x: number, z: number) => {
         this.player.pos.set(x, this.hf.heightAt(x, z), z);
         this.flashlight?.warp();
@@ -1876,7 +1989,9 @@ class StaticGame {
         this.settings.proximityTell = m;
         this.applySettings(this.settings);
       },
-      forceFear: (v: number) => { this.fear.value = v; },
+      // `value` is a read-only legacy accessor on ThreatModel (it returns
+      // dread), so a QA override has to go through the model's own setter.
+      forceFear: (v: number) => { this.fear.forceDread(v); },
       forceDetection: (v: number) => { this.entity.detection = v; },
       // Live snapshot: reads brain fields directly so it never goes stale
       // between frames (the cached entitySnap only refreshes once per update
