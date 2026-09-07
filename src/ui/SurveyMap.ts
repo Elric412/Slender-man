@@ -1,452 +1,333 @@
 /**
- * The survey map overlay.
+ * Pinewood's in-game survey sheet.
  *
- * Drawn to a 2D canvas rather than composed from DOM nodes, for one decisive
- * reason: the map's content is a projection of world geometry — 25 path
- * polylines, a 40-point lake shore, a lobed quarry rim, a 96² fog mask — and
- * expressing that as elements would mean thousands of nodes and a layout pass
- * per frame. A canvas also lets the sheet be *drawn* rather than styled, which
- * is what makes it read as a paper artefact instead of a game menu.
- *
- * The renderer receives `Cartography` and reads `PinewoodLayout` directly. It is
- * given no other data source, so every mark on the sheet traces to real world
- * geometry or real player knowledge. Undiscovered places are not drawn dimly —
- * they are not drawn at all, because a surveyor cannot annotate what they have
- * not surveyed.
- *
- * Style contract (applied to every mark on the sheet, per the UI-set principle
- * that consistency matters more than any single element): a single ink colour at
- * varying alpha, one hairline weight for graticule, one medium for paths, one
- * heavy for landmark glyphs; every glyph fits a 9 px box so it survives the
- * mobile scale; no filled shapes except water and the player mark.
+ * The supplied Pinewood Forest artwork is the visual base because the game world
+ * itself was authored from that same survey. It is not treated as a screenshot:
+ * baked progress, collectible marks and the original player arrow are scrubbed,
+ * then live Cartography state is drawn over it. The result keeps the authored
+ * map's texture and hierarchy without leaking information the player has not
+ * actually discovered.
  */
 
 import { Cartography } from '../world/Cartography';
 import {
-  LANDMARKS, PathEdge, PinewoodLandmark, WORLD_SIZE, worldToPx,
+  LANDMARKS, PathEdge, PinewoodLandmark, SPAWN_PX, WORLD_SIZE, worldToPx,
 } from '../world/PinewoodLayout';
 import { HeightField } from '../world/HeightField';
 
-/** The sheet is drawn at this resolution and CSS-scaled to fit. */
-const SHEET = 768;
+export const REFERENCE_W = 1024;
+export const REFERENCE_H = 683;
 
-/* Ink palette — one hue, many alphas. Aged blueprint, not neon HUD. */
-const INK = '212, 205, 184';
-const WATER = '92, 118, 126';
-const MARK = '214, 178, 106';      // the player's own pencil: warmer than the print
+const INK = '218, 214, 200';
+const DIM = '154, 158, 151';
+const MARK = '214, 178, 82';
+const PAPER = '#080b09';
+const ART_PARTS = Array.from({ length: 6 }, (_, i) => `./ui/pinewood-map/map.${i}.b64`);
 
 export class SurveyMap {
-  private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
-  /** world→sheet scale: the sheet covers the whole world with a margin */
-  private s: number;
-  private ox: number; private oy: number;
-  /** static layer (graticule, contours, shoreline, paths) rendered once */
-  private base: HTMLCanvasElement | null = null;
+  private referenceArt: HTMLImageElement | null = null;
+  private referenceLoading = false;
+  private fogCanvas: HTMLCanvasElement | null = null;
+  private fogCtx: CanvasRenderingContext2D | null = null;
+  private fogImage: ImageData | null = null;
 
   constructor(
-    canvas: HTMLCanvasElement,
+    private canvas: HTMLCanvasElement,
     private carto: Cartography,
     private hf: HeightField,
   ) {
-    this.canvas = canvas;
-    canvas.width = SHEET; canvas.height = SHEET;
+    canvas.width = REFERENCE_W;
+    canvas.height = REFERENCE_H;
     const c = canvas.getContext('2d');
     if (!c) throw new Error('SurveyMap: 2D context unavailable');
     this.ctx = c;
-
-    // The map's px space is the reference survey's own (0..700-ish); we fit the
-    // world extent instead, so the sheet stays correct if the world resizes.
-    const margin = 34;
-    this.s = (SHEET - margin * 2) / WORLD_SIZE;
-    this.ox = margin + (WORLD_SIZE / 2) * this.s;
-    this.oy = margin + (WORLD_SIZE / 2) * this.s;
+    void this.loadReferenceArt();
   }
 
-  /**
-   * Point the sheet at a new knowledge set, for a fresh run.
-   *
-   * Only the epistemic half is swapped. The cached base layer is a function of
-   * the terrain alone — contours, shoreline, quarry rim — and the terrain is
-   * seeded and identical across runs, so re-tracing it would be pure waste.
-   */
   setCartography(carto: Cartography): void {
     this.carto = carto;
+    this.fogCanvas = null;
+    this.fogCtx = null;
+    this.fogImage = null;
   }
 
-  /** world → sheet coordinates */
-  private X(x: number): number { return this.ox + x * this.s; }
-  private Y(z: number): number { return this.oy + z * this.s; }
-
-  /**
-   * Render the static print: everything that is a property of the terrain
-   * rather than of the player. Cached, because contour tracing is far too
-   * expensive to redo per frame and none of it ever changes.
-   */
-  private buildBase(): HTMLCanvasElement {
-    const cv = document.createElement('canvas');
-    cv.width = SHEET; cv.height = SHEET;
-    const g = cv.getContext('2d')!;
-
-    // ── paper. A flat fill reads as a UI panel; a faint vignette plus grain
-    // reads as a sheet that has been in a glovebox for thirty years.
-    g.fillStyle = '#12140f';
-    g.fillRect(0, 0, SHEET, SHEET);
-    const vig = g.createRadialGradient(SHEET / 2, SHEET / 2, SHEET * 0.1, SHEET / 2, SHEET / 2, SHEET * 0.72);
-    vig.addColorStop(0, 'rgba(38,40,32,0.85)');
-    vig.addColorStop(1, 'rgba(12,14,11,0.9)');
-    g.fillStyle = vig;
-    g.fillRect(0, 0, SHEET, SHEET);
-
-    // ── contour lines, traced from the real heightfield by marching squares.
-    // These are the single most important element: they are why the map teaches
-    // the watershed. Reading it, you can see that everything drains south into
-    // the lake and that the ridge is the high ground, which is the same fact the
-    // terrain teaches by walking it.
-    const CR = 150;                       // contour sampling grid
-    const step = WORLD_SIZE / (CR - 1);
-    const hs = new Float32Array(CR * CR);
-    let lo = Infinity, hi = -Infinity;
-    for (let j = 0; j < CR; j++) {
-      for (let i = 0; i < CR; i++) {
-        const x = -WORLD_SIZE / 2 + i * step;
-        const z = -WORLD_SIZE / 2 + j * step;
-        const v = this.hf.heightAt(x, z);
-        hs[j * CR + i] = v;
-        if (v < lo) lo = v; if (v > hi) hi = v;
-      }
+  /** Assemble the compressed artwork from small static text chunks once. */
+  private async loadReferenceArt(): Promise<void> {
+    if (this.referenceArt || this.referenceLoading) return;
+    this.referenceLoading = true;
+    try {
+      const parts = await Promise.all(ART_PARTS.map(async path => {
+        const r = await fetch(path, { cache: 'force-cache' });
+        if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+        return (await r.text()).trim();
+      }));
+      const img = new Image();
+      const loaded = new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('reference survey artwork could not be decoded'));
+      });
+      img.src = `data:image/webp;base64,${parts.join('')}`;
+      await loaded;
+      this.referenceArt = img;
+    } catch (err) {
+      // Navigation still works if the art cannot load. The fallback below is
+      // derived from the same world geometry and therefore never lies.
+      console.warn('[STATIC] reference survey artwork unavailable:', err);
+    } finally {
+      this.referenceLoading = false;
     }
-    const INTERVAL = 6;                   // metres between contours
-    const start = Math.ceil(lo / INTERVAL) * INTERVAL;
-    for (let level = start; level < hi; level += INTERVAL) {
-      // index contours (every 30 m) are heavier, as on a real survey sheet
-      const index = Math.abs(level % 30) < 0.001;
-      g.strokeStyle = `rgba(${INK},${index ? 0.3 : 0.15})`;
-      g.lineWidth = index ? 1.15 : 0.6;
-      g.beginPath();
-      for (let j = 0; j < CR - 1; j++) {
-        for (let i = 0; i < CR - 1; i++) {
-          const a = hs[j * CR + i], b = hs[j * CR + i + 1];
-          const c = hs[(j + 1) * CR + i + 1], d = hs[(j + 1) * CR + i];
-          const x0 = -WORLD_SIZE / 2 + i * step, z0 = -WORLD_SIZE / 2 + j * step;
-          const x1 = x0 + step, z1 = z0 + step;
-          // linear interpolation along each crossed cell edge
-          const seg: number[] = [];
-          const edge = (va: number, vb: number, ax: number, az: number, bx: number, bz: number) => {
-            if ((va - level) * (vb - level) >= 0) return;
-            const t = (level - va) / (vb - va);
-            seg.push(ax + (bx - ax) * t, az + (bz - az) * t);
-          };
-          edge(a, b, x0, z0, x1, z0);
-          edge(b, c, x1, z0, x1, z1);
-          edge(c, d, x1, z1, x0, z1);
-          edge(d, a, x0, z1, x0, z0);
-          for (let k = 0; k + 3 < seg.length; k += 4) {
-            g.moveTo(this.X(seg[k]), this.Y(seg[k + 1]));
-            g.lineTo(this.X(seg[k + 2]), this.Y(seg[k + 3]));
-          }
-        }
-      }
-      g.stroke();
-    }
-
-    // ── graticule. Drawn after contours so the grid sits on top like print.
-    g.strokeStyle = `rgba(${INK},0.075)`;
-    g.lineWidth = 0.5;
-    g.beginPath();
-    for (let m = -WORLD_SIZE / 2; m <= WORLD_SIZE / 2; m += 40) {
-      g.moveTo(this.X(m), this.Y(-WORLD_SIZE / 2)); g.lineTo(this.X(m), this.Y(WORLD_SIZE / 2));
-      g.moveTo(this.X(-WORLD_SIZE / 2), this.Y(m)); g.lineTo(this.X(WORLD_SIZE / 2), this.Y(m));
-    }
-    g.stroke();
-
-    return cv;
   }
 
-  /** trace a closed world-space polygon onto a context */
-  private polyPath(g: CanvasRenderingContext2D, pts: readonly { x: number; z: number }[]): void {
-    g.beginPath();
-    g.moveTo(this.X(pts[0].x), this.Y(pts[0].z));
-    for (let i = 1; i < pts.length; i++) g.lineTo(this.X(pts[i].x), this.Y(pts[i].z));
-    g.closePath();
-  }
+  private X(x: number): number { return worldToPx(x, 0).px; }
+  private Y(z: number): number { return worldToPx(0, z).py; }
 
-  /**
-   * Is this world point surveyed enough to draw?
-   *
-   * Sampled from the exploration grid rather than tested against landmark
-   * discovery, so a path only appears along the stretches you have actually
-   * walked. Watching a route extend itself across the sheet as you explore is
-   * the whole reward of the map.
-   */
   private known(x: number, z: number): boolean {
     const i = Math.floor((x + WORLD_SIZE / 2) / this.carto.cell);
     const j = Math.floor((z + WORLD_SIZE / 2) / this.carto.cell);
     return this.carto.at(i, j) > 0.35;
   }
 
-  /**
-   * Draw the map.
-   *
-   * @param px,pz  player world position
-   * @param yaw    player heading, for the position arrow
-   * @param timeSec run time, drives the "surveyed" annotations
-   */
   draw(px: number, pz: number, yaw: number): void {
     const g = this.ctx;
-    if (!this.base) this.base = this.buildBase();
+    g.clearRect(0, 0, REFERENCE_W, REFERENCE_H);
 
-    g.clearRect(0, 0, SHEET, SHEET);
-    g.drawImage(this.base, 0, 0);
+    if (this.referenceArt) {
+      this.drawReferenceArt(g);
+      this.drawExplorationVeil(g);
+      this.drawReferenceReadouts(g);
+    } else {
+      this.drawFallback(g);
+    }
 
-    // ── fog of war. Everything unsurveyed is *masked out*, not dimmed: the
-    // sheet is only filled in where the surveyor has been.
-    const cell = this.carto.cell * this.s;
-    g.save();
-    g.globalCompositeOperation = 'destination-in';
-    g.fillStyle = 'rgba(0,0,0,1)';
-    for (let j = 0; j < this.carto.res; j++) {
-      for (let i = 0; i < this.carto.res; i++) {
-        const v = this.carto.at(i, j);
-        if (v <= 0) continue;
-        const x = -WORLD_SIZE / 2 + i * this.carto.cell;
-        const z = -WORLD_SIZE / 2 + j * this.carto.cell;
-        g.globalAlpha = Math.min(1, v * 1.15);
-        // slight overdraw so neighbouring cells merge into a soft surveyed
-        // region rather than a visible grid of squares
-        g.fillRect(this.X(x) - cell * 0.15, this.Y(z) - cell * 0.15, cell * 1.3, cell * 1.3);
+    this.drawPages(g);
+    this.drawPlayer(g, px, pz, yaw);
+  }
+
+  /**
+   * Draw the supplied survey artwork and remove information that must be live.
+   * The image is deliberately only a base plate; gameplay state always wins.
+   */
+  private drawReferenceArt(g: CanvasRenderingContext2D): void {
+    g.drawImage(this.referenceArt!, 0, 0, REFERENCE_W, REFERENCE_H);
+
+    // Remove the baked 42% readout. A live value is painted after fog-of-war.
+    this.patch(g, 17, 82, 162, 31, 0.95);
+
+    // Remove the baked objective/progress block ("3/8 pages").
+    this.patch(g, 807, 284, 205, 88, 0.96);
+
+    // The game calls them recordings/tapes rather than pages. Replace the one
+    // legend label while keeping the artwork's icon language and spacing.
+    this.patch(g, 861, 151, 145, 23, 0.93);
+
+    // The artwork includes its original spawn arrow. It must never remain behind
+    // after the player walks away, so erase only that tiny mark and redraw the
+    // actual player later.
+    this.patch(g, SPAWN_PX[0] - 10, SPAWN_PX[1] - 13, 21, 25, 0.90);
+
+    // The source painting shows all recording sites. Hide every baked site here;
+    // only hinted/collected locations are reintroduced from Cartography below.
+    for (const p of this.carto.pages) {
+      const x = this.X(p.x), y = this.Y(p.z);
+      this.patch(g, x - 7, y - 8, 14, 17, 0.91);
+    }
+  }
+
+  private patch(
+    g: CanvasRenderingContext2D,
+    x: number, y: number, w: number, h: number, alpha: number,
+  ): void {
+    const grd = g.createLinearGradient(x, y, x + w, y + h);
+    grd.addColorStop(0, `rgba(5,8,7,${alpha})`);
+    grd.addColorStop(1, `rgba(9,12,10,${Math.max(0, alpha - 0.07)})`);
+    g.fillStyle = grd;
+    g.fillRect(x, y, w, h);
+  }
+
+  /**
+   * Fog-of-war over only the geographic field, never the legend/status rail.
+   * A 96² alpha mask is cheap to rebuild and scales softly over the artwork.
+   */
+  private drawExplorationVeil(g: CanvasRenderingContext2D): void {
+    const res = this.carto.res;
+    if (!this.fogCanvas || this.fogCanvas.width !== res) {
+      this.fogCanvas = document.createElement('canvas');
+      this.fogCanvas.width = res;
+      this.fogCanvas.height = res;
+      this.fogCtx = this.fogCanvas.getContext('2d');
+      this.fogImage = this.fogCtx?.createImageData(res, res) ?? null;
+    }
+    if (!this.fogCanvas || !this.fogCtx || !this.fogImage) return;
+
+    const d = this.fogImage.data;
+    for (let j = 0; j < res; j++) {
+      for (let i = 0; i < res; i++) {
+        const v = Math.min(1, this.carto.at(i, j) * 1.18);
+        const a = Math.round(238 * (1 - v));
+        const o = (j * res + i) * 4;
+        d[o] = 1; d[o + 1] = 3; d[o + 2] = 2; d[o + 3] = a;
       }
     }
+    this.fogCtx.putImageData(this.fogImage, 0, 0);
+
+    const left = this.X(-WORLD_SIZE / 2);
+    const top = this.Y(-WORLD_SIZE / 2);
+    const right = this.X(WORLD_SIZE / 2);
+    const bottom = this.Y(WORLD_SIZE / 2);
+
+    g.save();
+    g.imageSmoothingEnabled = true;
+    g.filter = 'blur(5px)';
+    g.drawImage(this.fogCanvas, left, top, right - left, bottom - top);
     g.restore();
-    g.globalAlpha = 1;
 
-    // ── Pine Lake. Water is the one filled shape on the sheet, because on a
-    // real survey it is the one thing rendered as an area rather than a line.
-    const shore = this.hf.layout.lake.shore;
-    if (shore.some(p => this.known(p.x, p.z))) {
-      this.polyPath(g, shore);
-      g.fillStyle = `rgba(${WATER},0.3)`;
-      g.fill();
-      g.strokeStyle = `rgba(${WATER},0.85)`;
-      g.lineWidth = 1.5;
+    // A faint uniform wash makes the revealed/unknown boundary feel like pencil
+    // graphite rather than a videogame minimap mask.
+    g.save();
+    g.globalAlpha = 0.08;
+    g.fillStyle = '#000';
+    g.fillRect(Math.max(0, left), Math.max(0, top), Math.min(760, right) - Math.max(0, left), REFERENCE_H);
+    g.restore();
+  }
+
+  private drawReferenceReadouts(g: CanvasRenderingContext2D): void {
+    const explored = Math.round(this.carto.exploredFraction * 100);
+    const collected = this.carto.collectedCount;
+    const total = this.carto.pages.length;
+
+    g.textBaseline = 'middle';
+    g.textAlign = 'left';
+    g.font = '16px ui-monospace, SFMono-Regular, Menlo, monospace';
+    g.fillStyle = `rgba(${INK},0.78)`;
+    g.fillText(`EXPLORED: ${explored}%`, 25, 98);
+
+    g.font = '15px ui-monospace, SFMono-Regular, Menlo, monospace';
+    g.fillStyle = `rgba(${INK},0.82)`;
+    g.fillText('OBJECTIVE', 820, 302);
+    g.strokeStyle = `rgba(${INK},0.34)`;
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(820, 316); g.lineTo(998, 316); g.stroke();
+    g.fillStyle = `rgba(${DIM},0.88)`;
+    g.fillText(`RECOVER ALL ${total} RECORDINGS`, 820, 337);
+    g.fillStyle = `rgba(${MARK},0.88)`;
+    g.fillText(`RECOVERED: ${collected}/${total}`, 820, 359);
+
+    g.fillStyle = `rgba(${DIM},0.88)`;
+    g.font = '13px ui-monospace, SFMono-Regular, Menlo, monospace';
+    g.fillText('RECORDING SITE', 869, 163);
+  }
+
+  /** Geometry-only fallback used if the authored artwork fails to load. */
+  private drawFallback(g: CanvasRenderingContext2D): void {
+    g.fillStyle = PAPER;
+    g.fillRect(0, 0, REFERENCE_W, REFERENCE_H);
+
+    const grad = g.createRadialGradient(420, 330, 40, 420, 330, 560);
+    grad.addColorStop(0, 'rgba(38,43,35,0.55)');
+    grad.addColorStop(1, 'rgba(0,0,0,0.65)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 780, REFERENCE_H);
+
+    g.strokeStyle = `rgba(${INK},0.10)`;
+    g.lineWidth = 1;
+    for (let m = -WORLD_SIZE / 2; m <= WORLD_SIZE / 2; m += 40) {
+      g.beginPath();
+      g.moveTo(this.X(m), this.Y(-WORLD_SIZE / 2));
+      g.lineTo(this.X(m), this.Y(WORLD_SIZE / 2));
+      g.moveTo(this.X(-WORLD_SIZE / 2), this.Y(m));
+      g.lineTo(this.X(WORLD_SIZE / 2), this.Y(m));
       g.stroke();
     }
 
-    // ── the quarry rim, hatched on the inside edge like a cut face
-    const rim = this.hf.layout.quarryRim;
-    if (rim.some(p => this.known(p.x, p.z))) {
-      this.polyPath(g, rim);
-      g.strokeStyle = `rgba(${INK},0.75)`;
-      g.lineWidth = 1.4;
-      g.setLineDash([5, 3]);
-      g.stroke();
-      g.setLineDash([]);
-    }
-
-    // ── the creek
-    const creek = this.hf.layout.creek.path;
-    g.strokeStyle = `rgba(${WATER},0.7)`;
-    g.lineWidth = 1.1;
-    this.strokeKnown(g, creek);
-
-    // ── the path network, weighted by class so the map teaches the same
-    // hierarchy the ground does: a graded road reads differently from a
-    // game-trail you can lose.
     for (const edge of this.hf.layout.paths as PathEdge[]) {
-      if (edge.cls === 'main') { g.lineWidth = 2.3; g.strokeStyle = `rgba(${INK},0.82)`; g.setLineDash([]); }
-      else if (edge.cls === 'trail') { g.lineWidth = 1.5; g.strokeStyle = `rgba(${INK},0.62)`; g.setLineDash([]); }
-      else { g.lineWidth = 1.1; g.strokeStyle = `rgba(${INK},0.42)`; g.setLineDash([6, 4]); }
+      g.strokeStyle = `rgba(${INK},${edge.cls === 'main' ? 0.8 : edge.cls === 'trail' ? 0.58 : 0.40})`;
+      g.lineWidth = edge.cls === 'main' ? 2.2 : 1.3;
+      g.setLineDash(edge.cls === 'faint' ? [6, 5] : []);
       this.strokeKnown(g, edge.pts);
     }
     g.setLineDash([]);
 
-    // ── landmarks
     for (const k of this.carto.landmarks) {
-      if (!k.discovered) continue;
-      this.glyph(g, k.lm, k.seenAtDistance);
+      if (k.discovered) this.fallbackLandmark(g, k.lm, k.seenAtDistance);
     }
 
-    // ── pages: hinted as a query, collected as a tick
-    for (const p of this.carto.pages) {
-      if (!p.hinted) continue;
-      const X = this.X(p.x), Y = this.Y(p.z);
-      g.lineWidth = 1.4;
-      if (p.collected) {
-        g.strokeStyle = `rgba(${MARK},0.9)`;
-        g.beginPath();
-        g.moveTo(X - 3.5, Y); g.lineTo(X - 1, Y + 3); g.lineTo(X + 4, Y - 3.5);
-        g.stroke();
-      } else {
-        g.strokeStyle = `rgba(${MARK},0.55)`;
-        g.beginPath();
-        g.arc(X, Y, 4.5, 0, Math.PI * 2);
-        g.stroke();
-        g.fillStyle = `rgba(${MARK},0.75)`;
-        g.font = 'bold 8px ui-monospace, monospace';
-        g.textAlign = 'center'; g.textBaseline = 'middle';
-        g.fillText('?', X, Y + 0.5);
-      }
-    }
-
-    // ── the player. Drawn last, in pencil-warm ink so it never competes with
-    // the print, and as a heading arrow rather than a dot because knowing which
-    // way you face is the entire reason to open a map.
-    const X = this.X(px), Y = this.Y(pz);
-    g.save();
-    g.translate(X, Y);
-    // world +z is map +y (south), and yaw 0 faces -z, so the arrow's screen
-    // rotation is yaw about the sheet normal directly.
-    g.rotate(-yaw);
-    g.fillStyle = `rgba(${MARK},0.95)`;
-    g.beginPath();
-    g.moveTo(0, -7.5); g.lineTo(4.6, 5); g.lineTo(0, 2.6); g.lineTo(-4.6, 5);
-    g.closePath();
-    g.fill();
-    g.restore();
-    // a halo so the mark is findable on a busy sheet
-    g.strokeStyle = `rgba(${MARK},0.28)`;
-    g.lineWidth = 1;
-    g.beginPath(); g.arc(X, Y, 12, 0, Math.PI * 2); g.stroke();
+    g.fillStyle = `rgba(${INK},0.82)`;
+    g.font = '25px ui-monospace, monospace';
+    g.fillText('PINEWOOD FOREST', 25, 38);
+    this.drawReferenceReadouts(g);
   }
 
-  /** stroke only the surveyed spans of a polyline */
   private strokeKnown(g: CanvasRenderingContext2D, pts: readonly { x: number; z: number }[]): void {
     let drawing = false;
     g.beginPath();
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      if (this.known(p.x, p.z)) {
-        if (!drawing) { g.moveTo(this.X(p.x), this.Y(p.z)); drawing = true; }
-        else g.lineTo(this.X(p.x), this.Y(p.z));
-      } else {
-        drawing = false;
-      }
+    for (const p of pts) {
+      if (!this.known(p.x, p.z)) { drawing = false; continue; }
+      if (!drawing) { g.moveTo(this.X(p.x), this.Y(p.z)); drawing = true; }
+      else g.lineTo(this.X(p.x), this.Y(p.z));
     }
     g.stroke();
   }
 
-  /**
-   * A landmark glyph.
-   *
-   * Each kind gets a distinct mark rather than a shared pin, so the sheet is
-   * readable at a glance and at mobile scale — the icon-set rule that the set
-   * matters more than any one piece. All glyphs share one stroke weight, one
-   * ink, and a 9 px envelope; only the geometry differs.
-   */
-  private glyph(g: CanvasRenderingContext2D, lm: PinewoodLandmark, distant: boolean): void {
-    const X = this.X(lm.x), Y = this.Y(lm.z);
-    const a = distant ? 0.5 : 0.92;
-    g.strokeStyle = `rgba(${INK},${a})`;
-    g.fillStyle = `rgba(${INK},${a})`;
-    g.lineWidth = 1.5;
-    g.beginPath();
-
-    switch (lm.kind) {
-      case 'cabin':
-      case 'shack': {
-        // a gabled hut in plan — the shack is drawn broken-roofed
-        g.moveTo(X - 4.5, Y + 4); g.lineTo(X - 4.5, Y - 1); g.lineTo(X, Y - 5);
-        g.lineTo(X + 4.5, Y - 1); g.lineTo(X + 4.5, Y + 4);
-        if (lm.kind === 'cabin') g.closePath();
-        g.stroke();
-        break;
-      }
-      case 'tower': {
-        // splayed legs + a deck: the fire-lookout silhouette
-        g.moveTo(X - 4.5, Y + 5); g.lineTo(X - 1.6, Y - 2);
-        g.moveTo(X + 4.5, Y + 5); g.lineTo(X + 1.6, Y - 2);
-        g.moveTo(X - 3.4, Y + 1.5); g.lineTo(X + 3.4, Y + 1.5);
-        g.stroke();
-        g.beginPath();
-        g.rect(X - 2.6, Y - 5.4, 5.2, 3.4);
-        g.stroke();
-        break;
-      }
-      case 'quarry': {
-        // an open cut: three benched steps
-        g.moveTo(X - 5, Y + 4); g.lineTo(X - 5, Y + 1); g.lineTo(X - 1.6, Y + 1);
-        g.lineTo(X - 1.6, Y - 2); g.lineTo(X + 2, Y - 2); g.lineTo(X + 2, Y - 5);
-        g.lineTo(X + 5, Y - 5);
-        g.stroke();
-        break;
-      }
-      case 'ridge': {
-        // a summit chevron with a spot height tick
-        g.moveTo(X - 5.5, Y + 3.5); g.lineTo(X - 1.5, Y - 4); g.lineTo(X + 2, Y + 1);
-        g.lineTo(X + 5.5, Y - 3);
-        g.stroke();
-        break;
-      }
-      case 'rocks': {
-        // clustered boulders
-        g.moveTo(X - 5, Y + 3.5); g.lineTo(X - 2, Y - 2); g.lineTo(X + 1, Y + 3.5);
-        g.closePath(); g.stroke();
-        g.beginPath();
-        g.moveTo(X, Y + 3.5); g.lineTo(X + 3, Y - 0.5); g.lineTo(X + 5.5, Y + 3.5);
-        g.closePath(); g.stroke();
-        break;
-      }
-      case 'camp': {
-        // two tents
-        g.moveTo(X - 5.5, Y + 3.5); g.lineTo(X - 2.5, Y - 2.5); g.lineTo(X + 0.5, Y + 3.5);
-        g.closePath(); g.stroke();
-        g.beginPath();
-        g.moveTo(X + 0.5, Y + 3.5); g.lineTo(X + 3, Y - 0.5); g.lineTo(X + 5.5, Y + 3.5);
-        g.closePath(); g.stroke();
-        break;
-      }
-      case 'dock': {
-        // a jetty with piles
-        g.moveTo(X - 5, Y - 1.5); g.lineTo(X + 5, Y - 1.5);
-        g.moveTo(X - 3, Y - 1.5); g.lineTo(X - 3, Y + 3);
-        g.moveTo(X, Y - 1.5); g.lineTo(X, Y + 3);
-        g.moveTo(X + 3, Y - 1.5); g.lineTo(X + 3, Y + 3);
-        g.stroke();
-        break;
-      }
-      case 'clearing': {
-        // an open ring — an absence of trees, drawn as absence
-        g.arc(X, Y, 4.6, 0, Math.PI * 2);
-        g.setLineDash([3, 2.5]); g.stroke(); g.setLineDash([]);
-        break;
-      }
-      case 'lake': {
-        // no glyph: the water body is already the mark
-        break;
-      }
-      case 'trailhead': {
-        // a way-out arrow
-        g.moveTo(X - 4.5, Y); g.lineTo(X + 3, Y);
-        g.moveTo(X + 0.5, Y - 3.2); g.lineTo(X + 4.2, Y); g.lineTo(X + 0.5, Y + 3.2);
-        g.stroke();
-        break;
-      }
-      default: {
-        // junction: a crossroads tick
-        g.moveTo(X - 4, Y); g.lineTo(X + 4, Y);
-        g.moveTo(X, Y - 4); g.lineTo(X, Y + 4);
-        g.stroke();
-        break;
-      }
-    }
-
-    // Label. Only for places actually visited: a distant sighting tells you
-    // *that* something is there, not what it is called.
+  private fallbackLandmark(g: CanvasRenderingContext2D, lm: PinewoodLandmark, distant: boolean): void {
+    const x = this.X(lm.x), y = this.Y(lm.z);
+    g.strokeStyle = `rgba(${INK},${distant ? 0.45 : 0.82})`;
+    g.fillStyle = `rgba(${INK},${distant ? 0.45 : 0.82})`;
+    g.lineWidth = 1.4;
+    g.beginPath(); g.arc(x, y, 4, 0, Math.PI * 2); g.stroke();
     if (!distant && lm.kind !== 'hub') {
-      g.font = '9px ui-monospace, monospace';
-      g.textAlign = 'center'; g.textBaseline = 'top';
-      g.fillStyle = `rgba(${INK},0.62)`;
-      g.fillText(lm.name.toUpperCase(), X, Y + 7);
+      g.font = '10px ui-monospace, monospace';
+      g.textAlign = 'center';
+      g.textBaseline = 'top';
+      g.fillText(lm.name.toUpperCase(), x, y + 7);
     }
   }
 
-  /** legend / status line, rendered by the caller into DOM (crisper text) */
+  private drawPages(g: CanvasRenderingContext2D): void {
+    for (const p of this.carto.pages) {
+      if (!p.hinted) continue;
+      const x = this.X(p.x), y = this.Y(p.z);
+      g.lineWidth = 1.5;
+      if (p.collected) {
+        g.strokeStyle = `rgba(${MARK},0.95)`;
+        g.beginPath();
+        g.moveTo(x - 4, y); g.lineTo(x - 1, y + 3.5); g.lineTo(x + 5, y - 4);
+        g.stroke();
+      } else {
+        g.fillStyle = 'rgba(7,9,8,0.82)';
+        g.strokeStyle = `rgba(${MARK},0.86)`;
+        g.fillRect(x - 5, y - 6, 10, 12);
+        g.strokeRect(x - 5, y - 6, 10, 12);
+        g.beginPath(); g.moveTo(x - 2, y - 2); g.lineTo(x + 2, y - 2); g.stroke();
+        g.beginPath(); g.moveTo(x - 2, y + 1); g.lineTo(x + 2, y + 1); g.stroke();
+      }
+    }
+  }
+
+  private drawPlayer(g: CanvasRenderingContext2D, px: number, pz: number, yaw: number): void {
+    const x = this.X(px), y = this.Y(pz);
+    g.save();
+    g.translate(x, y);
+    g.rotate(-yaw);
+    g.fillStyle = `rgba(${MARK},0.98)`;
+    g.strokeStyle = 'rgba(18,14,5,0.92)';
+    g.lineWidth = 1.2;
+    g.beginPath();
+    g.moveTo(0, -9); g.lineTo(5.4, 6); g.lineTo(0, 3.2); g.lineTo(-5.4, 6);
+    g.closePath();
+    g.fill(); g.stroke();
+    g.restore();
+
+    g.strokeStyle = `rgba(${MARK},0.34)`;
+    g.lineWidth = 1;
+    g.beginPath(); g.arc(x, y, 13, 0, Math.PI * 2); g.stroke();
+  }
+
   status(): string {
     const pct = (this.carto.exploredFraction * 100).toFixed(0);
     return `SURVEYED ${pct}%   ·   LANDMARKS ${this.carto.discoveredCount}/${LANDMARKS.length}`
       + `   ·   RECORDINGS ${this.carto.collectedCount}/${this.carto.pages.length}`;
   }
 
-  /** map px of a world point, exposed for tests */
   debugPx(x: number, z: number): { px: number; py: number } { return worldToPx(x, z); }
 }
