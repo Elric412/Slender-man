@@ -1,0 +1,37 @@
+name: Apply live map render migration
+
+on:
+  push:
+    branches:
+      - ui/field-recorder-polish
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.event.head_commit.message == 'run live map render fixer'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ui/field-recorder-polish
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: node tools/apply-live-map-render-fix.mjs
+      - run: npm ci
+      - run: npm run build
+      - name: Commit migration result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main.ts src/game/Flashlight.ts
+          if git diff --cached --quiet; then
+            echo "No migration changes to commit"
+            exit 0
+          fi
+          git commit -m "wire live map and render quality systems"
+          git push origin HEAD:ui/field-recorder-polish
