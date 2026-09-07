@@ -23,6 +23,7 @@ const DIM = '154, 158, 151';
 const MARK = '214, 178, 82';
 const PAPER = '#080b09';
 const ART_PARTS = Array.from({ length: 6 }, (_, i) => `./ui/pinewood-map/map.${i}.b64`);
+const MAP_STYLE = './ui/map-reference.css';
 
 export class SurveyMap {
   private ctx: CanvasRenderingContext2D;
@@ -42,6 +43,7 @@ export class SurveyMap {
     const c = canvas.getContext('2d');
     if (!c) throw new Error('SurveyMap: 2D context unavailable');
     this.ctx = c;
+    this.enhanceMapChrome();
     void this.loadReferenceArt();
   }
 
@@ -50,6 +52,55 @@ export class SurveyMap {
     this.fogCanvas = null;
     this.fogCtx = null;
     this.fogImage = null;
+  }
+
+  /**
+   * Upgrade the existing map DOM without changing Menu/Main interfaces.
+   * The footer becomes a real keyboard/touch close control and queues the same
+   * KeyM action as the normal input path, so StaticGame remains the sole owner
+   * of map-open state and pointer-lock restoration.
+   */
+  private enhanceMapChrome(): void {
+    if (!document.getElementById('map-reference-css')) {
+      const link = document.createElement('link');
+      link.id = 'map-reference-css';
+      link.rel = 'stylesheet';
+      link.href = MAP_STYLE;
+      document.head.appendChild(link);
+    }
+
+    const sheet = this.canvas.closest('.map-sheet') as HTMLElement | null;
+    const overlay = this.canvas.closest('.map-overlay') as HTMLElement | null;
+    sheet?.classList.add('map-sheet-reference');
+    if (overlay) {
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.setAttribute('aria-label', 'Pinewood Forest survey map');
+    }
+
+    const foot = sheet?.querySelector('.map-foot') as HTMLElement | null;
+    if (!foot || foot.id === 'map-close') return;
+    foot.id = 'map-close';
+    foot.classList.add('map-close');
+    foot.setAttribute('role', 'button');
+    foot.setAttribute('tabindex', '0');
+    foot.setAttribute('aria-label', 'Close survey map');
+    foot.innerHTML = '<span class="map-close-key" aria-hidden="true">M</span><span>CLOSE MAP</span>';
+
+    const close = () => this.queueMapToggle();
+    foot.addEventListener('click', close);
+    foot.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      close();
+    });
+  }
+
+  /** Send the map toggle through Input rather than mutating UI state directly. */
+  private queueMapToggle(): void {
+    const init: KeyboardEventInit = { code: 'KeyM', key: 'm', bubbles: true };
+    window.dispatchEvent(new KeyboardEvent('keydown', init));
+    window.dispatchEvent(new KeyboardEvent('keyup', init));
   }
 
   /** Assemble the compressed artwork from small static text chunks once. */
@@ -104,30 +155,22 @@ export class SurveyMap {
     this.drawPlayer(g, px, pz, yaw);
   }
 
-  /**
-   * Draw the supplied survey artwork and remove information that must be live.
-   * The image is deliberately only a base plate; gameplay state always wins.
-   */
+  /** Draw the supplied survey artwork and remove information that must be live. */
   private drawReferenceArt(g: CanvasRenderingContext2D): void {
     g.drawImage(this.referenceArt!, 0, 0, REFERENCE_W, REFERENCE_H);
 
-    // Remove the baked 42% readout. A live value is painted after fog-of-war.
+    // Live readouts replace the baked 42% and 3/8 values.
     this.patch(g, 17, 82, 162, 31, 0.95);
-
-    // Remove the baked objective/progress block ("3/8 pages").
     this.patch(g, 807, 284, 205, 88, 0.96);
 
-    // The game calls them recordings/tapes rather than pages. Replace the one
-    // legend label while keeping the artwork's icon language and spacing.
+    // This game uses recordings/tapes rather than pages.
     this.patch(g, 861, 151, 145, 23, 0.93);
 
-    // The artwork includes its original spawn arrow. It must never remain behind
-    // after the player walks away, so erase only that tiny mark and redraw the
-    // actual player later.
+    // Remove the artwork's fixed player marker. The actual heading marker is
+    // drawn from Player state at the end of every map frame.
     this.patch(g, SPAWN_PX[0] - 10, SPAWN_PX[1] - 13, 21, 25, 0.90);
 
-    // The source painting shows all recording sites. Hide every baked site here;
-    // only hinted/collected locations are reintroduced from Cartography below.
+    // Hide all baked collectible sites. Only Cartography-hinted sites return.
     for (const p of this.carto.pages) {
       const x = this.X(p.x), y = this.Y(p.z);
       this.patch(g, x - 7, y - 8, 14, 17, 0.91);
@@ -182,12 +225,13 @@ export class SurveyMap {
     g.drawImage(this.fogCanvas, left, top, right - left, bottom - top);
     g.restore();
 
-    // A faint uniform wash makes the revealed/unknown boundary feel like pencil
-    // graphite rather than a videogame minimap mask.
+    // A faint wash softens the revealed edge into graphite instead of a HUD mask.
     g.save();
     g.globalAlpha = 0.08;
     g.fillStyle = '#000';
-    g.fillRect(Math.max(0, left), Math.max(0, top), Math.min(760, right) - Math.max(0, left), REFERENCE_H);
+    const washLeft = Math.max(0, left);
+    const washRight = Math.min(760, right);
+    if (washRight > washLeft) g.fillRect(washLeft, 0, washRight - washLeft, REFERENCE_H);
     g.restore();
   }
 
