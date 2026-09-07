@@ -501,13 +501,29 @@ export class MapGenerator {
           // Gradient of the two wave trains: the surface tilt, in world XZ.
           vec2 slope = 0.030 * cos(a1) * vec2(0.94, 0.34)
                      + 0.013 * cos(a2) * vec2(-0.42, 0.91);
-          // normal is in VIEW space by this point in the chunk order, so the
-          // world-space tilt has to be rotated through normalMatrix before it
-          // can be added. Skipping that conversion is a silent error rather
-          // than a compile failure: the ripple would sweep in whatever
-          // direction the camera happened to face, which reads as the whole
-          // lake surface rotating with the player's head.
-          vec3 tilt = normalMatrix * vec3(slope.x, 0.0, slope.y);
+          // `normal` is in VIEW space by this point in the chunk order, so the
+          // world-space tilt has to be rotated into view space before it can be
+          // added. Skipping the conversion is a silent error rather than a
+          // compile failure: the ripple would sweep in whatever direction the
+          // camera happened to face, which reads as the whole lake surface
+          // rotating with the player's head.
+          //
+          // The transform is mat3(viewMatrix) — world -> view — NOT normalMatrix.
+          // Two reasons, and the first one is why this shader previously failed
+          // to compile at all:
+          //
+          //  1. three.js only declares normalMatrix in the VERTEX prefix. Naming
+          //     it here produced 'undeclared identifier' and the whole
+          //     MeshStandardMaterial fell back to a non-compiled program, so the
+          //     lake rendered untextured and the console filled with shader
+          //     errors every frame.
+          //  2. normalMatrix is object -> view. `slope` is already world-space
+          //     (it is built from vWaterPos.xz), so applying it would have
+          //     concatenated the model transform twice.
+          //
+          // viewMatrix's upper 3x3 is a pure rotation for a normal camera, so it
+          // needs no inverse-transpose to carry a direction correctly.
+          vec3 tilt = mat3(viewMatrix) * vec3(slope.x, 0.0, slope.y);
           normal = normalize(normal + tilt);
         }`);
     };
