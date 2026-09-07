@@ -7,6 +7,7 @@ const SRC = fileURLToPath(new URL('../src/', import.meta.url));
 const shaderMarker = /\/\*\s*glsl\s*\*\/\s*`/g;
 const failures = [];
 let shaderCount = 0;
+let glsl3Count = 0;
 
 async function walk(dir) {
   const out = [];
@@ -53,24 +54,20 @@ function extractShaderTemplates(source, file) {
   return templates;
 }
 
-function lintShader(shader, file, index) {
+function lintRenderGraphShader(shader, file, index) {
   const label = `${file} shader #${index + 1}`;
 
-  // THREE.GLSL3 injects the version directive itself. Supplying one in the
-  // source creates a duplicate directive at runtime and fails compilation.
+  // src/render is STATIC's custom WebGL2 post graph and explicitly uses
+  // THREE.GLSL3. Three injects the version directive, so source-level #version
+  // would be duplicated at runtime.
   if (/^\s*#version\b/m.test(shader)) {
     failures.push(`${label}: do not include #version; THREE.GLSL3 injects it`);
   }
-
-  // STATIC's render graph is GLSL ES 3.00. Catch legacy WebGL1 spellings that
-  // would fail at runtime without trying to parse interpolated template bodies.
-  // Interpolations can legitimately make a single extracted template look
-  // structurally incomplete, so brace-counting is intentionally avoided here.
   if (/\bgl_FragColor\b/.test(shader)) {
-    failures.push(`${label}: gl_FragColor is invalid in the GLSL3 pipeline; use fragColor`);
+    failures.push(`${label}: gl_FragColor is invalid in the GLSL3 render graph; use fragColor`);
   }
   if (/\btexture2D\s*\(/.test(shader)) {
-    failures.push(`${label}: texture2D() is legacy GLSL; use texture()`);
+    failures.push(`${label}: texture2D() is legacy GLSL in the GLSL3 render graph; use texture()`);
   }
 }
 
@@ -84,11 +81,21 @@ for (const path of await walk(SRC)) {
 
   const shaders = extractShaderTemplates(source, file);
   shaderCount += shaders.length;
-  shaders.forEach((shader, index) => lintShader(shader, file, index));
+
+  // Important distinction: world/entity material patches are injected into
+  // Three's built-in material shaders and legitimately use Three's legacy
+  // texture2D spelling. Only the custom render graph is guaranteed GLSL3.
+  if (file.startsWith('render/')) {
+    glsl3Count += shaders.length;
+    shaders.forEach((shader, index) => lintRenderGraphShader(shader, file, index));
+  }
 }
 
 if (shaderCount === 0) {
   failures.push('No /* glsl */ template literals found under src; shader lint would be a no-op');
+}
+if (glsl3Count === 0) {
+  failures.push('No GLSL3 render-graph templates found under src/render; GLSL3 lint would be a no-op');
 }
 
 if (failures.length) {
@@ -97,4 +104,4 @@ if (failures.length) {
   process.exit(1);
 }
 
-console.log(`Shader lint passed (${shaderCount} GLSL template${shaderCount === 1 ? '' : 's'}).`);
+console.log(`Shader lint passed (${shaderCount} templates, ${glsl3Count} GLSL3 render-graph templates).`);
