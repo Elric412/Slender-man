@@ -6,10 +6,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run test:map-ui && npm run lint:shaders && vite build",
+    "build": "npm run test:map-ui && npm run test:live-map-render && npm run lint:shaders && vite build",
     "preview": "vite preview --port 4173",
     "test": "npm run build && playwright test",
     "test:map-ui": "node tools/map-ui-contract.mjs",
+    "test:live-map-render": "node tools/live-map-render-contract.mjs",
     "typecheck": "tsc --noEmit",
     "lint:shaders": "node tools/lint-shaders.mjs",
     "palebark:report": "esbuild tools/mesh-report.ts --bundle --platform=node --format=esm --outfile=.tmp/mesh-report.mjs --external:three && node .tmp/mesh-report.mjs",
