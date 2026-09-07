@@ -1,0 +1,137 @@
+/* Pinewood reference-map presentation. Loaded lazily by SurveyMap so the main
+   HUD stylesheet remains independent of the optional authored map artwork. */
+
+.map-sheet.map-sheet-reference {
+  position: relative;
+  width: min(96vw, 146vh, 1420px);
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  background: #050706;
+  border: 1px solid rgba(139, 143, 128, 0.28);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.72),
+    0 20px 72px rgba(0, 0, 0, 0.78),
+    inset 0 0 80px rgba(0, 0, 0, 0.34);
+}
+
+.map-sheet-reference .map-head {
+  display: none;
+}
+
+.map-sheet-reference .map-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1024 / 683;
+  border: 0;
+  background: #050706;
+  image-rendering: auto;
+}
+
+/* SurveyMap paints the readable status into the sheet itself. Keep this DOM
+   copy available to assistive tech without duplicating text on screen. */
+.map-sheet-reference .map-status {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.map-close {
+  position: absolute;
+  left: clamp(14px, 3.1%, 38px);
+  bottom: clamp(12px, 3.4%, 34px);
+  z-index: 2;
+  min-width: 132px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border: 1px solid rgba(184, 186, 173, 0.36);
+  background: rgba(3, 5, 4, 0.82);
+  color: rgba(222, 218, 204, 0.84);
+  font: 11px/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px #000;
+  cursor: pointer;
+  user-select: none;
+  pointer-events: auto;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.map-close-key {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(206, 202, 185, 0.46);
+  color: rgba(222, 218, 204, 0.92);
+  letter-spacing: 0;
+}
+
+.map-close:focus-visible {
+  outline: 2px solid var(--ui-focus, #ded19f);
+  outline-offset: 3px;
+}
+
+.map-close:active {
+  border-color: var(--accent, #c8b98a);
+  color: var(--accent, #c8b98a);
+  background: rgba(7, 8, 6, 0.96);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .map-close:hover {
+    border-color: rgba(200, 185, 138, 0.72);
+    color: var(--accent, #c8b98a);
+    background: rgba(11, 12, 8, 0.90);
+  }
+}
+
+@media (max-width: 760px) {
+  .map-sheet.map-sheet-reference {
+    width: min(98vw, 146vh);
+  }
+
+  .map-close {
+    left: 10px;
+    bottom: 10px;
+    min-width: 116px;
+    min-height: 44px;
+    padding: 8px 10px;
+    font-size: 10px;
+    letter-spacing: 0.10em;
+  }
+
+  .map-close-key {
+    display: none;
+  }
+}
+
+@media (max-height: 480px) and (pointer: coarse) {
+  .map-sheet.map-sheet-reference {
+    width: min(98vw, 145vh);
+  }
+
+  .map-close {
+    left: 8px;
+    bottom: 8px;
+    min-width: 102px;
+    min-height: 40px;
+    padding: 7px 9px;
+    font-size: 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-overlay { animation: none; }
+}
