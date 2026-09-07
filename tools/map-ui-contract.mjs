@@ -31,6 +31,21 @@ expectText(survey, "new KeyboardEvent('keydown'", 'close action uses normal map 
 expectText(css, 'aspect-ratio: 1024 / 683', 'reference map responsive aspect ratio');
 expectText(css, '.map-close', 'map close touch/focus styling');
 
+// Interaction/readability contract. The authored sheet is still a live tool, not
+// a screenshot: players must be able to inspect it on mouse, trackpad and touch
+// without the exploration veil crushing the underlying geography to black.
+expectText(survey, 'UNKNOWN_ALPHA', 'map fog readability cap');
+const alpha = survey.match(/UNKNOWN_ALPHA\s*=\s*(\d+)/)?.[1];
+if (!alpha) failures.push('map fog readability cap: numeric UNKNOWN_ALPHA missing');
+else if (Number(alpha) > 170) failures.push(`map fog too opaque: UNKNOWN_ALPHA=${alpha} (>170)`);
+expectText(survey, 'bindInteractions', 'map interaction binding');
+expectText(survey, "addEventListener('wheel'", 'map wheel/trackpad zoom');
+expectText(survey, "addEventListener('pointerdown'", 'map drag/pinch start');
+expectText(survey, 'zoomAt(', 'cursor/pinch anchored zoom');
+expectText(survey, 'panBy(', 'map pan');
+expectText(survey, 'present(', 'map viewport presentation');
+expectText(css, 'touch-action: none', 'touch map gesture ownership');
+
 try {
   const art = Buffer.from(chunks.map(v => v.trim()).join(''), 'base64');
   if (art.length < 10_000) failures.push(`reference artwork unexpectedly small (${art.length} bytes)`);
