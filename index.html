@@ -9,48 +9,53 @@
 <link rel="manifest" href="./manifest.webmanifest" />
 <title>STATIC</title>
 <link rel="stylesheet" href="./src/style.css" />
+<link rel="stylesheet" href="./src/ui-polish.css" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2305070a'/%3E%3Ctext x='8' y='23' font-size='18' fill='%239aa5ad' font-family='monospace'%3ES%3C/text%3E%3C/svg%3E" />
 </head>
 <body>
 <div id="app">
   <canvas id="game-canvas"></canvas>
 
-  <!-- ============ LOADING ============ -->
-  <div id="loading-screen" class="screen">
+  <div id="loading-screen" class="screen" aria-live="polite">
     <div class="load-inner">
       <div class="load-logo">S T A T I C</div>
       <div class="load-sub">PINE BRIDGE COUNTY &mdash; BACKCOUNTRY SURVEY ARCHIVE</div>
-      <div class="load-bar-wrap"><div id="load-bar" class="load-bar"></div></div>
+      <div class="load-bar-wrap" aria-hidden="true"><div id="load-bar" class="load-bar"></div></div>
       <div id="load-status" class="load-status">initializing&hellip;</div>
     </div>
   </div>
 
-  <!-- ============ TITLE ============ -->
   <div id="title-screen" class="screen hidden">
     <div class="title-flicker"></div>
     <div class="title-inner">
-      <div class="title-rec"><span class="rec-dot"></span>REC&nbsp;&nbsp;03:14:07&nbsp;&nbsp;BATT&nbsp;12%</div>
-      <div class="title-logo">S T A T I C</div>
-      <div class="title-tag">eight tapes. one forest. it already knows you're here.</div>
-      <nav class="title-menu">
-        <button id="btn-start" class="menu-btn">BEGIN RECOVERY</button>
-        <button id="btn-settings" class="menu-btn">SETTINGS</button>
-        <button id="btn-about" class="menu-btn">FIELD NOTES</button>
-      </nav>
-      <div class="title-foot">headphones strongly recommended &middot; click a button to enable audio</div>
+      <div class="title-copy">
+        <div class="title-rec"><span class="rec-dot"></span>REC&nbsp;&nbsp;03:14:07&nbsp;&nbsp;BATT&nbsp;12%</div>
+        <div class="title-logo">S T A T I C</div>
+        <div class="title-tag">eight tapes. one forest. it already knows you're here.</div>
+      </div>
+      <div class="title-rail">
+        <nav class="title-menu" aria-label="Main menu">
+          <button id="btn-start" class="menu-btn primary">
+            <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#play"></use></svg>
+            <span>BEGIN RECOVERY</span>
+          </button>
+          <button id="btn-settings" class="menu-btn">
+            <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#settings"></use></svg>
+            <span>SETTINGS</span>
+          </button>
+          <button id="btn-about" class="menu-btn">
+            <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#notes"></use></svg>
+            <span>FIELD NOTES</span>
+          </button>
+        </nav>
+        <div class="title-foot">headphones strongly recommended &middot; click a button to enable audio</div>
+      </div>
     </div>
   </div>
 
-  <!-- ============ CONTENT ADVISORY ============ -->
-  <!--
-    Shown once, before the first run can start, gated on settings.advisoryAck.
-    Brief §11 requires this to be brief and honest rather than a legal wall of
-    text: the player is told what the sound design actually does to them, and is
-    given the two controls that matter *before* they need them.
-  -->
   <div id="advisory-screen" class="screen hidden">
-    <div class="panel">
-      <div class="panel-title">BEFORE YOU START</div>
+    <div class="panel" role="dialog" aria-labelledby="advisory-title" aria-modal="true">
+      <div id="advisory-title" class="panel-title">BEFORE YOU START</div>
       <div class="panel-body">
         <p>STATIC uses intense sound design as its primary tool. Specifically:</p>
         <ul class="advisory-list">
@@ -75,14 +80,16 @@
         </div>
         <p class="dim">Headphones are recommended, but the game is mixed to still work on laptop and phone speakers.</p>
       </div>
-      <button id="btn-advisory-ok" class="menu-btn">I UNDERSTAND &mdash; CONTINUE</button>
+      <button id="btn-advisory-ok" class="menu-btn primary">
+        <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#check"></use></svg>
+        <span>I UNDERSTAND &mdash; CONTINUE</span>
+      </button>
     </div>
   </div>
 
-  <!-- ============ ABOUT ============ -->
   <div id="about-screen" class="screen hidden">
-    <div class="panel">
-      <div class="panel-title">FIELD NOTES &mdash; INCIDENT 11-C</div>
+    <div class="panel" role="dialog" aria-labelledby="about-title">
+      <div id="about-title" class="panel-title">FIELD NOTES &mdash; INCIDENT 11-C</div>
       <div class="panel-body">
         <p>Pinebridge Station was a U.S. survey outpost, evacuated in a single night. A four-person team never signed out.</p>
         <p>Their field recorders are still out there. Recover all <strong>eight tapes</strong>, then reach the fire-access road at the east boundary.</p>
@@ -90,14 +97,16 @@
         <p>Locals had a name for what the team found. They called it <em>Palebark</em>. It hears. It watches. If the picture starts to break up, it is close.</p>
         <p class="dim">STATIC is an original work of interactive fiction. Any resemblance to existing properties is coincidental.</p>
       </div>
-      <button class="menu-btn back-btn" data-back>BACK</button>
+      <button class="menu-btn back-btn" data-back>
+        <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#back"></use></svg>
+        <span>BACK</span>
+      </button>
     </div>
   </div>
 
-  <!-- ============ SETTINGS ============ -->
   <div id="settings-screen" class="screen hidden">
-    <div class="panel">
-      <div class="panel-title">SETTINGS</div>
+    <div class="panel settings-panel" role="dialog" aria-labelledby="settings-title">
+      <div id="settings-title" class="panel-title">SETTINGS</div>
       <div class="panel-body settings-grid">
         <label for="set-quality">Quality</label>
         <select id="set-quality">
@@ -113,12 +122,6 @@
 
         <div class="settings-section">VISUAL COMFORT</div>
 
-        <!--
-          Scales film grain, signal noise, scanlines and tape dropout together.
-          At 0 the image is clean; the found-footage identity still reads through
-          the viewfinder, the AgX grade and the vignette. Costs no performance
-          either way — this is a comfort control, not a quality tier.
-        -->
         <label for="set-filmnoise">Film grain &amp; video noise</label>
         <input id="set-filmnoise" type="range" min="0" max="100" value="100" />
 
@@ -140,22 +143,19 @@
 
         <label for="set-lowfreq">
           Low-frequency intensity
-          <span class="hint">Deep sub-bass pressure effects. Set to 0 to remove them
-          entirely; this is independent of master volume.</span>
+          <span class="hint">Deep sub-bass pressure effects. Set to 0 to remove them entirely; this is independent of master volume.</span>
         </label>
         <input id="set-lowfreq" type="range" min="0" max="100" value="55" />
 
         <label for="set-nightmode">
           Night / small-speaker mode
-          <span class="hint">Evens out loudness and lifts mid frequencies. Easier on
-          laptop and phone speakers, but flattens the intended dynamic range.</span>
+          <span class="hint">Evens out loudness and lifts mid frequencies. Easier on laptop and phone speakers, but flattens the intended dynamic range.</span>
         </label>
         <input id="set-nightmode" type="checkbox" />
 
         <label for="set-audiocues">
           Visual sound cues
-          <span class="hint">Captions important audio-only information — approach
-          warnings and escalation — separately from dialogue subtitles.</span>
+          <span class="hint">Captions important audio-only information &mdash; approach warnings and escalation &mdash; separately from dialogue subtitles.</span>
         </label>
         <input id="set-audiocues" type="checkbox" />
 
@@ -163,10 +163,7 @@
 
         <label for="set-proximity">
           Warn when it is near
-          <span class="hint">Off is the intended experience &mdash; you are meant
-          to be unsure. <em>Diegetic</em> lets the tape react a little sooner,
-          with nothing added to the screen. <em>On-screen</em> shows a direct
-          indicator with a direction.</span>
+          <span class="hint">Off is the intended experience &mdash; you are meant to be unsure. <em>Diegetic</em> lets the tape react a little sooner, with nothing added to the screen. <em>On-screen</em> shows a direct indicator with a direction.</span>
         </label>
         <select id="set-proximity">
           <option value="off">Off (intended)</option>
@@ -194,68 +191,69 @@
         <label for="set-fov">Field of view</label>
         <input id="set-fov" type="range" min="60" max="100" value="75" />
       </div>
-      <button class="menu-btn back-btn" data-back>BACK</button>
+      <button class="menu-btn back-btn" data-back>
+        <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#back"></use></svg>
+        <span>BACK</span>
+      </button>
     </div>
   </div>
 
-  <!-- ============ PAUSE ============ -->
   <div id="pause-screen" class="screen hidden translucent">
-    <div class="panel">
-      <div class="panel-title">PAUSED &mdash; TAPE HELD</div>
+    <div class="panel" role="dialog" aria-labelledby="pause-title">
+      <div id="pause-title" class="panel-title">PAUSED &mdash; TAPE HELD</div>
       <div class="panel-body"><p class="dim">The forest is not waiting for you. It just doesn't need to hurry.</p></div>
-      <nav class="title-menu">
-        <button id="btn-resume" class="menu-btn">RESUME</button>
-        <button id="btn-pause-settings" class="menu-btn">SETTINGS</button>
-        <button id="btn-quit" class="menu-btn">ABANDON RUN</button>
+      <nav class="title-menu" aria-label="Pause menu">
+        <button id="btn-resume" class="menu-btn primary">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#play"></use></svg>
+          <span>RESUME</span>
+        </button>
+        <button id="btn-pause-settings" class="menu-btn">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#settings"></use></svg>
+          <span>SETTINGS</span>
+        </button>
+        <button id="btn-quit" class="menu-btn danger">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#exit"></use></svg>
+          <span>ABANDON RUN</span>
+        </button>
       </nav>
     </div>
   </div>
 
-  <!-- ============ END ============ -->
   <div id="end-screen" class="screen hidden">
     <div class="end-inner">
       <div id="end-title" class="end-title">TAPE ENDS</div>
       <div id="end-detail" class="end-detail"></div>
       <div id="end-stats" class="end-stats"></div>
-      <button id="btn-restart" class="menu-btn">REWIND &amp; RE-ENTER</button>
-      <button id="btn-title" class="menu-btn">MAIN MENU</button>
+      <button id="btn-restart" class="menu-btn primary">
+        <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#restart"></use></svg>
+        <span>REWIND &amp; RE-ENTER</span>
+      </button>
+      <button id="btn-title" class="menu-btn">
+        <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#home"></use></svg>
+        <span>MAIN MENU</span>
+      </button>
     </div>
   </div>
 
-  <!-- ============ CAPTURE FLASH ============ -->
   <div id="capture-overlay" class="hidden"></div>
 
-  <!-- ============ HUD ============ -->
   <div id="hud" class="hidden">
-    <!-- persistent camcorder chrome: the title screen has REC/BATT, so the
-         in-game frame keeps that identity instead of going HUD-bare during play -->
     <div id="hud-chrome" class="hud-chrome">
       <span class="rec-dot"></span>REC&nbsp;&nbsp;<span id="hud-clock">00:00:00</span>&nbsp;&nbsp;BATT&nbsp;<span id="hud-batt">100%</span>
     </div>
     <div id="tape-counter" class="tape-counter hidden"><span id="tape-count">0</span> / 8 TAPES</div>
-    <!-- pickup exposure blink: one-frame "the camera noticed" stutter, so a
-         tape recovery reads physically without opening the HUD floodgates -->
     <div id="pickup-flash" class="pickup-flash" aria-hidden="true"></div>
     <div id="interact-prompt" class="interact-prompt hidden">E &mdash; RECOVER TAPE</div>
-    <div id="subtitle" class="subtitle hidden"></div>
-    <!--
-      Audio-cue captions (§11). Deliberately a *separate* element from #subtitle,
-      styled differently and positioned higher, so a player who needs it can tell
-      "this is information about the world" apart from "this is someone talking".
-    -->
+    <div id="subtitle" class="subtitle hidden" aria-live="polite"></div>
     <div id="audio-cue" class="audio-cue hidden" aria-live="polite"></div>
+
     <div id="viewfinder-overlay" class="viewfinder hidden">
       <div class="vf-corner tl"></div><div class="vf-corner tr"></div>
       <div class="vf-corner bl"></div><div class="vf-corner br"></div>
       <div class="vf-label">&#9654; PLAY &nbsp;&nbsp;SP&nbsp;&nbsp;CAM 01&nbsp;&nbsp;<span id="vf-time">-0:04</span></div>
       <div class="vf-scan"></div>
     </div>
-    <!--
-      Proximity tell (`explicit` mode only). A bearing dial rather than a bar:
-      the useful question is "which way do I not walk", and a bare intensity
-      number would just teach the player to stand still and watch it. Hidden
-      unless the setting asks for it — see src/world/ProximityTell.ts.
-    -->
+
     <div id="proximity-tell" class="proximity-tell hidden" aria-hidden="true">
       <div class="pt-dial">
         <div class="pt-ring"></div>
@@ -264,9 +262,6 @@
       <div id="pt-label" class="pt-label">NEAR</div>
     </div>
 
-    <!-- survey map overlay. The sheet itself is drawn to canvas from world
-         geometry (see src/ui/SurveyMap.ts); only the chrome is DOM, because
-         text is crisper as text. -->
     <div id="map-overlay" class="map-overlay hidden">
       <div class="map-sheet">
         <div class="map-head">
@@ -282,29 +277,37 @@
     <div id="rotate-prompt" class="rotate-prompt hidden">ROTATE DEVICE FOR BEST EXPERIENCE</div>
     <div id="perf-overlay" class="perf-overlay hidden"></div>
 
-    <!-- touch controls -->
     <div id="touch-ui" class="hidden">
       <div id="stick-zone"><div id="stick-base"><div id="stick-nub"></div></div></div>
-      <!--
-        Labels are TEXT, not emoji. The codepoints these buttons used to carry
-        (U+1F526 torch, U+270B raised hand, U+2B07 down arrow, U+23E9
-        fast-forward, U+231A watch, U+1F5FA map) are drawn by the OS from its
-        own colour emoji font, so they arrive as saturated blue/yellow/orange
-        cartoon discs sitting on top of a near-black forest. On a phone they
-        were the brightest pixels on screen — brighter than the moon, brighter
-        than the flashlight — and they read as a toy app rather than found
-        footage. Short stencil words in the HUD's own mono face cost nothing,
-        inherit the amber/ink palette, sit visually with the REC/BATT chrome
-        that is already on screen, and stay localisable through aria-label.
-      -->
       <div class="touch-buttons">
-        <button id="tb-flash" class="tbtn" aria-label="flashlight">LAMP</button>
-        <button id="tb-interact" class="tbtn" aria-label="interact">TAKE</button>
-        <button id="tb-crouch" class="tbtn" aria-label="crouch">CRCH</button>
-        <button id="tb-sprint" class="tbtn" aria-label="sprint">RUN</button>
-        <button id="tb-vf" class="tbtn" aria-label="viewfinder">VIEW</button>
-        <button id="tb-map" class="tbtn" aria-label="survey map">MAP</button>
-        <button id="tb-pause" class="tbtn small" aria-label="pause">II</button>
+        <button id="tb-flash" class="tbtn" aria-label="flashlight">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#flashlight"></use></svg>
+          <span class="tbtn-label">Lamp</span>
+        </button>
+        <button id="tb-interact" class="tbtn" aria-label="interact">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#take"></use></svg>
+          <span class="tbtn-label">Take</span>
+        </button>
+        <button id="tb-crouch" class="tbtn" aria-label="crouch">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#crouch"></use></svg>
+          <span class="tbtn-label">Crouch</span>
+        </button>
+        <button id="tb-sprint" class="tbtn" aria-label="sprint">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#run"></use></svg>
+          <span class="tbtn-label">Run</span>
+        </button>
+        <button id="tb-vf" class="tbtn" aria-label="viewfinder">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#viewfinder"></use></svg>
+          <span class="tbtn-label">View</span>
+        </button>
+        <button id="tb-map" class="tbtn" aria-label="survey map">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#map"></use></svg>
+          <span class="tbtn-label">Map</span>
+        </button>
+        <button id="tb-pause" class="tbtn small" aria-label="pause">
+          <svg class="ui-icon" aria-hidden="true"><use href="./ui/ui-icons.svg#pause"></use></svg>
+          <span class="tbtn-label">Pause</span>
+        </button>
       </div>
     </div>
   </div>
