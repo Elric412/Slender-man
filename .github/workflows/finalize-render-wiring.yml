@@ -1,0 +1,41 @@
+name: Finalize render wiring
+
+on:
+  push:
+    branches:
+      - render/night-shadow-wiring
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.event.head_commit.message == 'finalize render wiring'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: render/night-shadow-wiring
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Apply source wiring
+        run: node tools/apply-render-wiring.mjs
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify render ownership
+        run: node tools/render-wiring-contract.mjs
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Commit generated source and clean relay
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main.ts
+          git rm tools/apply-render-wiring.mjs .github/workflows/finalize-render-wiring.yml
+          git commit -m "wire NightLighting and ShadowQuality into runtime"
+          git push origin HEAD:render/night-shadow-wiring
