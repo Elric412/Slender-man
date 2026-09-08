@@ -904,6 +904,21 @@ class StaticGame {
     // session opens at the previous run's act, so the narrative dread floor and
     // every capability gate (stalking, prediction, confrontation) start unlocked.
     this.progression.reset();
+    // The rest of the horror stack is per-run state for the same reason. The
+    // behaviour model in particular must not persist: it would open the second
+    // run already convinced the player sprints, hoards the flashlight and takes
+    // predictable routes, and the entity would act on a profile built from a
+    // session the player has effectively forgotten.
+    //
+    // The two directors take the run seed rather than the world seed, so two
+    // runs on the identical map still schedule different beats — the map is
+    // meant to be learnable, the encounters are not.
+    this.behaviour.reset();
+    this.director.begin(this.runSeed);
+    this.encounters.begin(this.runSeed);
+    // Force the objective set to rebuild on the next tick even if the tape count
+    // happens to match the previous run's opening value.
+    this.objectivesForTapes = -1;
     // Carry the mode across but drop the accumulated value, so a fresh run never
     // opens with a warning inherited from the previous one's final moments.
     this.tell.reset();
