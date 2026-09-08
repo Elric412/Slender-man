@@ -266,12 +266,26 @@ interface Placement {
 }
 
 /** A ground-detail card, decided once and re-merged on demand. */
+/** Ground-cover families, kept as a closed union so a census cannot silently
+ *  invent a category (or miss one) when a new card type is added. */
+type FloorFamily = 'reed' | 'fern' | 'leafDry' | 'leafBroad';
+
 interface FloorItem {
   geo: RawGeo;
   x: number; y: number; z: number;
   yaw: number; leanX: number; leanZ: number;
   tr: number; tg: number; tb: number;
   h: number;
+  /**
+   * Which ground-cover family this card belongs to.
+   *
+   * Stored rather than re-derived from `geo`, because the tile atlas is shared:
+   * reeds and ferns both draw from TILE.fern and differ only in their aspect
+   * ratio, so the geometry alone cannot answer "what is this". `detailCensus()`
+   * reads this to prove the floor is a mix of distinct things and not one asset
+   * repeated forty thousand times.
+   */
+  family: FloorFamily;
 }
 
 interface Chunk {
@@ -882,13 +896,19 @@ export class ScatterSystem {
 
       const roll = crng.next() * total;
       let tile: number, w: number, h: number, bow: number;
+      let family: FloorFamily;
       if (roll < reed) {
+        // Tall and narrow: reads as a reed even though it shares the fern tile.
         tile = TILE.fern; w = 0.5; h = 1.15 + crng.next() * 0.7; bow = 0.28;
+        family = 'reed';
       } else if (roll < reed + fern) {
         tile = TILE.fern; w = 1.15 + crng.next() * 0.6; h = 0.5 + crng.next() * 0.45; bow = 0.18;
+        family = 'fern';
       } else {
-        tile = crng.next() < 0.45 ? TILE.leafDry : TILE.leafBroad;
+        const dry = crng.next() < 0.45;
+        tile = dry ? TILE.leafDry : TILE.leafBroad;
         w = 0.75 + crng.next() * 0.55; h = 0.22 + crng.next() * 0.28; bow = 0.1;
+        family = dry ? 'leafDry' : 'leafBroad';
       }
 
       const tint = 0.78 + crng.next() * 0.34;
@@ -902,6 +922,7 @@ export class ScatterSystem {
         leanZ: crng.range(-0.18, 0.18),
         tr: tint * 0.95, tg: tint, tb: tint * 0.9,
         h,
+        family,
       });
     }
     return out;

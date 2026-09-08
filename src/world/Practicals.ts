@@ -75,6 +75,10 @@ interface Practical extends PracticalDef {
   glowMat: THREE.MeshBasicMaterial | null;
   bulbMat: THREE.MeshStandardMaterial | null;
   dist2: number;
+  /** extinguished by the wrongness system; skipped by flicker and pooling */
+  doused: boolean;
+  /** intensity as authored, so relightAll() can restore it exactly */
+  baseIntensity: number;
 }
 
 /** Colour temperature helpers, so the art direction is stated in Kelvin. */
@@ -116,6 +120,7 @@ export class Practicals {
       fl: 1, slot: -1, ramp: 0,
       phase: this.items.length * 2.399963,   // golden-angle: no two in phase
       glowMat: null, bulbMat: null, dist2: Infinity,
+      doused: false, baseIntensity: def.intensity,
     };
 
     // --- visible hot surface -------------------------------------------------
@@ -167,6 +172,61 @@ export class Practicals {
     this.items.push(p);
   }
 
+  /**
+   * Extinguish the nearest practical to a point, permanently for this run.
+   *
+   * The environmental-wrongness system's strongest and cheapest tool. A lamp
+   * that was burning when you walked past it and is dark when you come back is
+   * the ideal deniable change: it has an obvious mundane explanation (it ran
+   * out), it needs no new geometry, and it is only unsettling if the player
+   * happens to remember — which is exactly the "was that always like that?"
+   * reaction the brief asks for.
+   *
+   * Implemented as a hard state change rather than a flicker so it cannot be
+   * mistaken for the existing `fluor`/`beacon` flicker kinds, which the player
+   * has already learned to read as normal.
+   *
+   * @param minDistance refuse if the nearest candidate is closer than this, so
+   *        a light never dies in the player's face — that reads as a scripted
+   *        effect, and the whole value of this beat is deniability.
+   * @returns the position of the doused light, or null if none qualified.
+   */
+  douse(x: number, z: number, minDistance = 24): { x: number; y: number; z: number } | null {
+    let best: Practical | null = null;
+    let bd = Infinity;
+    for (const p of this.items) {
+      if (p.doused) continue;
+      const d = Math.hypot(p.x - x, p.z - z);
+      if (d < minDistance) continue;
+      if (d < bd) { bd = d; best = p; }
+    }
+    if (!best) return null;
+    best.doused = true;
+    best.intensity = 0;
+    // Kill the visible source too. Leaving a lit bulb on a dead light is the
+    // kind of half-applied state change that reads as a bug rather than as
+    // something having happened.
+    if (best.bulbMat) best.bulbMat.emissiveIntensity = 0;
+    if (best.glowMat) best.glowMat.opacity = 0;
+    return { x: best.x, y: best.y, z: best.z };
+  }
+
+  /** How many practicals have been extinguished this run. */
+  get dousedCount(): number {
+    let n = 0;
+    for (const p of this.items) if (p.doused) n++;
+    return n;
+  }
+
+  /** Relight everything. Called on run start; wrongness is per-run state. */
+  relightAll(): void {
+    for (const p of this.items) {
+      if (!p.doused) continue;
+      p.doused = false;
+      p.intensity = p.baseIntensity;
+    }
+  }
+
   /** Is any practical tagged `tag` currently within `r` metres of (x,z)? */
   litNear(x: number, z: number, r: number, tag?: string): boolean {
     const r2 = r * r;
@@ -203,6 +263,10 @@ export class Practicals {
     // Each kind is a different physical failure mode. Sine-only flicker reads
     // as "shader effect"; these read as fire, gas and dying ballast.
     for (const p of this.items) {
+      // A doused light is out. Skipping it here rather than zeroing at the end
+      // keeps the emissive and glow surfaces dark too — the flicker block below
+      // writes both every frame and would otherwise resurrect them.
+      if (p.doused) { p.fl = 0; continue; }
       const ph = p.phase;
       switch (p.flickerKind) {
         case 'flame':
@@ -259,7 +323,7 @@ export class Practicals {
       p.dist2 = dx * dx + dy * dy + dz * dz;
     }
     const ranked = this.items
-      .filter(p => p.dist2 < (p.range + 34) * (p.range + 34))
+      .filter(p => !p.doused && p.dist2 < (p.range + 34) * (p.range + 34))
       .sort((a, b) => a.dist2 - b.dist2)
       .slice(0, this.pool.length);
     const chosen = new Set(ranked);
