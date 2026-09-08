@@ -429,26 +429,37 @@ export class AudioDirector {
   get currentAct(): DirectorState['act'] { return this.act; }
 
   /**
-   * Externally-commanded silence — the `absence` encounter beat.
+   * Externally requested cut-to-quiet, for the encounter director's `absence`
+   * beat.
    *
-   * Distinct from the director's own cut-to-quiet on purpose. A cut-to-quiet is
-   * *rationed* out of the cliché budget because it is a startle-adjacent device
-   * (pull the bed at the moment the player expects a swell). An absence beat is
-   * the opposite instrument: the EncounterDirector has decided the world should
-   * simply stop for a while, with no payoff attached, and that must not compete
-   * for the same budget or it would starve the device that does have a payoff.
+   * The mechanism already existed but could only ever trigger itself, off
+   * rising tension or a stalk transition. An absence beat is the opposite
+   * situation — the encounter director wants the world to go quiet precisely
+   * when *nothing* is happening, because a player who has learned that quiet
+   * means safe has learned to stop being afraid of most of the run.
    *
-   * Takes the longer of the two windows rather than overwriting, so a director
-   * cut already in flight is never shortened by an absence request.
+   * Deliberately routed through the same budget and the same cooldown as the
+   * self-triggered path rather than around them. Silence only reads as an event
+   * against a floor of ordinary sound (see the note at the top of this file), so
+   * an unbudgeted external caller could spend the run's entire silence
+   * allowance and leave the bed too sparse for any of it to register. Returning
+   * false lets the caller record a refusal instead of assuming it fired.
+   *
+   * @param seconds requested length; clamped to the same 1.4-5.2 s band the
+   *                internal path uses, so an external request cannot produce a
+   *                duration the player could never otherwise hear and thereby
+   *                become learnable as "this one was scripted".
    */
-  requestQuiet(seconds: number): void {
-    const s = Math.max(0, Math.min(30, seconds));
-    if (s <= this.cutRemaining) return;
-    this.cutRemaining = s;
-    // Push the director's own next cut out past this window: two silences
-    // back to back read as an audio bug, not as an absence.
-    this.cutTimer = Math.max(this.cutTimer, s + 25);
-    this.reason = `absence beat ${s.toFixed(1)}s (external)`;
+  requestQuiet(seconds: number): boolean {
+    if (this.act === 'opening') return false;
+    if (this.cutRemaining > 0 || this.cutTimer > 0) return false;
+    if (!this.canSpend('cutToQuiet')) return false;
+    this.spend('cutToQuiet');
+    this.cutRemaining = Math.min(5.2, Math.max(1.4, seconds));
+    this.cutTimer = this.rng.range(45, 105);
+    this.reason = `cut-to-quiet ${this.cutRemaining.toFixed(1)}s (absence beat)`;
+    this.onCutToQuiet?.(this.cutRemaining);
+    return true;
   }
 
   /** Ask permission to fire a budgeted stinger-class event. */
