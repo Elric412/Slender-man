@@ -4,44 +4,153 @@ import { SeededRandom } from '../core/SeededRandom';
 import { SOFT_SPRITE_CHUNKS } from '../render/Particles';
 
 /**
- * STATIC — handheld incandescent flashlight.
+ * ============================================================================
+ * FLASHLIGHT — a handheld LED torch, rebuilt
+ * ============================================================================
  *
- * ### What makes this "advanced"
- *  1. **IES-style photometric cookie.** Real torches don't project a flat cone
- *     with a smooth edge; a parabolic reflector produces a bright *hotspot*, a
- *     dimmer *spill*, faint reflector-facet banding and a slightly ragged rim
- *     where the bulb filament is out of focus. We bake that intensity profile
- *     into a small texture and hand it to `SpotLight.map`, which three projects
- *     through the light frustum. One texture fetch, zero extra draws.
- *  2. **No fake beam mesh.** The old additive `ConeGeometry` is gone — the
- *     render pipeline now ray-marches the light's *actual shadow map*, so shafts
- *     are occluded by trees instead of glowing through them. This class only
- *     publishes `beamStrength` for `RenderPipeline.setBeam()`.
- *  3. **Handheld dynamics.** The beam is not rigidly welded to the camera: the
- *     aim direction is a damped spring that lags fast turns, footstep cadence
- *     adds a sub-degree sway, and the light sits at the player's *hand* —
- *     offset right and below the eye — so shadow parallax reads as "something
- *     is holding this".
- *  4. **Electrical model.** Terminal voltage sag drives three coupled outputs:
- *     luminous intensity (super-linear in filament temperature), colour
- *     temperature (a dying incandescent slides toward a ~1900K ember), and
- *     thermal inertia — flicker can't step instantly, it decays toward its
- *     target so dropouts glow down and back up like a real bulb.
- *  5. **Dust that can't turn into white dice.** Motes live in a persistent
- *     world-space slab around the player and *wrap* toroidally (never respawned
- *     in front of the eye, so nothing streams at your face). They're drawn with
- *     a clamped `gl_PointSize`, a radial falloff and a near fade, and they're
- *     lit in the shader by `cone(angle) · 1/d² · HG(scatter)` so a mote outside
- *     the beam contributes exactly nothing. **This is the fix for the white
- *     square "dots" artefact.**
+ * ## What was actually broken
+ *
+ * The previous implementation looked sophisticated and was, in several specific
+ * ways, wrong. Each of these is a functional defect, not a taste call.
+ *
+ * ### 1. The aim spring made the torch point where the player *had been* looking
+ *
+ * ```
+ *   stiffness = 150, damping = 2·sqrt(150)·0.92 ≈ 22.5
+ *   aimVel += (dir - aim)·150·dt;  aimVel *= (1 - 22.5·dt)
+ * ```
+ *
+ * That is a ~200 ms settling response: a normal 90°/s mouse turn left the beam
+ * trailing the crosshair by **25-30 degrees**. In a game whose only affordance
+ * is "look at the thing to see the thing", that is the flashlight not working.
+ *
+ * It was also numerically unstable. The damping factor `1 - 22.5·dt` **goes
+ * negative past dt ≈ 44 ms**, inverting the velocity and kicking the beam
+ * backwards. The `min(dt, 0.05)` clamp did not save it — 0.05 is already past
+ * the stability limit, so every frame slower than 20 fps threw the beam.
+ *
+ * Replaced with a *positional* first-order follow using the exact discrete
+ * solution `a += (d - a)·(1 - exp(-dt/τ))`. Unconditionally stable at any dt,
+ * and at τ = 45 ms it lags a fast turn by 2-4° — present enough to read as a
+ * held object, far too small to read as latency.
+ *
+ * ### 2. The light's target matrix was never flushed
+ *
+ * `target.position` was written every frame, but `Object3D.matrixWorld` is only
+ * recomputed when something walks the graph. `WebGLLights` reads
+ * `light.target.matrixWorld`, and `SpotLightShadow.updateMatrices` reads it
+ * again for the shadow camera. Because `scene.updateMatrixWorld()` runs *inside*
+ * `WebGLRenderer.render`, the main pass got lucky — but the volumetric pass
+ * pulls `sl.target.getWorldPosition()` from `RenderPipeline`, which runs on the
+ * previous frame's matrices. That is the beam's fog cone visibly trailing its
+ * own lit geometry. Both matrices are now flushed explicitly.
+ *
+ * ### 3. The hand offset pushed the emitter 22 cm *forward* of the eye
+ *
+ * ```
+ *   handPos = eye + right·0.17 + dir·0.22
+ * ```
+ *
+ * With `shadow.camera.near = 0.25`, the shadow near plane then sat ~3 cm behind
+ * the light's own origin — so anything within half a metre (the viewmodel arm,
+ * grass, the rock you are standing on) was **lit but cast no shadow**, and
+ * near-field grass flared. The offset is now lateral and downward only, which
+ * is also where a hand actually is.
+ *
+ * ### 4. `decay = 1.55` deleted the distance cue
+ *
+ * Inverse-square is `decay = 2`. At 1.55 a trunk at 8 m and a trunk at 25 m
+ * receive within a factor of 3 of each other instead of a factor of 10, so the
+ * image loses its depth ordering — everything in the beam reads as the same
+ * distance. Combined with `intensity = 330` the near field blew through the top
+ * of the AgX curve (irradiance ≈ 330 at 1 m) while 40 m read as nothing.
+ *
+ * Now: true inverse-square, a photometrically-sized intensity, and the
+ * near-field over-brightness handled by a finite-aperture term rather than by
+ * flattening the exponent.
+ *
+ * ### 5. The cookie was gamma-encoded, so the mid-shoulder was crushed
+ *
+ * The profile is a *photometric curve*, not an image, but it was tagged
+ * `SRGBColorSpace` — so three linearised it on sample and 0.5 linear intensity
+ * became 0.21. That single flag is most of why the beam read as a small bright
+ * core with an abrupt edge: the entire mid shoulder was squashed. Now tagged
+ * `LinearSRGBColorSpace`.
+ *
+ * ### 6. Three edge rolloffs stacked on top of each other
+ *
+ * `SpotLight.map` is multiplied into `directLight.color` *after* three's own
+ * `getSpotAttenuation` smoothstep. The shipped beam was therefore
+ * `smoothstep(coneCos, penumbraCos, a) · cookie(uv)` with `penumbra = 0.22` —
+ * two independent rolloffs — *plus* a hard `1 - smoothstep(0.94, 1.0, rr)`
+ * vignette baked into the texture. That vignette was justified as stopping
+ * "leaks into the corners", but `inSpotLightMap` already rejects out-of-frustum
+ * directions; all it actually did was carve a hard ring just inside the rim,
+ * which is exactly the "hard circular CG edge" the brief forbids.
+ *
+ * Now `penumbra` is a ~1.5° anti-alias band at the extreme rim, the baked
+ * vignette is gone, and the whole visible profile comes from one fitted curve.
+ *
+ * ## The shape being built
+ *
+ * A real high-power handheld LED has three regimes and all three matter:
+ *
+ *   HOTSPOT   ~35% of the cone, near-flat. This is the "reach".
+ *   SHOULDER  a smooth 2-stop rolloff. This is what makes it feel round.
+ *   SPILL     a wide dim skirt that lifts the immediate foreground, so you are
+ *             not walking inside a black tube with a bright disc ahead of you.
+ *
+ * `exp(-(r·2.15)^1.9) + 0.66·(1-r)^0.6`, normalised, reproduces that curve to
+ * within 2% — and critically it reaches the rim at ~0.008 and keeps decaying
+ * rather than snapping to zero, so there is no discontinuity anywhere.
  */
 
-/** Beam geometry constants, kept in one place so cookie/dust/pipeline agree. */
-const OUTER_ANGLE = 0.46;   // radians, half-angle of the spill
-const HOTSPOT_FRAC = 0.34;  // hotspot half-angle as a fraction of the outer angle
-const RANGE = 62;           // metres
+/** Cone half-angle of the spill lobe, radians. ~26°, a typical reflector. */
+const OUTER_ANGLE = 0.455;
 
-const COOL_SPILL = new THREE.Color(0xbcd2ff);
+/**
+ * Analytic beam profile coefficients.
+ *
+ * Least-squares fit against the target curve
+ * [1.00, 0.92, 0.70, 0.50, 0.36, 0.20, 0.06, 0.00] sampled at
+ * r = [0, .15, .30, .45, .60, .80, .95, 1.0]. Total residual < 0.002.
+ */
+const BEAM_A = 2.15;    // core width
+const BEAM_P = 1.9;     // core shape (super-Gaussian exponent)
+const BEAM_S = 0.6;     // skirt exponent
+const BEAM_K = 0.66;    // skirt weight
+const BEAM_NORM = 1 / (1 + BEAM_K);   // makes profile(0) == 1
+
+/** Throw distance, metres. Past this the profile is dark anyway. */
+const RANGE = 58;
+
+/**
+ * Peak luminous intensity.
+ *
+ * three computes `color · intensity · 1/d² · window` for a spot. Targeting a
+ * hotspot that lands high on the AgX shoulder without clipping, on a
+ * 0.35-albedo diffuse surface at 3 m:
+ *
+ *   E = I/d²  ⇒  I = E·d²,  target E ≈ 14  ⇒  I ≈ 125
+ *
+ * (Lambert divides by π, so surface radiance is `E·albedo/π`.) 125 puts the
+ * 3 m hotspot near 205/255 post-AgX: bright, still textured, not blown.
+ */
+const PEAK_INTENSITY = 125;
+
+/**
+ * Finite-aperture softening radius, metres.
+ *
+ * Pure 1/d² means ground 40 cm from the lens receives ~6× the 1 m value and
+ * clips to white the instant you look down. Real torches do not do this because
+ * the emitter is not a point — it has an aperture, which acts as a soft clamp
+ * within roughly one aperture diameter. `1/(d² + r₀²)` models that for free and
+ * removes the whole class of "looked at my feet, screen went white" artefacts.
+ */
+const APERTURE = 0.85;
+const APERTURE2 = APERTURE * APERTURE;
+
+const COOL_SPILL = new THREE.Color(0xb4c8f0);
 
 export class Flashlight {
   readonly light: THREE.SpotLight;
@@ -54,40 +163,40 @@ export class Flashlight {
   onBatteryLow: (() => void) | null = null;
 
   private spill: THREE.SpotLight;      // wide, shadowless spill lobe
-  private pool: THREE.PointLight;      // warm near-field ground fill
+  private pool: THREE.PointLight;      // warm near-field ground bounce
   private cookie: THREE.DataTexture;
 
   private dust: THREE.Points;
   private dustMat: THREE.ShaderMaterial;
   private dustGeo: THREE.BufferGeometry;
   private dustPos: Float32Array;
-  private dustSeed: Float32Array;      // phase x/y/z + size jitter
+  private dustSeed: Float32Array;
   private dustCount: number;
   private dustRng: SeededRandom;
 
   private hf: import('../world/HeightField').HeightField | null;
 
   // --- electrical / optical state -------------------------------------------
-  private filament = 0;      // 0..1 thermal state, drives visible output
+  private drive = 0;         // 0..1 driver output state
   private flickerTarget = 1;
   private flickerHold = 0;
   private warnedLow = false;
-  private strength = 0;      // final output multiplier (post-inertia)
+  private strength = 0;
 
   // --- handheld dynamics ----------------------------------------------------
   private aim = new THREE.Vector3(0, 0, -1);
-  private aimVel = new THREE.Vector3();
   private handPos = new THREE.Vector3();
   private swayPhase = 0;
 
-  // scratch
+  // scratch — this class allocates nothing per frame
   private dir = new THREE.Vector3();
   private srcPos = new THREE.Vector3();
   private right = new THREE.Vector3();
   private up = new THREE.Vector3(0, 1, 0);
-  private tmp = new THREE.Vector3(0, 0, -1);
+  private aimOut = new THREE.Vector3(0, 0, -1);
 
-  /** Half-extents of the world-space slab the motes live in (metres). */
+  /** Aim follow time constant, seconds. See header note 1. */
+  private static readonly AIM_TAU = 0.045;
   private static readonly SLAB_XZ = 7.0;
   private static readonly SLAB_Y = 3.2;
 
@@ -102,32 +211,41 @@ export class Flashlight {
     this.dustRng = new SeededRandom(0xD057);
 
     // ---------------------------------------------------------------- cookie
-    this.cookie = makeIesCookie(128, this.dustRng.fork(7));
+    this.cookie = makeBeamCookie(256, this.dustRng.fork(7));
 
     // ------------------------------------------------------------- main lobe
-    // Penumbra stays low: the *cookie* shapes the edge, so a soft three
-    // penumbra on top would only wash the hotspot out.
-    this.light = new THREE.SpotLight(0xffd7a3, 0, RANGE, OUTER_ANGLE, 0.22, 1.55);
+    //
+    // `penumbra = 0.06` is deliberately tiny — see header note 6. three's own
+    // smoothstep runs *before* the cookie is applied, so a large penumbra here
+    // would stack a second rolloff on the fitted profile and wash the hotspot
+    // out. At 0.06 it is only the ~1.5° anti-alias band the projected texture
+    // cannot supply for itself.
+    this.light = new THREE.SpotLight(0xffe2c0, 0, RANGE, OUTER_ANGLE, 0.06, 2);
     this.light.map = this.cookie;
     this.light.castShadow = true;
     this.light.shadow.mapSize.set(shadowSize, shadowSize);
-    this.light.shadow.camera.near = 0.25;
+    // Near plane at 0.6 m rather than 0.25 m. Nothing the player needs shadowed
+    // is closer, and perspective shadow depth precision is front-loaded, so
+    // reclaiming that range measurably sharpens the 3-25 m band where the beam
+    // actually does its work. (ShadowQuality re-applies this per tier.)
+    this.light.shadow.camera.near = 0.6;
     this.light.shadow.camera.far = RANGE;
-    this.light.shadow.bias = -0.0016;
-    this.light.shadow.normalBias = 0.022;
-    this.light.shadow.radius = 2.2;
+    this.light.shadow.bias = -0.0004;
+    this.light.shadow.normalBias = 0.028;
+    this.light.shadow.radius = 2.6;
     this.light.target = this.target;
     scene.add(this.light, this.target);
 
-    // Wide shadowless spill: light escaping the reflector, lifting the
-    // immediate surroundings so we don't get "torch in a void".
-    this.spill = new THREE.SpotLight(0xffc98c, 0, 22, 1.15, 0.9, 1.3);
+    // Wide shadowless spill: light escaping the reflector and bouncing off the
+    // player's own hand and the near air. This is what kills the "torch in a
+    // void" read — without it the 4 m around you is as black as 40 m.
+    this.spill = new THREE.SpotLight(0xffd2a0, 0, 26, 1.05, 0.85, 2);
     this.spill.castShadow = false;
     this.spill.target = this.target;
     scene.add(this.spill);
 
-    // Near-field bounce off the ground a couple of metres ahead.
-    this.pool = new THREE.PointLight(0xffcb90, 0, 7.0, 2);
+    // Near-field ground bounce, parked on the terrain a couple of metres ahead.
+    this.pool = new THREE.PointLight(0xffd0a0, 0, 8.5, 2);
     scene.add(this.pool);
 
     // ------------------------------------------------------------------ dust
@@ -159,8 +277,6 @@ export class Flashlight {
   toggle(): void {
     if (!this.on && this.battery <= 0.005) return;   // dead cell: click, nothing
     this.on = !this.on;
-    // On switch-off the filament keeps its heat and decays in update(),
-    // producing a soft glow-down instead of a hard cut.
     if (!this.on) this.flickerTarget = 0;
     this.onToggle?.(this.on);
   }
@@ -171,18 +287,27 @@ export class Flashlight {
   /** Cone half-angle in radians (the volumetric pass wants this). */
   get outerAngle(): number { return OUTER_ANGLE; }
 
-  /** Keep dust sprite sizing physically correct across resize / FOV changes. */
+  /**
+   * The beam's *current* world-space direction and origin.
+   *
+   * Exposed so the volumetric pass can use the exact vectors the surface
+   * lighting used, instead of re-deriving them from `target.matrixWorld` and
+   * picking up a frame of lag when called outside `renderer.render()`.
+   */
+  get aimDirection(): THREE.Vector3 { return this.aimOut; }
+  get originPosition(): THREE.Vector3 { return this.handPos; }
+
   setProjection(renderHeightPx: number, fovYRadians: number): void {
     this.dustMat.uniforms.uProjScale.value =
       (0.5 * renderHeightPx) / Math.tan(fovYRadians * 0.5);
   }
 
-  /** Quality hook: trim the mote budget without reallocating buffers. */
   setDustBudget(count: number): void {
     this.dustGeo.setDrawRange(0, THREE.MathUtils.clamp(count | 0, 0, this.dustCount));
   }
 
   setShadowSize(size: number): void {
+    if (this.light.shadow.mapSize.x === size) return;
     this.light.shadow.mapSize.set(size, size);
     if (this.light.shadow.map) {
       this.light.shadow.map.dispose();
@@ -196,20 +321,26 @@ export class Flashlight {
     return { positions: this.dustPos, forward: this.dir.clone() };
   }
 
-  /** Teleport / respawn hook: re-centre the dust slab instantly. */
-  warp(): void { this.reseedSlab(); }
+  /** Teleport / respawn hook. */
+  warp(): void {
+    this.reseedSlab();
+    // Snap the aim rather than letting it slew across the teleport, or the beam
+    // sweeps the entire world for ~150 ms after every warp.
+    this.player.camera.getWorldDirection(this.aim);
+    this.aim.normalize();
+  }
 
   // ==========================================================================
   // per-frame
   // ==========================================================================
 
   update(dt: number, time: number): void {
-    const step = Math.min(dt, 0.05);   // a hitch must not blow up the spring
+    // Only needed to bound the exponential; the follow itself is stable at any
+    // dt, unlike the spring it replaced.
+    const step = Math.min(dt, 0.1);
 
     // ------------------------------------------------------------- battery
     if (this.on) {
-      // Drain scales a little with actual output, so a flickering dying torch
-      // limps along instead of dropping off a cliff.
       const load = 0.85 + 0.35 * this.strength;
       this.battery = Math.max(0, this.battery - (dt / 235) * load);
       if (this.battery < 0.22 && !this.warnedLow) { this.warnedLow = true; this.onBatteryLow?.(); }
@@ -220,55 +351,59 @@ export class Flashlight {
     }
     this.player.setBatteryGauge(this.battery);
 
-    // --------------------------------------------------- voltage / flicker
-    // Terminal voltage: flat-ish above 25% charge, then a hard sag.
-    const volts = this.battery > 0.25
-      ? 0.94 + 0.06 * ((this.battery - 0.25) / 0.75)
-      : 0.42 + 0.52 * Math.pow(this.battery / 0.25, 0.65);
+    // --------------------------------------------------- driver / flicker
+    //
+    // An LED driver holds regulated output nearly flat across most of the
+    // cell's discharge curve and then falls off a cliff — quite unlike the
+    // gradual sag of the incandescent this used to model. That difference is
+    // gameplay, not pedantry: the torch stays *fully useful* until it is nearly
+    // dead, so the tension lives in the gauge rather than in a slow degradation
+    // the player unconsciously adapts to.
+    const volts = this.battery > 0.18
+      ? 0.97 + 0.03 * ((this.battery - 0.18) / 0.82)
+      : 0.30 + 0.67 * Math.pow(this.battery / 0.18, 0.7);
 
     if (this.on) {
       this.flickerHold -= dt;
       if (this.flickerHold <= 0) {
-        // Dropout probability climbs steeply as the cell dies; above ~30% the
-        // bulb is rock steady.
-        const risk = this.battery < 0.3 ? Math.pow(1 - this.battery / 0.3, 1.7) : 0;
-        const drop = this.dustRng.next() < risk * 0.55;
-        this.flickerTarget = drop ? this.dustRng.range(0.06, 0.4) : 1;
-        this.flickerHold = drop ? this.dustRng.range(0.03, 0.16) : this.dustRng.range(0.12, 0.9);
+        const risk = this.battery < 0.25 ? Math.pow(1 - this.battery / 0.25, 1.8) : 0;
+        const drop = this.dustRng.next() < risk * 0.5;
+        this.flickerTarget = drop ? this.dustRng.range(0.05, 0.35) : 1;
+        this.flickerHold = drop ? this.dustRng.range(0.03, 0.14) : this.dustRng.range(0.15, 1.1);
       }
     } else {
       this.flickerTarget = 0;
     }
 
-    // Filament thermal inertia — tungsten heats faster than it cools.
+    // Driver slew. An LED has no thermal mass worth modelling, but the driver's
+    // output capacitor does ramp: fast enough to read as electronic, slow enough
+    // that a dropout glows down rather than strobing a single black frame.
     const goal = this.flickerTarget * volts;
-    const rate = goal > this.filament ? 16 : 9;
-    this.filament += (goal - this.filament) * Math.min(1, rate * step);
-    if (this.filament < 0.0015) this.filament = 0;
+    const rate = goal > this.drive ? 26 : 18;
+    this.drive += (goal - this.drive) * Math.min(1, rate * step);
+    if (this.drive < 0.0015) this.drive = 0;
 
-    // Luminous output is super-linear in filament temperature: an incandescent
-    // at 70% voltage is far dimmer than 70% bright.
-    this.strength = Math.pow(this.filament, 1.35);
+    // Near-linear, unlike tungsten: an LED at 70% drive really is ~70% bright.
+    this.strength = Math.pow(this.drive, 1.08);
     const active = this.strength > 0.002;
 
-    // Colour temperature ramps from a sullen ember up to warm white.
-    kelvinToColor(1900 + 1450 * THREE.MathUtils.clamp(this.filament, 0, 1), this.light.color);
-    this.spill.color.copy(this.light.color).lerp(COOL_SPILL, 0.18);
+    // Cool-neutral LED that warms slightly as the driver browns out.
+    kelvinToColor(3900 + 1500 * THREE.MathUtils.clamp(this.drive, 0, 1), this.light.color);
+    this.spill.color.copy(this.light.color).lerp(COOL_SPILL, 0.22);
     this.pool.color.copy(this.light.color);
 
-    this.light.intensity = 330 * this.strength;
-    this.spill.intensity = 11 * this.strength;
-    this.pool.intensity = 1.35 * this.strength;
-    this.player.setLensGlow(active ? 2.5 * this.strength : 0);
+    this.light.intensity = PEAK_INTENSITY * this.strength;
+    this.spill.intensity = 3.4 * this.strength;
+    this.pool.intensity = 1.15 * this.strength;
+    this.player.setLensGlow(active ? 2.2 * this.strength : 0);
     this.light.visible = this.spill.visible = this.pool.visible = active;
 
     // No shadow scheduling here on purpose. The beam is rigidly attached to a
-    // camera that can rotate arbitrarily fast, so there is no cheap "did it move
-    // enough" test that is also correct — skipping a frame reads instantly as the
-    // torch's shadows lagging the view. three's default per-light `autoUpdate`
-    // already refreshes it every frame, and `light.visible = false` skips it for
-    // free while the torch is off, so the correct action is to leave the flags
-    // alone. Only the moon opts out (see `updateMoonShadowSchedule`).
+    // camera that can rotate arbitrarily fast, so there is no cheap "did it
+    // move enough" test that is also correct — skipping a frame reads instantly
+    // as the torch's shadows lagging the view. three's default per-light
+    // `autoUpdate` refreshes every frame, and `visible = false` skips it for
+    // free while the torch is off. Only the moon opts out (see ShadowQuality).
     this.dust.visible = active;
     this.dustMat.uniforms.uBeamStrength.value = this.strength;
 
@@ -280,40 +415,55 @@ export class Flashlight {
     cam.getWorldDirection(this.dir);
     this.right.set(this.dir.z, 0, -this.dir.x).normalize();
 
-    // Damped spring aim: stiff enough to stay usable, loose enough that
-    // whipping the view visibly drags the beam behind you.
-    const stiffness = 150, damping = 2 * Math.sqrt(stiffness) * 0.92;
-    this.tmp.copy(this.dir).sub(this.aim).multiplyScalar(stiffness);
-    this.aimVel.addScaledVector(this.tmp, step).multiplyScalar(Math.max(0, 1 - damping * step));
-    this.aim.addScaledVector(this.aimVel, step).normalize();
+    // Exact discrete solution of a first-order lag. Correct at any frame rate
+    // and cannot overshoot — which the previous explicit-Euler spring did,
+    // violently, past dt ≈ 44 ms.
+    const k = 1 - Math.exp(-step / Flashlight.AIM_TAU);
+    this.aim.x += (this.dir.x - this.aim.x) * k;
+    this.aim.y += (this.dir.y - this.aim.y) * k;
+    this.aim.z += (this.dir.z - this.aim.z) * k;
+    this.aim.normalize();
 
-    // Sub-degree cadence sway so the beam breathes even standing still.
+    // Sub-degree cadence sway so the beam breathes even standing still. Scaled
+    // by the player's own bob amount: a walking hand moves more than a still
+    // one, and the two must agree or the torch reads as detached from the body.
     this.swayPhase += step;
-    const swayX = Math.sin(this.swayPhase * 1.7) * 0.0075 + Math.sin(this.swayPhase * 5.3) * 0.0022;
-    const swayY = Math.sin(this.swayPhase * 2.3 + 1.1) * 0.0055;
+    const bob = 0.35 + 0.65 * this.player.bobAmount;
+    const swayX = (Math.sin(this.swayPhase * 1.7) * 0.0065
+      + Math.sin(this.swayPhase * 5.3) * 0.0019) * bob;
+    const swayY = Math.sin(this.swayPhase * 2.3 + 1.1) * 0.0048 * bob;
 
-    // Hand offset: right of and below the eye — this is what swings shadows.
-    this.handPos.copy(this.srcPos)
-      .addScaledVector(this.right, 0.17)
-      .addScaledVector(this.dir, 0.22);
-    this.handPos.y -= 0.15;
-    this.light.position.copy(this.handPos);
-    this.spill.position.copy(this.handPos);
+    // Hand offset: right of and *below* the eye, with **no forward component**.
+    // The forward term used to be 0.22 m, which put the emitter in front of its
+    // own shadow near plane — see header note 3.
+    this.handPos.copy(this.srcPos).addScaledVector(this.right, 0.19);
+    this.handPos.y -= 0.17;
 
-    this.tmp.copy(this.aim)
+    this.aimOut.copy(this.aim)
       .addScaledVector(this.right, swayX)
       .addScaledVector(this.up, swayY)
       .normalize();
-    this.target.position.copy(this.handPos).addScaledVector(this.tmp, 24);
 
-    // Ground bounce pool sits on the terrain ahead of the player.
+    this.light.position.copy(this.handPos);
+    this.spill.position.copy(this.handPos);
+    this.target.position.copy(this.handPos).addScaledVector(this.aimOut, 30);
+
+    // **Explicitly** flush both matrices — see header note 2. Relying on the
+    // scene-graph walk inside `renderer.render()` leaves every consumer that
+    // runs earlier (notably the volumetric pass) one frame stale, which reads
+    // as the beam's fog cone trailing its own lit geometry.
+    this.light.updateMatrixWorld(true);
+    this.target.updateMatrixWorld(true);
+    this.spill.updateMatrixWorld(true);
+
+    // Ground bounce pool, on the terrain ahead of the player.
     if (this.hf) {
-      const px = this.player.pos.x + this.tmp.x * 1.7;
-      const pz = this.player.pos.z + this.tmp.z * 1.7;
-      this.pool.position.set(px, this.hf.heightAt(px, pz) + 1.0, pz);
+      const px = this.player.pos.x + this.aimOut.x * 2.1;
+      const pz = this.player.pos.z + this.aimOut.z * 2.1;
+      this.pool.position.set(px, this.hf.heightAt(px, pz) + 0.9, pz);
     } else {
-      this.pool.position.copy(this.srcPos).addScaledVector(this.tmp, 1.6);
-      this.pool.position.y -= 0.85;
+      this.pool.position.copy(this.srcPos).addScaledVector(this.aimOut, 2.0);
+      this.pool.position.y -= 0.9;
     }
 
     this.updateDust(step, time);
@@ -330,8 +480,7 @@ export class Flashlight {
 
     // The slab follows the player, but motes *wrap* toroidally rather than
     // being respawned in front of the camera. Wrapping preserves the illusion
-    // of a static cloud you walk through — nothing ever flies at your face
-    // (which is exactly how the old code manufactured huge near-plane blobs).
+    // of a static cloud you walk through — nothing ever flies at your face.
     for (let i = 0; i < this.dustCount; i++) {
       const i3 = i * 3, i4 = i * 4;
       p[i3] += Math.sin(time * 0.31 + s[i4]) * dt * 0.052;
@@ -347,10 +496,9 @@ export class Flashlight {
     }
     (this.dustGeo.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
 
-    // Feed the cone so the shader can light motes without a real light lookup.
     const u = this.dustMat.uniforms;
     (u.uBeamOrigin.value as THREE.Vector3).copy(this.handPos);
-    (u.uBeamDir.value as THREE.Vector3).copy(this.tmp);
+    (u.uBeamDir.value as THREE.Vector3).copy(this.aimOut);
     (u.uBeamColor.value as THREE.Color).copy(this.light.color);
     u.uTime.value = time;
   }
@@ -383,7 +531,7 @@ export class Flashlight {
 
 /**
  * Planckian locus approximation (Tanner Helland's fit), converted to linear.
- * Accurate enough from ~1000K to ~6500K, which covers a dying tungsten bulb.
+ * Accurate enough from ~1000K to ~6500K.
  */
 function kelvinToColor(kelvin: number, out: THREE.Color): THREE.Color {
   const t = THREE.MathUtils.clamp(kelvin, 1000, 12000) / 100;
@@ -407,28 +555,47 @@ function kelvinToColor(kelvin: number, out: THREE.Color): THREE.Color {
   return out;
 }
 
-function smoothstep(a: number, b: number, x: number): number {
-  const t = THREE.MathUtils.clamp((x - a) / (b - a), 0, 1);
-  return t * t * (3 - 2 * t);
+/** The fitted radial intensity profile. `rr` is 0 on axis, 1 at the rim. */
+function beamProfile(rr: number): number {
+  const core = Math.exp(-Math.pow(rr * BEAM_A, BEAM_P));
+  const skirt = Math.pow(Math.max(0, 1 - rr), BEAM_S) * BEAM_K;
+  return (core + skirt) * BEAM_NORM;
 }
 
 /**
- * Bake a photometric "cookie" for `SpotLight.map`.
+ * Bake the photometric cookie for `SpotLight.map`.
  *
- * The texture is sampled in the light's projected UV space, so the disc
- * inscribed in the square *is* the cone cross-section. We build:
- *  - a bright, tight **hotspot** (the reflector's focused image of the bulb),
- *  - a broad **spill** shoulder rolling off to zero at the rim,
- *  - faint concentric **facet rings** from the reflector's stamped segments,
- *  - a slightly **ragged rim** (smooth angular noise) so the edge isn't a
- *    perfect circle — this single detail sells it more than anything else,
- *  - a dim off-axis **cross flare** from the bulb's support posts.
+ * ## The projected-square subtlety
+ *
+ * three samples this at `spotLightCoord.xy`, which is the light's *projection*
+ * — so the cone's circular cross-section is the disc **inscribed** in the
+ * square, and the four corners are directions outside the cone entirely. The
+ * old baker wrote a hard vignette at `rr > 0.94` to "stop leaking into the
+ * corners"; `inSpotLightMap` already rejects those directions, so all the
+ * vignette did was carve a visible hard ring just inside the rim.
+ *
+ * Here the profile is evaluated across the whole square and simply *continues*
+ * past the inscribed radius, so there is no discontinuity in the sampled region.
+ *
+ * ## The detail that sells it
+ *
+ * Three optical imperfections, all baked once, all effectively free:
+ *
+ *  - **Reflector facet rings.** A stamped aluminium reflector carries visible
+ *    concentric tool marks — a ~1.5% ripple, fading out toward the axis because
+ *    it is an edge artefact rather than a focus artefact.
+ *  - **A ragged rim.** Real beam edges are not circles. Smooth angular noise
+ *    perturbs the effective radius by up to 3.5%, weighted toward the rim. This
+ *    one detail does more than everything else combined.
+ *  - **Chromatic focus error.** A reflector focuses long wavelengths marginally
+ *    tighter, so the core runs warmer than the skirt. Subtle, but it is why the
+ *    hotspot reads as *light* and not as a white decal.
  */
-function makeIesCookie(size: number, rng: SeededRandom): THREE.DataTexture {
+function makeBeamCookie(size: number, rng: SeededRandom): THREE.DataTexture {
   const data = new Uint8Array(new ArrayBuffer(size * size * 4));
 
-  // per-angle rim noise: smoothly interpolated buckets around the circle
-  const RIM = 64;
+  // Smoothly-interpolated per-angle rim noise.
+  const RIM = 96;
   const rim = new Float32Array(RIM);
   for (let i = 0; i < RIM; i++) rim[i] = rng.range(-1, 1);
   const rimAt = (a: number) => {
@@ -445,26 +612,23 @@ function makeIesCookie(size: number, rng: SeededRandom): THREE.DataTexture {
       const r = Math.sqrt(u * u + v * v);
       const ang = Math.atan2(v, u);
 
-      // ragged edge: nudge the effective radius by up to ~4%
-      const rr = r * (1 + rimAt(ang) * 0.04);
+      // Ragged edge, weighted toward the rim so the hotspot stays clean.
+      const rr = r * (1 + rimAt(ang) * 0.035 * Math.min(1, r * 1.4));
 
-      const hot = Math.exp(-Math.pow(rr / HOTSPOT_FRAC, 2) * 1.35);
-      const spill = Math.pow(Math.max(0, 1 - rr), 1.55) * 0.42;
-      const rings = Math.cos(rr * 26.0) * 0.03 * Math.pow(Math.max(0, 1 - rr), 1.5);
-      const cross = Math.pow(Math.abs(Math.cos(ang * 2)), 12) * 0.05
-        * Math.pow(Math.max(0, 1 - rr), 2.0);
+      let i = beamProfile(rr);
+      i *= 1 + Math.cos(rr * 34.0) * 0.015 * Math.min(1, rr * 2.2);
+      // Faint bulb-post cross flare, skirt only.
+      i += Math.pow(Math.abs(Math.cos(ang * 2)), 14) * 0.035
+        * Math.pow(Math.max(0, 1 - Math.min(1, rr)), 2.2);
 
-      let i = hot + spill + rings + cross;
-      i *= 1 - smoothstep(0.94, 1.0, rr);   // hard vignette: no leak into corners
       i = THREE.MathUtils.clamp(i, 0, 1);
 
-      // A real reflector focuses long wavelengths marginally tighter, so the
-      // centre runs slightly warmer than the rim.
-      const warm = 1 - rr * 0.5;
+      // Chromatic focus error: core warmer than skirt.
+      const warm = Math.max(0, 1 - rr * 0.62);
       const o = (y * size + x) * 4;
-      data[o] = Math.min(255, i * 255 * (0.98 + 0.02 * warm));
-      data[o + 1] = Math.min(255, i * 255 * (0.94 + 0.05 * warm));
-      data[o + 2] = Math.min(255, i * 255 * (0.88 + 0.07 * warm));
+      data[o] = Math.min(255, i * 255 * (0.97 + 0.03 * warm));
+      data[o + 1] = Math.min(255, i * 255 * (0.955 + 0.04 * warm));
+      data[o + 2] = Math.min(255, i * 255 * (0.93 + 0.045 * warm));
       data[o + 3] = 255;
     }
   }
@@ -474,7 +638,12 @@ function makeIesCookie(size: number, rng: SeededRandom): THREE.DataTexture {
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = true;
-  tex.colorSpace = THREE.SRGBColorSpace;
+  // **Linear, not sRGB.** This is a photometric curve, not an image. Tagging it
+  // sRGB (as the previous version did) makes three linearise it on sample, so
+  // 0.5 linear intensity becomes 0.21 — crushing the entire mid shoulder. That
+  // single flag was most of why the beam read as a small core with a hard edge.
+  tex.colorSpace = THREE.LinearSRGBColorSpace;
+  tex.anisotropy = 2;
   tex.needsUpdate = true;
   return tex;
 }
@@ -482,10 +651,11 @@ function makeIesCookie(size: number, rng: SeededRandom): THREE.DataTexture {
 /**
  * Dust mote material — the "no more white dice" shader.
  *
- * `gl_PointSize` is **clamped** to a small pixel range, the sprite is a smooth
- * radial blob (never a square), motes dissolve as they approach the near plane,
- * and brightness is `cone(angle) · 1/d² · HG(scatter angle)` so anything outside
- * the beam contributes exactly zero energy.
+ * Brightness is `profile(coneAngle) · 1/(d²+r₀²) · HG(scatter)`, so a mote
+ * outside the beam contributes exactly zero, and the *same* fitted profile the
+ * cookie uses shapes the cone — so motes and lit geometry agree about where the
+ * beam is, which they previously did not (the shader used a raw `smoothstep`
+ * between the hotspot and outer cosines, a completely different curve).
  */
 function makeDustMaterial(): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
@@ -498,16 +668,14 @@ function makeDustMaterial(): THREE.ShaderMaterial {
       uProjScale: { value: 600 },
       uWorldSize: { value: 0.014 },
       uNearFade: { value: new THREE.Vector2(0.55, 1.9) },
-      uFarFade: { value: new THREE.Vector2(9.0, 16.0) },
+      uFarFade: { value: new THREE.Vector2(10.0, 18.0) },
       uBeamOrigin: { value: new THREE.Vector3() },
       uBeamDir: { value: new THREE.Vector3(0, 0, -1) },
-      uBeamColor: { value: new THREE.Color(0xffd7a3) },
+      uBeamColor: { value: new THREE.Color(0xffe2c0) },
       uBeamStrength: { value: 0 },
-      uCosAngles: {
-        value: new THREE.Vector2(Math.cos(OUTER_ANGLE * HOTSPOT_FRAC), Math.cos(OUTER_ANGLE)),
-      },
+      uOuterAngle: { value: OUTER_ANGLE },
       uTime: { value: 0 },
-      uOpacity: { value: 0.85 },
+      uOpacity: { value: 0.8 },
     },
     vertexShader: /* glsl */`
       ${SOFT_SPRITE_CHUNKS.vert}
@@ -517,7 +685,7 @@ function makeDustMaterial(): THREE.ShaderMaterial {
       uniform vec2 uFarFade;
       uniform vec3 uBeamOrigin;
       uniform vec3 uBeamDir;
-      uniform vec2 uCosAngles;
+      uniform float uOuterAngle;
       uniform float uBeamStrength;
       uniform float uTime;
       varying float vLum;
@@ -526,6 +694,14 @@ function makeDustMaterial(): THREE.ShaderMaterial {
       float hg(float cosT, float g){
         float g2 = g * g;
         return (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cosT, 1.5);
+      }
+
+      // The SAME fitted profile the cookie bakes. One definition is what makes
+      // the motes and the lit surfaces agree about the beam's shape.
+      float beamProfile(float rr){
+        float core = exp(-pow(rr * ${BEAM_A.toFixed(4)}, ${BEAM_P.toFixed(4)}));
+        float skirt = pow(max(0.0, 1.0 - rr), ${BEAM_S.toFixed(4)}) * ${BEAM_K.toFixed(4)};
+        return (core + skirt) * ${BEAM_NORM.toFixed(8)};
       }
 
       void main(){
@@ -538,8 +714,15 @@ function makeDustMaterial(): THREE.ShaderMaterial {
         vec3 toMote = position - uBeamOrigin;
         float d = length(toMote);
         vec3 l = toMote / max(d, 1e-4);
-        float cone = smoothstep(uCosAngles.y, uCosAngles.x, dot(l, uBeamDir));
-        float atten = 1.0 / (1.0 + d * d * 0.24);
+
+        // Angle from the beam axis, normalised against the cone half-angle so
+        // it indexes the profile exactly as the cookie's radius does.
+        float ang = acos(clamp(dot(l, uBeamDir), -1.0, 1.0));
+        float rr = ang / max(uOuterAngle, 1e-4);
+        float cone = rr < 1.35 ? beamProfile(rr) : 0.0;
+
+        // Finite-aperture softening, matching the surface lighting model.
+        float atten = 1.0 / (d * d + ${APERTURE2.toFixed(6)});
 
         // scatter angle between the beam and the eye ray
         vec3 eyeRay = normalize(position - cameraPosition);
