@@ -3,7 +3,7 @@ import { QualitySpec } from '../core/Config';
 import { quantiseScale } from '../engine/TargetPool';
 import {
   GLSL_HASH, GLSL_DEPTH, GLSL_COLOR, GLSL_TONEMAP, GLSL_PHASE,
-  GLSL_UNPACK_DEPTH, GLSL_CATMULL_ROM, POST_VERT, buildFrag,
+  GLSL_BEAM_PROFILE, GLSL_UNPACK_DEPTH, GLSL_CATMULL_ROM, POST_VERT, buildFrag,
 } from './ShaderChunks';
 
 /**
@@ -290,11 +290,35 @@ export class RenderPipeline {
   // configuration hooks used by the game layer
   // ======================================================================
 
-  /** Hand the pipeline the flashlight so volumetrics can shadow-march it. */
-  setBeam(light: THREE.SpotLight | null, intensity = 1): void {
+  /**
+   * Hand the pipeline the flashlight so volumetrics can shadow-march it.
+   *
+   * `origin`/`direction` are optional but strongly preferred: the volumetric
+   * pass runs *before* `renderer.render()` walks the scene graph, so deriving
+   * the beam axis from `light.target.matrixWorld` here samples last frame's
+   * transform. That one-frame skew is visible as the in-scattered shaft
+   * trailing its own lit geometry during a turn. `Flashlight` publishes the
+   * exact vectors it used for the surface lighting, so passing them through
+   * keeps the two in lockstep.
+   */
+  setBeam(
+    light: THREE.SpotLight | null, intensity = 1,
+    origin?: THREE.Vector3, direction?: THREE.Vector3,
+  ): void {
     this.beam.light = light;
     this.beam.intensity = intensity;
+    if (origin && direction) {
+      this.beamOrigin.copy(origin);
+      this.beamDir.copy(direction);
+      this.beamExplicit = true;
+    } else {
+      this.beamExplicit = false;
+    }
   }
+
+  private beamOrigin = new THREE.Vector3();
+  private beamDir = new THREE.Vector3(0, 0, -1);
+  private beamExplicit = false;
 
   setMoon(light: THREE.DirectionalLight | null): void { this.moon = light; }
 
@@ -573,7 +597,9 @@ export class RenderPipeline {
       uniform vec3 uSpotPos;
       uniform vec3 uSpotDir;
       uniform vec3 uSpotColor;
-      uniform vec2 uSpotCos;      // (coneCos, penumbraCos)
+      uniform vec2 uSpotCos;      // (coneCos, penumbraCos) — rim reject only
+      uniform float uSpotOuter;   // cone half-angle, radians (profile index)
+      uniform float uSpotAperture2; // finite-emitter softening radius, squared
       uniform float uSpotRange;
       uniform float uSpotIntensity;
 
@@ -636,7 +662,14 @@ export class RenderPipeline {
             vec3 Ln = L / dist;
             float cosA = dot(-Ln, uSpotDir);
             if (cosA > uSpotCos.x) {
-              float atten = smoothstep(uSpotCos.x, uSpotCos.y, cosA) / dist2;
+              // The SAME fitted profile the cookie bakes — see GLSL_BEAM_PROFILE.
+              // A smoothstep over the (now 1.5°) penumbra band would be a step
+              // function and would give the shaft a hard geometric edge.
+              float cone = beamProfileFromCos(cosA, uSpotOuter);
+              // Finite-aperture softening, matching the surface lighting model,
+              // so the in-scatter does not blow out where the ray passes within
+              // centimetres of the emitter.
+              float atten = cone / (dist2 + uSpotAperture2);
               atten *= max(1.0 - dist / uSpotRange, 0.0);
               #if VOL_SPOT_SHADOW
                 atten *= mix(1.0, shadowLookup(tSpotShadow, uSpotShadowMatrix, wp, uSpotShadowBias), uSpotShadowValid);
@@ -658,7 +691,7 @@ export class RenderPipeline {
           trans *= exp(-sigma * uExtinction);
         }
         fragColor = vec4(acc, 1.0 - trans);
-      }`, [GLSL_HASH, GLSL_DEPTH, GLSL_PHASE, GLSL_UNPACK_DEPTH]), {
+      }`, [GLSL_HASH, GLSL_DEPTH, GLSL_PHASE, GLSL_BEAM_PROFILE, GLSL_UNPACK_DEPTH]), {
       tDepth: { value: null }, uInvProj: { value: new THREE.Matrix4() },
       uCamWorld: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() },
       uFrame: { value: 0 }, uTime: { value: 0 }, uMaxDist: { value: 42 },
@@ -668,6 +701,7 @@ export class RenderPipeline {
       uSpotPos: { value: new THREE.Vector3() }, uSpotDir: { value: new THREE.Vector3(0, 0, -1) },
       uSpotColor: { value: new THREE.Color(1, 0.86, 0.66) },
       uSpotCos: { value: new THREE.Vector2(0.92, 0.96) },
+      uSpotOuter: { value: 0.455 }, uSpotAperture2: { value: 0.7225 },
       uSpotRange: { value: 55 }, uSpotIntensity: { value: 0 },
       uMoonDir: { value: new THREE.Vector3(0, -1, 0) },
       uMoonColor: { value: new THREE.Color(0.58, 0.66, 0.85) },
@@ -1392,18 +1426,34 @@ export class RenderPipeline {
       const sl = this.beam.light;
       let spotI = 0;
       if (sl && sl.intensity > 0 && this.beam.intensity > 0) {
-        sl.getWorldPosition(this.tmpA);
-        (u.uSpotPos.value as THREE.Vector3).copy(this.tmpA);
-        sl.target.getWorldPosition(this.tmpB);
-        (u.uSpotDir.value as THREE.Vector3).copy(this.tmpB).sub(this.tmpA).normalize();
+        // Prefer the vectors the light source itself published this frame; fall
+        // back to the scene graph only when nobody supplied them. See setBeam().
+        if (this.beamExplicit) {
+          (u.uSpotPos.value as THREE.Vector3).copy(this.beamOrigin);
+          (u.uSpotDir.value as THREE.Vector3).copy(this.beamDir);
+        } else {
+          sl.getWorldPosition(this.tmpA);
+          (u.uSpotPos.value as THREE.Vector3).copy(this.tmpA);
+          sl.target.getWorldPosition(this.tmpB);
+          (u.uSpotDir.value as THREE.Vector3).copy(this.tmpB).sub(this.tmpA).normalize();
+        }
         (u.uSpotColor.value as THREE.Color).copy(sl.color);
+        // Only the .x term is still used, as a cheap early reject outside the
+        // cone. The visible falloff comes from beamProfileFromCos().
         (u.uSpotCos.value as THREE.Vector2).set(
-          Math.cos(sl.angle),
+          Math.cos(Math.min(Math.PI * 0.5, sl.angle * 1.35)),
           Math.cos(sl.angle * (1 - sl.penumbra)));
+        u.uSpotOuter.value = sl.angle;
         u.uSpotRange.value = sl.distance > 0 ? sl.distance : 60;
         // three's intensity is candela-like; this factor puts single-scattering
-        // in the same ballpark as the surface lighting it belongs to
-        spotI = sl.intensity * 0.00055 * this.beam.intensity;
+        // in the same ballpark as the surface lighting it belongs to.
+        //
+        // Rescaled with the beam rebuild: peak intensity dropped 330 -> 125 and
+        // the cone term is now a normalised profile (peak 1.0) rather than a
+        // smoothstep that saturated to 1.0 across most of the hotspot, so the
+        // old 0.00055 would have quietly cut the shaft to ~40% of its intended
+        // strength.
+        spotI = sl.intensity * 0.00145 * this.beam.intensity;
         const smap = sl.shadow.map;
         if (smap && this.spec.volumetric >= 2) {
           u.tSpotShadow.value = smap.texture;
