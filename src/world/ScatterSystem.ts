@@ -266,9 +266,16 @@ interface Placement {
 }
 
 /** A ground-detail card, decided once and re-merged on demand. */
-/** Ground-cover families, kept as a closed union so a census cannot silently
- *  invent a category (or miss one) when a new card type is added. */
-type FloorFamily = 'reed' | 'fern' | 'leafDry' | 'leafBroad';
+/**
+ * Ground-cover families, kept as a closed union so a census cannot silently
+ * invent a category (or miss one) when a new card type is added.
+ *
+ * The first four are alpha cards; everything after them is a solid prop from
+ * `GroundProps`. The union is flat rather than nested because `detailCensus()`
+ * reports one row per family and the whole point of that report is a single
+ * flat list of everything the floor contains.
+ */
+type FloorFamily = 'reed' | 'fern' | 'leafDry' | 'leafBroad' | PropFamily;
 
 interface FloorItem {
   geo: RawGeo;
@@ -276,6 +283,26 @@ interface FloorItem {
   yaw: number; leanX: number; leanZ: number;
   tr: number; tg: number; tb: number;
   h: number;
+  /**
+   * Solid props merge into the *bark* batch, cards into the foliage batch.
+   *
+   * They cannot share one batch: the foliage material is `alphaTest: 0.38,
+   * side: DoubleSide`, which is right for a fern card and wrong for a log —
+   * a double-sided log renders its interior faces and an alpha-tested one
+   * dissolves wherever the bark texture happens to be dark. Splitting by
+   * material keeps both correct and still costs only the two draws the atlas
+   * was designed around.
+   */
+  solidBatch?: boolean;
+  /**
+   * Whether this item casts a shadow.
+   *
+   * Cards never do — hundreds of thin alpha-tested slivers in the shadow map
+   * buy nothing and cost a lot of fill. Large solid props *must*, because a log
+   * or a boulder with no shadow is the single most obvious "pasted on" tell in
+   * a flashlight-lit scene, and contact shadow is most of what grounds them.
+   */
+  cast?: boolean;
   /**
    * Which ground-cover family this card belongs to.
    *
