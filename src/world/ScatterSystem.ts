@@ -57,6 +57,11 @@ import { ForestAtlas, ATLAS_ATTRIBUTE, TILE } from './ForestAtlas';
 import { TreeCache, variantCount, type RawGeo, type TreeTemplate } from './TreeFactory';
 import { ZoneSystem, ZONE_PROFILES, ZONE_IDS, type ArchetypeId } from './ZoneSystem';
 import { patchForestWind } from './VegetationSystem';
+// Type-only: the floor census reports solid props alongside alpha cards, so
+// FloorFamily unions in GroundProps' own family list rather than restating it.
+// Restating would let the two drift, and a census that silently omits a family
+// is worse than no census — it reports a healthy floor that is missing content.
+import type { PropFamily } from './GroundProps';
 
 /** Chunk edge in metres. 60 divides the 420 m world into 7x7. */
 const CHUNK = 60;
