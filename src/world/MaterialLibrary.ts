@@ -336,6 +336,126 @@ export function detailNormalPatch(scale: number, strength: number): string {
   });
 }
 
+/**
+ * **Stochastic (hex-grid) tiling.** Breaks the *pattern*, not just its brightness.
+ *
+ * `macroVariationPatch` below modulates albedo luminance at a very low
+ * frequency, which hides large-scale banding but leaves the tile itself
+ * repeating verbatim. On the forest floor that is the failure the player
+ * actually sees: the ground texture repeats every 6.22 m, and at a standing eye
+ * height one tile subtends 81 deg of view at 1 m and 51 deg at 5 m — so the
+ * near field is filled by a handful of copies of one image, with every twig and
+ * pebble in the same place in each. No amount of brightness variation fixes
+ * that, because the eye locks onto the *arrangement*, not the exposure.
+ *
+ * The standard cure: partition UV space into a hex lattice, give every cell its
+ * own random offset and rotation, and blend the three cells whose kernels
+ * overlap at each pixel. Hexagons rather than squares because a hex has three
+ * overlapping neighbours instead of four, so the blend costs three taps instead
+ * of four and the weights are naturally barycentric.
+ *
+ * Two things make this correct rather than merely different:
+ *
+ *  - **Variance preservation.** Naive linear blending of three random offsets
+ *    averages the texture toward its mean, which reads as a blurry grey wash.
+ *    The weights are sharpened toward the dominant cell so contrast survives.
+ *  - **Explicit derivatives.** Each tap uses `textureGrad` with the derivatives
+ *    of the *unrotated* UV. Without that, the discontinuity at every cell
+ *    boundary makes the hardware pick the lowest mip, producing a visible seam
+ *    of blur along every hex edge — the classic tell of a broken stochastic
+ *    implementation.
+ *
+ * Applied to albedo, normal and roughness/AO together so all three agree; if
+ * only the albedo were randomised the normal map would still spell out the
+ * original lattice under a grazing flashlight beam, which is exactly the
+ * lighting condition this game is played in.
+ *
+ * @param scale how many hex cells per UV unit. Lower = larger cells = fewer
+ *              taps landing near a boundary, but a longer-range repeat.
+ */
+export function stochasticTilePatch(scale: number): string {
+  const key = `stoch:${scale}`;
+  return registerShaderPatch(key, () => (shader) => {
+    const helpers = /* glsl */`
+    // Hex lattice in a skewed basis. Returns the three cell ids whose kernels
+    // cover this point, plus barycentric weights.
+    vec2 hexCell(vec2 p, out vec2 c0, out vec2 c1, out vec2 c2, out vec3 w) {
+      const mat2 TO_HEX = mat2(1.0, 0.0, -0.57735027, 1.15470054);
+      vec2 s = TO_HEX * p;
+      vec2 base = floor(s);
+      vec2 f = s - base;
+      // Split the parallelogram into two triangles; the diagonal decides which
+      // three lattice points are the nearest neighbours.
+      float sum = f.x + f.y;
+      if (sum < 1.0) { c0 = base; c1 = base + vec2(1.0, 0.0); c2 = base + vec2(0.0, 1.0);
+                       w = vec3(1.0 - sum, f.x, f.y); }
+      else           { c0 = base + vec2(1.0, 1.0); c1 = base + vec2(1.0, 0.0); c2 = base + vec2(0.0, 1.0);
+                       w = vec3(sum - 1.0, 1.0 - f.y, 1.0 - f.x); }
+      return base;
+    }
+    vec2 hexHash(vec2 c) {
+      return fract(sin(vec2(dot(c, vec2(127.1, 311.7)), dot(c, vec2(269.5, 183.3)))) * 43758.5453);
+    }
+    // One tap: the cell's own random translation and rotation, sampled with the
+    // caller's derivatives so the mip level never collapses at a cell edge.
+    vec4 hexTap(sampler2D tex, vec2 uv, vec2 cell, vec2 dx, vec2 dy) {
+      vec2 h = hexHash(cell);
+      float a = h.x * 6.2831853;
+      float ca = cos(a), sa = sin(a);
+      mat2 rot = mat2(ca, -sa, sa, ca);
+      return textureGrad(tex, rot * uv + h, rot * dx, rot * dy);
+    }
+    // Three taps, blended with variance-preserving weights.
+    vec4 hexSample(sampler2D tex, vec2 uv, float cells) {
+      vec2 dx = dFdx(uv), dy = dFdy(uv);
+      vec2 c0, c1, c2; vec3 w;
+      hexCell(uv * cells, c0, c1, c2, w);
+      // Sharpen toward the dominant cell. Linear weights average three
+      // independent samples and drive contrast toward the texture mean, which
+      // reads as a grey wash; the cube restores most of the lost variance while
+      // keeping the transition continuous.
+      w = w * w * w;
+      w /= (w.x + w.y + w.z);
+      return hexTap(tex, uv, c0, dx, dy) * w.x
+           + hexTap(tex, uv, c1, dx, dy) * w.y
+           + hexTap(tex, uv, c2, dx, dy) * w.z;
+    }
+    `;
+    const S = scale.toFixed(4);
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace('void main() {', helpers + '\nvoid main() {')
+      // Albedo.
+      .replace('#include <map_fragment>', /* glsl */`
+      #ifdef USE_MAP
+        diffuseColor *= hexSample(map, vMapUv, ${S});
+      #endif`)
+      // Normal. Replaces the tangent-space branch only; the object-space and
+      // bump branches are not used by any material this is applied to.
+      .replace('#include <normal_fragment_maps>', /* glsl */`
+      #ifdef USE_NORMALMAP_TANGENTSPACE
+      {
+        vec3 mapN = hexSample(normalMap, vNormalMapUv, ${S}).xyz * 2.0 - 1.0;
+        mapN.xy *= normalScale;
+        normal = normalize(tbn * mapN);
+      }
+      #endif`)
+      // Roughness and metalness share the ORM texture, so one tap serves both.
+      // Sampled at the same scale so a pebble's shading, its bump and its
+      // gloss all belong to the same pebble.
+      .replace('#include <roughnessmap_fragment>', /* glsl */`
+      float roughnessFactor = roughness;
+      #ifdef USE_ROUGHNESSMAP
+        roughnessFactor *= hexSample(roughnessMap, vRoughnessMapUv, ${S}).g;
+      #endif`)
+      .replace('#include <metalnessmap_fragment>', /* glsl */`
+      float metalnessFactor = metalness;
+      #ifdef USE_METALNESSMAP
+        metalnessFactor *= hexSample(metalnessMap, vMetalnessMapUv, ${S}).b;
+      #endif`);
+  });
+}
+
 /** Low-frequency albedo modulation: the cheapest cure for visible tiling. */
 export function macroVariationPatch(scale: number, strength: number): string {
   const key = `macro:${scale}:${strength}`;
@@ -970,6 +1090,15 @@ export class MaterialLibrary {
       color: 0x93887a, envMapIntensity: 0.45,
       normalScale: new THREE.Vector2(1.25, 1.25),
       patches: [
+        // Stochastic tiling FIRST: it replaces the map/normal/roughness fetches
+        // outright, so anything that merely modulates their result must be
+        // composed after it. The patch registry applies in array order.
+        //
+        // 0.5 hex cells per UV unit, and one UV unit is one 6.22 m tile, so a
+        // cell is ~12.4 m across — comfortably larger than the tile it is
+        // hiding, which is what keeps the three taps decorrelated. Smaller
+        // cells would put more pixels near a blend boundary for no gain.
+        stochasticTilePatch(0.5),
         detailNormalPatch(4, 0.35),
         // 90 tiles across the terrain / 30 → ~3 macro blotches per map edge
         macroVariationPatch(1 / 30, 0.55),
