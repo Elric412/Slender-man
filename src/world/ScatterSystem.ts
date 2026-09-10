@@ -57,11 +57,12 @@ import { ForestAtlas, ATLAS_ATTRIBUTE, TILE } from './ForestAtlas';
 import { TreeCache, variantCount, type RawGeo, type TreeTemplate } from './TreeFactory';
 import { ZoneSystem, ZONE_PROFILES, ZONE_IDS, type ArchetypeId } from './ZoneSystem';
 import { patchForestWind } from './VegetationSystem';
-// Type-only: the floor census reports solid props alongside alpha cards, so
-// FloorFamily unions in GroundProps' own family list rather than restating it.
-// Restating would let the two drift, and a census that silently omits a family
-// is worse than no census — it reports a healthy floor that is missing content.
-import type { PropFamily } from './GroundProps';
+import {
+  makeLog, makeBranch, makeStump, makeRootFlare, makeRootArch,
+  makeRock, makeMossMound, makeFungus, makeBarkFleck,
+  type PropFamily, type PropSpec,
+} from './GroundProps';
+import { FloorEcology, RULES, positionRng, type FloorSample } from './FloorEcology';
 
 /** Chunk edge in metres. 60 divides the 420 m world into 7x7. */
 const CHUNK = 60;
@@ -331,6 +332,11 @@ interface Chunk {
   nearBark: THREE.Mesh | null;
   nearFoliage: THREE.Mesh | null;
   floor: THREE.Mesh | null;
+  /**
+   * Solid ground props (logs, stumps, rocks, roots), merged separately from the
+   * cards so they can use the opaque bark material and cast shadows.
+   */
+  floorSolid: THREE.Mesh | null;
   /** 0 = near tier wanted, 1 = far tier, -1 = culled */
   tier: number;
   /** monotonic tick when this chunk last wanted its near tier */
@@ -428,6 +434,33 @@ export class ScatterSystem {
   private fieldPatch: SeededRandom;
 
   /**
+   * Semantic environment fields for the floor layer.
+   *
+   * Separate from the three above because those answer "is this a wooded
+   * region" for *tree* placement, whereas this answers moisture / drainage /
+   * geology / deadfall / wear for *floor* placement. Sharing them would
+   * correlate the two, so every gravel drift would sit in a clearing and every
+   * log would sit in a thicket.
+   */
+  private eco: FloorEcology;
+  /** Reused sample struct — the placement loop runs ~10^5 times at boot. */
+  private ecoSample: FloorSample = FloorEcology.newSample();
+
+  /**
+   * Prop template cache, keyed by family + a quantised parameter bucket.
+   *
+   * Props are shared the same way tree templates are, and for the same reason:
+   * merging is only affordable if the source geometry is reused. A fresh log
+   * mesh per placement would build ~40 000 meshes at boot. Bucketing the
+   * continuous parameters (length, radius, decay) into a small number of steps
+   * gives ~20 variants per family — plenty, because per-instance yaw, scale,
+   * lean and tint are applied at merge time and do the rest of the work.
+   */
+  private propCache = new Map<string, PropSpec>();
+  /** Solid props that collision should treat as step-over obstacles. */
+  private propColliders: TrunkCollider[] = [];
+
+  /**
    * World-space spacing hash, 6 m cells.
    *
    * The first implementation rejected against a 24-entry tail of the current
@@ -471,6 +504,8 @@ export class ScatterSystem {
     // permutations, still two materials.
     patchForestWind(this.barkMat, 0.075);
     patchForestWind(this.foliageMat, 0.42);
+
+    this.eco = new FloorEcology(hf, zones, seed);
 
     this.build();
   }
@@ -618,8 +653,29 @@ export class ScatterSystem {
         if (c) this.chunks.push(c);
       }
     }
-    // Far tier second, so occupancy is fully stamped before anything is merged
-    // and the two passes cannot see a half-built field.
+
+    // ---- floor, as a SECOND pass over the whole map -----------------------
+    //
+    // The ordering here is load-bearing, not tidiness. Almost every floor
+    // family is positioned relative to standing trees: logs and stumps need a
+    // tree to have fallen from, bark plates ring the trunk that shed them,
+    // fungi follow deadwood, and the shade term that drives moss comes from the
+    // canopy above. If the floor were planned inside `planChunk` — as the old
+    // card layer was — then chunk (0,0) would be dressed before any tree in
+    // chunk (0,1) existed, so `trunkInfluence` would be systematically wrong
+    // near every chunk boundary and the debris would visibly stop at seams.
+    //
+    // Planning the floor only after the last tree is placed means every point
+    // in the world sees the finished forest, and the 60 m grid becomes
+    // invisible in the result.
+    this.eco.indexTrunks(this.trees);
+    for (const c of this.chunks) {
+      const crng = this.rng.fork(((c.cx * 131 + c.cz) | 0) * 7919 + 977);
+      c.floorItems = this.planFloor(c.cx - CHUNK / 2, c.cz - CHUNK / 2, crng);
+    }
+
+    // Far tier last, so occupancy is fully stamped before anything is merged
+    // and the passes cannot see a half-built field.
     for (const c of this.chunks) this.buildFar(c);
 
     this.stats.chunks = this.chunks.length;
@@ -738,13 +794,17 @@ export class ScatterSystem {
       }
     }
 
-    const floorItems = this.planFloor(ox, oz, crng);
-    if (placements.length === 0 && floorItems.length === 0) return null;
-
+    // No floor here. It is planned in a second pass over the whole map once
+    // every tree exists — see `build()` for why the ordering matters.
+    //
+    // A chunk is therefore kept even when it holds no trees, because the floor
+    // pass may still dress it: an open clearing with gravel, twigs and stones is
+    // exactly the case the old early-return discarded, and discarding it is how
+    // a clearing became a bare plane.
     return {
-      cx, cz, placements, floorItems,
+      cx, cz, placements, floorItems: [],
       farBark: null, farFoliage: null,
-      nearBark: null, nearFoliage: null, floor: null,
+      nearBark: null, nearFoliage: null, floor: null, floorSolid: null,
       tier: -1, lastUsed: 0, nearVerts: 0, triNear: 0, triFar: 0,
     };
   }
@@ -828,12 +888,12 @@ export class ScatterSystem {
   }
 
   private freeNear(c: Chunk): void {
-    for (const m of [c.nearBark, c.nearFoliage, c.floor]) {
+    for (const m of [c.nearBark, c.nearFoliage, c.floor, c.floorSolid]) {
       if (!m) continue;
       m.geometry.dispose();
       this.group.remove(m);
     }
-    c.nearBark = null; c.nearFoliage = null; c.floor = null;
+    c.nearBark = null; c.nearFoliage = null; c.floor = null; c.floorSolid = null;
     this.residentVerts -= c.nearVerts;
     c.nearVerts = 0;
     c.triNear = 0;
@@ -900,80 +960,526 @@ export class ScatterSystem {
   }
 
   /**
-   * Ground detail: ferns, litter, reeds, broadleaf scrub.
+   * Fetch or build a prop template.
    *
-   * Driven by the zone's own density scalars, so the floor changes character
-   * with the forest above it rather than being one texture everywhere. This is
-   * the layer that stops the ground reading as sterile.
+   * Bucketing is the whole trick. The generators take continuous parameters,
+   * but building a unique mesh per placement would produce tens of thousands of
+   * `RawGeo` objects at boot and blow the memory budget the tree templates
+   * already carefully fit inside. Quantising each parameter to a handful of
+   * steps collapses that to a few hundred templates, and the resulting
+   * repetition is hidden by the per-instance yaw, non-uniform scale, lean and
+   * tint that `MergeTarget.add` applies afterwards.
+   *
+   * The bucket key must be *coarse* for this to pay off, and it must be
+   * deterministic — a chunk that is evicted and rebuilt has to produce the same
+   * geometry, which is why the RNG handed to a generator is derived from the
+   * bucket key rather than from the placement stream.
+   */
+  private prop(family: PropFamily, buckets: number[]): PropSpec {
+    const key = `${family}:${buckets.join(',')}`;
+    const hit = this.propCache.get(key);
+    if (hit) return hit;
+
+    // Deterministic per-template RNG: same bucket, same mesh, forever.
+    let h = 0x811c9dc5;
+    for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619);
+    const rng = new SeededRandom(h >>> 0);
+
+    let spec: PropSpec;
+    switch (family) {
+      case 'log':
+      case 'logBroken': {
+        const [len, rad, dec, moss] = buckets;
+        spec = makeLog(rng, {
+          length: len, radius: rad, decay: dec / 10, mossBias: moss / 10,
+          broken: family === 'logBroken',
+        });
+        break;
+      }
+      case 'branch':
+      case 'twig': {
+        const [len, rad, dec] = buckets;
+        spec = makeBranch(rng, {
+          length: len / 10, radius: rad / 1000, decay: dec / 10,
+          forks: family === 'twig' ? 1 : 2,
+        });
+        break;
+      }
+      case 'stump': {
+        const [rad, hgt, dec, moss] = buckets;
+        spec = makeStump(rng, {
+          radius: rad / 100, height: hgt / 10, decay: dec / 10, mossBias: moss / 10,
+          ragged: rng.next() < 0.72,
+        });
+        break;
+      }
+      case 'rootFlare': {
+        const [tr, cnt, moss] = buckets;
+        spec = makeRootFlare(rng, {
+          trunkRadius: tr / 100, count: cnt, mossBias: moss / 10, decay: 0.3,
+        });
+        break;
+      }
+      case 'rootArch': {
+        const [span, th, moss] = buckets;
+        spec = makeRootArch(rng, { span: span / 10, thickness: th / 100, mossBias: moss / 10 });
+        break;
+      }
+      case 'boulder':
+      case 'stone':
+      case 'pebble': {
+        const [sz, moss, wet] = buckets;
+        spec = makeRock(rng, { size: sz / 100, mossBias: moss / 10, wetness: wet / 10 });
+        break;
+      }
+      case 'mossMound': {
+        spec = makeMossMound(rng, { size: buckets[0] / 100 });
+        break;
+      }
+      case 'fungus': {
+        spec = makeFungus(rng, { size: buckets[0] / 100, bracket: buckets[1] === 1 });
+        break;
+      }
+      case 'barkFleck':
+      default: {
+        spec = makeBarkFleck(rng, { size: buckets[0] / 100 });
+        break;
+      }
+    }
+    this.propCache.set(key, spec);
+    return spec;
+  }
+
+  /**
+   * Dress the forest floor.
+   *
+   * ## Why this is a stratified pass and not one loop
+   *
+   * The families here span four orders of magnitude in footprint — a twig is
+   * 20 cm, a fallen trunk is 14 m — and they are wanted at wildly different
+   * rates: twigs nearly everywhere, boulders occasionally, root arches rarely.
+   * One shared attempt loop cannot express that. It gives every family the same
+   * spatial frequency, so either the big props are as common as twigs (absurd)
+   * or the twigs are as rare as boulders (which is the bare floor we started
+   * with, measured at 50.8 % empty).
+   *
+   * So each family gets its own attempt count and its own rule from
+   * `FloorEcology.RULES`, evaluated against the semantic fields at that point.
+   * The attempt counts below are per 3600 m² chunk and were chosen against the
+   * census: the target is that fewer than ~5 % of probe points anywhere are
+   * empty, while the *large* families stay rare enough to remain events rather
+   * than texture.
+   *
+   * ## Why big props are placed first
+   *
+   * Placement order is significant because of the spacing test. Logs and
+   * boulders claim their footprint in the spacing hash before the small stuff
+   * is considered, so a twig can never be planted inside a log. Doing it the
+   * other way round would either reject the log (losing the read that matters
+   * most) or intersect it (which is worse than either).
    */
   private planFloor(ox: number, oz: number, crng: SeededRandom): FloorItem[] {
     if (this.floorDetail <= 0) return [];
     const out: FloorItem[] = [];
-    const attempts = Math.round(340 * this.floorDetail);
+    const s = this.ecoSample;
+    const d = this.floorDetail;
 
-    for (let i = 0; i < attempts; i++) {
-      const x = ox + crng.next() * CHUNK;
-      const z = oz + crng.next() * CHUNK;
-      if (!this.plantable(x, z)) continue;
-
-      const fern = this.zones.scalarAt(x, z, 'fernDensity');
-      const litter = this.zones.scalarAt(x, z, 'litterDensity');
-      const reed = this.zones.scalarAt(x, z, 'reedDensity');
-      const total = fern + litter + reed;
-      if (total <= 0.01) continue;
-      // Coverage gate multiplied by a noise field, so density itself varies
-      // within a zone — uniform ground cover is as much a tell as uniform trees.
-      const patch = 0.5 + 0.5 * this.fieldPatch.fbm2(x * 0.09, z * 0.09, 2);
-      if (crng.next() > Math.min(0.95, total * 0.62 * patch)) continue;
-
-      const roll = crng.next() * total;
-      let tile: number, w: number, h: number, bow: number;
-      let family: FloorFamily;
-      if (roll < reed) {
-        // Tall and narrow: reads as a reed even though it shares the fern tile.
-        tile = TILE.fern; w = 0.5; h = 1.15 + crng.next() * 0.7; bow = 0.28;
-        family = 'reed';
-      } else if (roll < reed + fern) {
-        tile = TILE.fern; w = 1.15 + crng.next() * 0.6; h = 0.5 + crng.next() * 0.45; bow = 0.18;
-        family = 'fern';
-      } else {
-        const dry = crng.next() < 0.45;
-        tile = dry ? TILE.leafDry : TILE.leafBroad;
-        w = 0.75 + crng.next() * 0.55; h = 0.22 + crng.next() * 0.28; bow = 0.1;
-        family = dry ? 'leafDry' : 'leafBroad';
+    /**
+     * Local spacing grid, so props inside one chunk cannot interpenetrate.
+     *
+     * Deliberately chunk-local rather than reusing the world spacing hash: that
+     * one holds *tree* footprints and is consulted for trunk placement, and
+     * poisoning it with forty thousand pebble footprints would slow every
+     * subsequent tree query for no benefit. Cross-chunk overlap of small props
+     * is invisible; cross-chunk overlap of trees is not, which is why only the
+     * latter is globally tracked.
+     */
+    const claimed: { x: number; z: number; r: number }[] = [];
+    const clash = (x: number, z: number, r: number): boolean => {
+      for (const c of claimed) {
+        const dx = c.x - x, dz = c.z - z;
+        const rr = c.r + r;
+        if (dx * dx + dz * dz < rr * rr) return true;
       }
+      return false;
+    };
 
-      const tint = 0.78 + crng.next() * 0.34;
+    /**
+     * One family's placement pass.
+     *
+     * `weight` is the ecological rule; `emit` turns an accepted point into
+     * items. `emit` may push more than one item — clustering (a gravel drift, a
+     * ring of bark plates) is expressed that way rather than by inflating the
+     * attempt count, because a cluster has to share a centre to read as one.
+     */
+    const pass = (
+      attempts: number,
+      weight: (s: FloorSample) => number,
+      emit: (x: number, z: number, s: FloorSample, rng: SeededRandom) => void,
+    ): void => {
+      const n = Math.round(attempts * d);
+      for (let i = 0; i < n; i++) {
+        const x = ox + crng.next() * CHUNK;
+        const z = oz + crng.next() * CHUNK;
+        if (!this.plantable(x, z)) continue;
+        this.eco.sample(x, z, s);
+        const w = weight(s) * this.eco.patch(x, z);
+        if (w <= 0.001 || crng.next() > Math.min(0.97, w)) continue;
+        emit(x, z, s, positionRng(x, z, i * 31 + 7));
+      }
+    };
+
+    /** Common push helper: sinks the item into the terrain and jitters it. */
+    const put = (
+      family: FloorFamily, spec: PropSpec, x: number, z: number,
+      rng: SeededRandom, opts: { sink: number; scale?: number; lean?: number; tint?: number },
+    ): void => {
+      const tint = opts.tint ?? (0.82 + rng.next() * 0.3);
+      const lean = opts.lean ?? 0.1;
       out.push({
-        geo: this.cardGeo(tile, w, h, bow),
-        x, y: this.hf.heightAt(x, z) - 0.04, z,
-        yaw: crng.next() * Math.PI * 2,
-        // Ground cards lean with the slope so they sit on the surface instead
-        // of standing plumb out of a bank.
-        leanX: crng.range(-0.22, 0.22),
-        leanZ: crng.range(-0.18, 0.18),
-        tr: tint * 0.95, tg: tint, tb: tint * 0.9,
-        h,
+        geo: spec.geo,
+        x, z,
+        // Sink is a *fraction of the prop's own height*, so a boulder buries
+        // proportionally as much as a pebble. A fixed offset would leave big
+        // rocks perched and small ones invisible.
+        y: this.hf.heightAt(x, z) - spec.height * opts.sink,
+        yaw: rng.next() * Math.PI * 2,
+        leanX: rng.range(-lean, lean),
+        leanZ: rng.range(-lean, lean),
+        tr: tint * 0.98, tg: tint, tb: tint * 0.95,
+        h: Math.max(0.1, spec.height),
         family,
+        solidBatch: true,
+        // Only things with real bulk cast. A twig's shadow is subpixel and a
+        // pebble's is noise, but both would still cost a shadow-map draw.
+        cast: spec.radius > 0.35 || spec.height > 0.5,
       });
+      claimed.push({ x, z, r: spec.radius * (opts.scale ?? 1) * 0.8 });
+    };
+
+    // ---- 1. cards: the original vegetation layer, unchanged in character ---
+    //
+    // Kept as-is because it was never the problem: ferns and litter were
+    // present and correct, just alone. The one change is that the coverage gate
+    // now also reads canopy, so litter accumulates under trees the way fallen
+    // leaves actually do.
+    {
+      const attempts = Math.round(340 * d);
+      for (let i = 0; i < attempts; i++) {
+        const x = ox + crng.next() * CHUNK;
+        const z = oz + crng.next() * CHUNK;
+        if (!this.plantable(x, z)) continue;
+
+        const fern = this.zones.scalarAt(x, z, 'fernDensity');
+        const litter = this.zones.scalarAt(x, z, 'litterDensity');
+        const reed = this.zones.scalarAt(x, z, 'reedDensity');
+        const total = fern + litter + reed;
+        if (total <= 0.01) continue;
+        const patch = 0.5 + 0.5 * this.fieldPatch.fbm2(x * 0.09, z * 0.09, 2);
+        if (crng.next() > Math.min(0.95, total * 0.62 * patch)) continue;
+
+        const roll = crng.next() * total;
+        let tile: number, w: number, h: number, bow: number;
+        let family: FloorFamily;
+        if (roll < reed) {
+          tile = TILE.fern; w = 0.5; h = 1.15 + crng.next() * 0.7; bow = 0.28;
+          family = 'reed';
+        } else if (roll < reed + fern) {
+          tile = TILE.fern; w = 1.15 + crng.next() * 0.6; h = 0.5 + crng.next() * 0.45; bow = 0.18;
+          family = 'fern';
+        } else {
+          const dry = crng.next() < 0.45;
+          tile = dry ? TILE.leafDry : TILE.leafBroad;
+          w = 0.75 + crng.next() * 0.55; h = 0.22 + crng.next() * 0.28; bow = 0.1;
+          family = dry ? 'leafDry' : 'leafBroad';
+        }
+
+        const tint = 0.78 + crng.next() * 0.34;
+        out.push({
+          geo: this.cardGeo(tile, w, h, bow),
+          x, y: this.hf.heightAt(x, z) - 0.04, z,
+          yaw: crng.next() * Math.PI * 2,
+          leanX: crng.range(-0.22, 0.22),
+          leanZ: crng.range(-0.18, 0.18),
+          tr: tint * 0.95, tg: tint, tb: tint * 0.9,
+          h, family,
+        });
+      }
+    }
+
+    // ---- 2. logs: few, large, and the strongest read on the floor ----------
+    pass(14, RULES.log, (x, z, sm, rng) => {
+      // Length scales with how mature the local stand is, so an old-growth log
+      // is genuinely a 14 m obstacle and a thicket log is a 4 m one.
+      const len = Math.round(4 + sm.trunkInfluence * rng.range(4, 10));
+      const rad = Math.round((0.16 + sm.trunkInfluence * rng.range(0.1, 0.4)) * 100) / 100;
+      const dec = Math.round(rng.range(0.1, 0.95) * 10);
+      const moss = Math.round(Math.min(1, sm.moisture * 1.1) * 10);
+      const spec = this.prop('log', [len, rad, dec, moss]);
+      if (clash(x, z, spec.radius * 0.5)) return;
+      // Logs lie *along* the slope contour more often than across it, because a
+      // trunk that fell across a hillside rolls until it does. Expressed as a
+      // reduced lean range rather than a real contour alignment: the heightfield
+      // gradient is available, but a log perfectly aligned to it everywhere
+      // looks combed, and the partial version is indistinguishable in practice.
+      put('log', spec, x, z, rng, { sink: 0.30, lean: 0.13 });
+    });
+
+    pass(10, RULES.logBroken, (x, z, sm, rng) => {
+      const len = Math.round(2 + sm.trunkInfluence * rng.range(1, 5));
+      const rad = Math.round((0.14 + rng.range(0.04, 0.3)) * 100) / 100;
+      const spec = this.prop('logBroken', [
+        len, rad, Math.round(rng.range(0.2, 1) * 10),
+        Math.round(Math.min(1, sm.moisture) * 10),
+      ]);
+      if (clash(x, z, spec.radius * 0.5)) return;
+      put('logBroken', spec, x, z, rng, { sink: 0.38, lean: 0.22 });
+    });
+
+    // ---- 3. stumps and roots ----------------------------------------------
+    pass(9, RULES.stump, (x, z, sm, rng) => {
+      const rad = Math.round((0.18 + sm.trunkInfluence * rng.range(0.1, 0.42)) * 100);
+      const hgt = Math.round(rng.range(0.4, 1.6) * 10);
+      const spec = this.prop('stump', [
+        rad, hgt, Math.round(rng.range(0.2, 0.95) * 10),
+        Math.round(Math.min(1, sm.moisture * 1.2) * 10),
+      ]);
+      if (clash(x, z, spec.radius * 0.6)) return;
+      put('stump', spec, x, z, rng, { sink: 0.22, lean: 0.06 });
+    });
+
+    pass(7, RULES.rootArch, (x, z, sm, rng) => {
+      const span = Math.round(rng.range(0.9, 2.6) * 10);
+      const th = Math.round(rng.range(0.06, 0.17) * 100);
+      const spec = this.prop('rootArch', [span, th, Math.round(Math.min(1, sm.moisture) * 10)]);
+      if (clash(x, z, spec.radius * 0.5)) return;
+      put('rootArch', spec, x, z, rng, { sink: 0.1, lean: 0.1 });
+    });
+
+    // ---- 4. branches and twigs: the layer that fills the gaps -------------
+    pass(46, RULES.branch, (x, z, sm, rng) => {
+      const len = Math.round(rng.range(0.7, 2.4) * 10);
+      const rad = Math.round(rng.range(0.035, 0.09) * 1000);
+      const spec = this.prop('branch', [len, rad, Math.round(rng.range(0.2, 0.9) * 10)]);
+      put('branch', spec, x, z, rng, { sink: 0.55, lean: 0.28 });
+    });
+
+    /**
+     * Twigs. The highest attempt count here by a wide margin.
+     *
+     * This is the family that actually moves the emptiness metric, and it is
+     * the cheapest one — a forked twig is ~40 triangles and its template is
+     * shared across thousands of instances. Spending the budget here rather
+     * than on more ferns is the deliberate choice: a stick reads as *forest
+     * debris* under a torch, whereas another fern card reads as more of the
+     * same plant.
+     */
+    pass(150, RULES.twig, (x, z, sm, rng) => {
+      const len = Math.round(rng.range(0.18, 0.62) * 10);
+      const rad = Math.round(rng.range(0.008, 0.03) * 1000);
+      const spec = this.prop('twig', [len, rad, Math.round(rng.range(0.3, 1) * 10)]);
+      put('twig', spec, x, z, rng, { sink: 0.72, lean: 0.42 });
+    });
+
+    // ---- 5. rock families -------------------------------------------------
+    pass(8, RULES.boulder, (x, z, sm, rng) => {
+      const sz = Math.round(rng.range(0.6, 1.9) * 100);
+      const spec = this.prop('boulder', [
+        sz, Math.round(Math.min(1, sm.moisture * 1.3) * 10), Math.round(sm.moisture * 10),
+      ]);
+      if (clash(x, z, spec.radius * 0.9)) return;
+      // Boulders sit deep: a rock resting on soil is mostly buried, and a
+      // shallow one reads as a prop dropped on the surface.
+      put('boulder', spec, x, z, rng, { sink: 0.42, lean: 0.14 });
+    });
+
+    pass(34, RULES.stone, (x, z, sm, rng) => {
+      const sz = Math.round(rng.range(0.17, 0.5) * 100);
+      const spec = this.prop('stone', [
+        sz, Math.round(Math.min(1, sm.moisture * 1.2) * 10), Math.round(sm.moisture * 10),
+      ]);
+      if (clash(x, z, spec.radius * 0.7)) return;
+      put('stone', spec, x, z, rng, { sink: 0.46, lean: 0.3 });
+    });
+
+    /**
+     * Pebbles, emitted in drifts.
+     *
+     * The cluster is the point. Gravel does not occur as isolated stones — water
+     * sorts it into patches — so each accepted point becomes a small elongated
+     * drift oriented along the local flow. A per-stone attempt loop would give
+     * an even sprinkle, which reads as noise on the ground texture rather than
+     * as gravel.
+     */
+    pass(26, RULES.pebble, (x, z, sm, rng) => {
+      const count = 3 + Math.round(sm.drainage * rng.range(4, 14));
+      const spread = 0.35 + sm.drainage * rng.range(0.5, 1.6);
+      // Elongate the drift: strongly directional when drainage is high (a
+      // channel), round when it is low (a weathered patch).
+      const dir = rng.next() * Math.PI * 2;
+      const elong = 1 + sm.drainage * 2.2;
+      for (let k = 0; k < count; k++) {
+        const a = rng.next() * Math.PI * 2, rr = Math.sqrt(rng.next()) * spread;
+        const lx = Math.cos(a) * rr * elong, lz = Math.sin(a) * rr;
+        const px = x + lx * Math.cos(dir) - lz * Math.sin(dir);
+        const pz = z + lx * Math.sin(dir) + lz * Math.cos(dir);
+        if (!this.plantable(px, pz)) continue;
+        const sz = Math.round(rng.range(0.04, 0.15) * 100);
+        const spec = this.prop('pebble', [sz, 0, Math.round(sm.moisture * 10)]);
+        put('pebble', spec, px, pz, rng, { sink: 0.5, lean: 0.5 });
+      }
+    });
+
+    // ---- 6. moss, fungi, bark --------------------------------------------
+    pass(20, RULES.mossMound, (x, z, sm, rng) => {
+      const spec = this.prop('mossMound', [Math.round(rng.range(0.2, 0.7) * 100)]);
+      if (clash(x, z, spec.radius * 0.8)) return;
+      put('mossMound', spec, x, z, rng, { sink: 0.5, lean: 0.18 });
+    });
+
+    pass(16, RULES.fungus, (x, z, sm, rng) => {
+      const spec = this.prop('fungus', [
+        Math.round(rng.range(0.05, 0.16) * 100), rng.next() < 0.4 ? 1 : 0,
+      ]);
+      put('fungus', spec, x, z, rng, {
+        sink: 0.15, lean: 0.12,
+        // Fungi keep their own pale tint — the usual brown jitter would cancel
+        // the one property that makes them useful under a flashlight.
+        tint: 0.94 + rng.next() * 0.12,
+      });
+    });
+
+    /**
+     * Bark plates, emitted as a ring around the trunk that shed them.
+     *
+     * Positioned in an *annulus* against the nearest trunk rather than at the
+     * sampled point, because bark does not travel: it falls straight down and
+     * accumulates in a skirt at the base. Scattering it on the sample point
+     * would give a haze of flecks across the forest, which is both wrong and
+     * far less legible than a visible ring at the foot of a big tree.
+     */
+    pass(22, RULES.barkFleck, (x, z, sm, rng) => {
+      const t = this.eco.trunkNear(x, z, 14);
+      if (!t.nearest) return;
+      const count = 2 + Math.round(rng.next() * 5);
+      for (let k = 0; k < count; k++) {
+        const a = rng.next() * Math.PI * 2;
+        const rr = t.nearest.r * rng.range(1.0, 3.4);
+        const px = t.nearest.x + Math.cos(a) * rr;
+        const pz = t.nearest.z + Math.sin(a) * rr;
+        if (!this.plantable(px, pz)) continue;
+        const spec = this.prop('barkFleck', [Math.round(rng.range(0.07, 0.22) * 100)]);
+        put('barkFleck', spec, px, pz, rng, { sink: 0.6, lean: 0.5 });
+      }
+    });
+
+    // ---- 7. root flares on the standing trunks in this chunk -------------
+    //
+    // Not a `pass`: these are not scattered at all, they are attached to
+    // specific trees. Iterating the chunk's own placements is what guarantees a
+    // flare is centred exactly on a trunk — a sampled position would be metres
+    // off and the roots would emerge from bare soil beside the tree.
+    for (const p of this.placementsNear(ox, oz)) {
+      if (p.r < 0.30) continue;                    // saplings have no buttress
+      if (this.hf.trailDist(p.x, p.z) < TRAIL_CLEAR) continue;
+      const rng = positionRng(p.x, p.z, 0x5100);
+      // Not every tree gets one: universal buttressing looks like a stylistic
+      // choice rather than a feature of old trees.
+      if (rng.next() > 0.32 + Math.min(0.5, p.r * 0.8)) continue;
+      const moist = this.zones.moistureAt(p.x, p.z);
+      const spec = this.prop('rootFlare', [
+        Math.round(p.r * 100), 3 + Math.round(rng.next() * 3),
+        Math.round(Math.min(1, moist * 1.2) * 10),
+      ]);
+      out.push({
+        geo: spec.geo,
+        x: p.x, z: p.z, y: this.hf.heightAt(p.x, p.z) - p.r * 0.35,
+        yaw: rng.next() * Math.PI * 2,
+        leanX: 0, leanZ: 0,
+        tr: 0.94, tg: 0.96, tb: 0.9,
+        h: Math.max(0.2, spec.height),
+        family: 'rootFlare',
+        solidBatch: true,
+        cast: true,
+      });
+    }
+
+    return out;
+  }
+
+  /** The trunk placements whose base falls inside this chunk. */
+  private placementsNear(ox: number, oz: number): { x: number; z: number; r: number }[] {
+    const out: { x: number; z: number; r: number }[] = [];
+    for (const t of this.trees) {
+      if (t.x < ox || t.x >= ox + CHUNK || t.z < oz || t.z >= oz + CHUNK) continue;
+      out.push({ x: t.x, z: t.z, r: t.r });
     }
     return out;
   }
 
+  /**
+   * Merge the floor into two meshes: alpha cards and solid props.
+   *
+   * The split is forced by material semantics, not by preference. The foliage
+   * material is `alphaTest: 0.38, side: DoubleSide` — correct for a fern card,
+   * ruinous for a log, which would render its interior faces and dissolve
+   * wherever its bark texture is dark. The bark material is opaque and
+   * single-sided, which is right for solids and would turn every fern card into
+   * an opaque rectangle.
+   *
+   * It costs one extra draw call per near chunk and buys correct shading plus
+   * shadow-casting deadwood, which is among the cheapest trades in the renderer.
+   */
   private buildFloorMesh(c: Chunk): void {
-    if (c.floor || c.floorItems.length === 0) return;
-    let v = 0, i = 0;
-    for (const f of c.floorItems) { v += f.geo.position.length / 3; i += f.geo.index.length; }
-    const t = new MergeTarget(v, i);
+    if (c.floor || c.floorSolid || c.floorItems.length === 0) return;
+
+    let vc = 0, ic = 0, vs = 0, is = 0, vsc = 0, isc = 0;
     for (const f of c.floorItems) {
-      t.add(f.geo, f.x, f.y, f.z, f.yaw, 1, f.leanX, f.leanZ,
-        f.tr, f.tg, f.tb, 0.55, 1, f.h);
+      const v = f.geo.position.length / 3, i = f.geo.index.length;
+      if (!f.solidBatch) { vc += v; ic += i; }
+      else if (f.cast) { vsc += v; isc += i; }
+      else { vs += v; is += i; }
     }
-    // Ground cards do not cast: hundreds of thin alpha-tested slivers in the
-    // shadow map buy nothing and cost a lot of fill.
-    c.floor = this.mkMesh(t.finish(), this.foliageMat, false);
-    c.nearVerts += t.vertices;
-    this.residentVerts += t.vertices;
+
+    // Cards.
+    if (ic > 0) {
+      const t = new MergeTarget(vc, ic);
+      for (const f of c.floorItems) {
+        if (f.solidBatch) continue;
+        t.add(f.geo, f.x, f.y, f.z, f.yaw, 1, f.leanX, f.leanZ,
+          f.tr, f.tg, f.tb, 0.55, 1, f.h);
+      }
+      // Ground cards do not cast: hundreds of thin alpha-tested slivers in the
+      // shadow map buy nothing and cost a lot of fill.
+      c.floor = this.mkMesh(t.finish(), this.foliageMat, false);
+      c.nearVerts += t.vertices;
+      this.residentVerts += t.vertices;
+    }
+
+    /**
+     * Solids.
+     *
+     * Non-casting and casting solids go into ONE mesh whose `castShadow` is
+     * driven by whether any casting item is present. Splitting them into two
+     * meshes would be more precise and cost a third draw call per chunk; the
+     * measured win is not worth it, because the non-casting solids (twigs,
+     * pebbles, flecks) are exactly the items whose shadow-map contribution is
+     * subpixel anyway — they cost fill, not correctness, and they are tiny.
+     */
+    if (is + isc > 0) {
+      const t = new MergeTarget(vs + vsc, is + isc);
+      for (const f of c.floorItems) {
+        if (!f.solidBatch) continue;
+        // Solid props do not sway: `swayRef` is set enormous so the wind
+        // shader's height ramp evaluates to ~0 across the whole prop. A rock
+        // that bends in the wind is a worse artefact than no wind at all.
+        t.add(f.geo, f.x, f.y, f.z, f.yaw, 1, f.leanX, f.leanZ,
+          f.tr, f.tg, f.tb, 0, 1, 1e6);
+      }
+      c.floorSolid = this.mkMesh(t.finish(), this.barkMat, isc > 0);
+      c.nearVerts += t.vertices;
+      this.residentVerts += t.vertices;
+    }
   }
 
   // ── runtime ───────────────────────────────────────────────────────────────
@@ -1061,6 +1567,7 @@ export class ScatterSystem {
       // Ground detail is near-only: at 80 m a 30 cm card is subpixel and all it
       // contributes is aliasing.
       if (c.floor) c.floor.visible = showNear;
+      if (c.floorSolid) c.floorSolid.visible = showNear;
 
       if (showNear) { triN += c.triNear; resident++; }
       else if (showFar) triF += c.triFar;
@@ -1228,7 +1735,7 @@ export class ScatterSystem {
 
   dispose(): void {
     for (const c of this.chunks) {
-      for (const m of [c.nearBark, c.nearFoliage, c.farBark, c.farFoliage, c.floor]) {
+      for (const m of [c.nearBark, c.nearFoliage, c.farBark, c.farFoliage, c.floor, c.floorSolid]) {
         if (!m) continue;
         m.geometry.dispose();
         this.group.remove(m);
