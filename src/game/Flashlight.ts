@@ -2,6 +2,9 @@ import * as THREE from 'three';
 import { Player } from './Player';
 import { SeededRandom } from '../core/SeededRandom';
 import { SOFT_SPRITE_CHUNKS } from '../render/Particles';
+import {
+  BEAM_A, BEAM_P, BEAM_S, BEAM_K, BEAM_NORM, beamProfile,
+} from '../render/ShaderChunks';
 
 /**
  * ============================================================================
@@ -108,18 +111,11 @@ import { SOFT_SPRITE_CHUNKS } from '../render/Particles';
 /** Cone half-angle of the spill lobe, radians. ~26°, a typical reflector. */
 const OUTER_ANGLE = 0.455;
 
-/**
- * Analytic beam profile coefficients.
- *
- * Least-squares fit against the target curve
- * [1.00, 0.92, 0.70, 0.50, 0.36, 0.20, 0.06, 0.00] sampled at
- * r = [0, .15, .30, .45, .60, .80, .95, 1.0]. Total residual < 0.002.
- */
-const BEAM_A = 2.15;    // core width
-const BEAM_P = 1.9;     // core shape (super-Gaussian exponent)
-const BEAM_S = 0.6;     // skirt exponent
-const BEAM_K = 0.66;    // skirt weight
-const BEAM_NORM = 1 / (1 + BEAM_K);   // makes profile(0) == 1
+// The beam profile coefficients and the `beamProfile()` curve now live in
+// `render/ShaderChunks.ts`, imported above. They moved because the volumetric
+// in-scatter pass needs the identical curve and cannot import from a gameplay
+// module without a dependency cycle — and a second copy of these five numbers
+// is exactly how the lit cone and the visible shaft drift apart.
 
 /** Throw distance, metres. Past this the profile is dark anyway. */
 const RANGE = 58;
@@ -556,11 +552,9 @@ function kelvinToColor(kelvin: number, out: THREE.Color): THREE.Color {
 }
 
 /** The fitted radial intensity profile. `rr` is 0 on axis, 1 at the rim. */
-function beamProfile(rr: number): number {
-  const core = Math.exp(-Math.pow(rr * BEAM_A, BEAM_P));
-  const skirt = Math.pow(Math.max(0, 1 - rr), BEAM_S) * BEAM_K;
-  return (core + skirt) * BEAM_NORM;
-}
+// `beamProfile()` is imported from render/ShaderChunks — see the note by the
+// imports. The cookie bake below calls it, so the baked texture and the
+// volumetric shader are guaranteed to describe the same cone.
 
 /**
  * Bake the photometric cookie for `SpotLight.map`.
