@@ -157,6 +157,75 @@ vec3 sampleCatmullRom(sampler2D tex, vec2 uv, vec2 texSize){
 }
 `;
 
+// ============================================================================
+// flashlight beam profile
+// ============================================================================
+
+/**
+ * Analytic beam profile coefficients — the ONE definition in the codebase.
+ *
+ * Least-squares fit against the target curve
+ * [1.00, 0.92, 0.70, 0.50, 0.36, 0.20, 0.06, 0.00] sampled at
+ * r = [0, .15, .30, .45, .60, .80, .95, 1.0]. Total residual < 0.002.
+ *
+ * These live here, rather than in `Flashlight.ts` where they were first
+ * written, because *four* separate consumers have to agree on the beam's shape
+ * and they do not all live in the same module:
+ *
+ *   1. the baked photometric cookie on `SpotLight.map`  (surface lighting)
+ *   2. the dust-mote vertex shader                      (particles in the beam)
+ *   3. the volumetric in-scatter pass                   (the visible shaft)
+ *   4. the shadow-quality focus calculation             (where detail is spent)
+ *
+ * If any one of them disagrees, the shaft of light and the surfaces it lands on
+ * describe differently-shaped cones, and the beam separates from the world —
+ * the motes light up outside the lit ellipse, or the shaft has a hard rim the
+ * floor does not. Exporting the numbers from a shared chunk is what makes
+ * "one definition" enforceable rather than aspirational.
+ */
+export const BEAM_A = 2.15;    // core width
+export const BEAM_P = 1.9;     // core shape (super-Gaussian exponent)
+export const BEAM_S = 0.6;     // skirt exponent
+export const BEAM_K = 0.66;    // skirt weight
+export const BEAM_NORM = 1 / (1 + BEAM_K);   // makes profile(0) == 1
+
+/** The fitted radial intensity profile. `rr` is 0 on axis, 1 at the rim. */
+export function beamProfile(rr: number): number {
+  const core = Math.exp(-Math.pow(rr * BEAM_A, BEAM_P));
+  const skirt = Math.pow(Math.max(0, 1 - rr), BEAM_S) * BEAM_K;
+  return (core + skirt) * BEAM_NORM;
+}
+
+/**
+ * GLSL form of the same profile, plus a cosine-domain entry point.
+ *
+ * The volumetric pass has a `cos(angle)` in hand rather than the angle, because
+ * that is what a dot product against the beam axis gives it, and `acos` per
+ * raymarch step per pixel is not free — this shader takes up to 24 steps.
+ *
+ * `beamProfileFromCos` therefore converts through `acos` only once per step and
+ * normalises by the cone's own half-angle, so it indexes the curve exactly as
+ * the cookie's texel radius does. Reconstructing the profile directly in the
+ * cosine domain would be cheaper still, but it changes shape with the cone
+ * angle — and the cone angle is a runtime uniform here, so the curve would
+ * drift against the baked cookie whenever the beam widened.
+ */
+export const GLSL_BEAM_PROFILE = /* glsl */`
+float beamProfile(float rr){
+  float core = exp(-pow(rr * ${BEAM_A.toFixed(4)}, ${BEAM_P.toFixed(4)}));
+  float skirt = pow(max(0.0, 1.0 - rr), ${BEAM_S.toFixed(4)}) * ${BEAM_K.toFixed(4)};
+  return (core + skirt) * ${BEAM_NORM.toFixed(8)};
+}
+
+float beamProfileFromCos(float cosA, float outerAngle){
+  float ang = acos(clamp(cosA, -1.0, 1.0));
+  float rr = ang / max(outerAngle, 1e-4);
+  // Past 1.35 the fitted skirt has fallen below the dither floor, so the branch
+  // saves the pow() calls rather than changing the result.
+  return rr < 1.35 ? beamProfile(rr) : 0.0;
+}
+`;
+
 /** Fullscreen-triangle style vertex shader (GLSL3) used by every post pass. */
 export const POST_VERT = /* glsl */`
 out vec2 vUv;
