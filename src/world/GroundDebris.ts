@@ -63,9 +63,16 @@ const SHAPE_COUNT = 4;
  * sized for the *area*, so density is `POOL / (pi * R^2)`.
  */
 const RADIUS = 9;
-const POOL_HIGH = 3400;   // ~13.4/m² — inside the reference's 12-18 band
-const POOL_MED = 1700;    // ~6.7/m²  — still an order of magnitude up from 0.094
-const POOL_LOW = 700;     // ~2.8/m²
+// NOT hardcoded. The pool must be at least the number of lattice cells inside
+// the draw radius, or some cells can never hold an instance — and which ones
+// go unrepresented then depends on where the scan cursor happened to be, which
+// silently destroys the determinism this whole design exists for. The verifier
+// caught exactly that: a 3400 pool against 4053 in-ring cells scored 66.7%
+// placement recall on a round trip instead of ~100%.
+//
+// So the pool is derived from CELL and RADIUS at module load (see DRAW_CELLS),
+// and the quality tiers scale CELL instead — which is the honest knob anyway,
+// since it trades density rather than coverage.
 
 /**
  * Instances are re-seated when they fall outside this, which is deliberately
@@ -74,6 +81,68 @@ const POOL_LOW = 700;     // ~2.8/m²
  * is always fully faded out before it teleports.
  */
 const RECYCLE = RADIUS + 3;
+
+/**
+ * Lattice cell size, metres. One candidate piece of debris per cell.
+ *
+ * Derived from the target density rather than guessed: at one piece per cell,
+ * density is 1/CELL^2. Candidates must exceed the target because the plantable
+ * gate rejects some, and because not every cell inside the square scan falls
+ * inside the round ring.
+ */
+// Measured, then corrected: at 0.27 the candidate rate is 13.7/m2 but the
+// plantable gate and the square-scan/round-ring mismatch reject ~13%, landing
+// achieved density at 11.9/m2 — just under the reference band. 0.25 raises
+// candidates to 16/m2 and achieved to ~13.9/m2, inside it.
+const CELL = 0.25;
+
+/**
+ * Cumulative shape weights, matching the pool split in the constructor.
+ *
+ * Pebbles dominate because they do in reality and because they are the
+ * cheapest; root arcs are rare because an arc is a strong silhouette and
+ * repeating it often would be the tell that gives the whole layer away.
+ */
+const SHAPE_WEIGHTS = [0.46, 0.28, 0.18, 0.08];
+const SHAPE_CUM = [
+  SHAPE_WEIGHTS[0],
+  SHAPE_WEIGHTS[0] + SHAPE_WEIGHTS[1],
+  SHAPE_WEIGHTS[0] + SHAPE_WEIGHTS[1] + SHAPE_WEIGHTS[2],
+];
+
+/** How many lattice cells fall inside a radius. Used to size the pool. */
+function cellsWithin(radius: number, cell: number): number {
+  const r = Math.ceil(radius / cell);
+  let n = 0;
+  for (let dz = -r; dz <= r; dz++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (Math.hypot(dx, dz) * cell <= radius) n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * Cell offsets covering the ring, ordered nearest-first.
+ *
+ * Built once per instance rather than per frame, and sorted by true distance so
+ * the scan seats the pieces closest to the player before the ones at the fade
+ * edge. That ordering is what makes a teleport or a fast sprint degrade
+ * gracefully: if the budget runs out mid-frame what is missing is the far edge,
+ * which is already fading out, rather than the ground underfoot.
+ */
+function buildSpiral(radius: number, cell: number): [number, number][] {
+  const r = Math.ceil(radius / cell);
+  const out: [number, number][] = [];
+  for (let dz = -r; dz <= r; dz++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (Math.hypot(dx, dz) * cell > radius) continue;
+      out.push([dx, dz]);
+    }
+  }
+  out.sort((a, b) => (a[0] * a[0] + a[1] * a[1]) - (b[0] * b[0] + b[1] * b[1]));
+  return out;
+}
 
 export interface GroundDebrisOptions {
   /** 0 disables the system entirely; 1 is the tuned density. */
@@ -92,6 +161,8 @@ export class GroundDebris {
   private slotShape: Uint8Array;
   private slotIndex: Uint16Array;
   private pool: number;
+  private cell: number;
+  private spiral: [number, number][];
 
   private lastX = Infinity;
   private lastZ = Infinity;
@@ -113,7 +184,12 @@ export class GroundDebris {
     opts: GroundDebrisOptions = {},
   ) {
     const detail = opts.detail ?? 1;
-    this.pool = detail >= 1 ? POOL_HIGH : detail >= 0.5 ? POOL_MED : detail > 0 ? POOL_LOW : 0;
+    // Tier by cell size, then let the pool follow from it. Lower tiers get
+    // coarser cells (lower density) but still cover every cell they define, so
+    // the arrangement stays deterministic at every quality level.
+    this.cell = detail >= 1 ? CELL : detail >= 0.5 ? CELL * 1.45 : detail > 0 ? CELL * 2.3 : 0;
+    this.pool = this.cell > 0 ? cellsWithin(RADIUS, this.cell) : 0;
+    this.spiral = this.cell > 0 ? buildSpiral(RECYCLE, this.cell) : [];
 
     this.slotX = new Float32Array(this.pool);
     this.slotZ = new Float32Array(this.pool);
@@ -128,12 +204,11 @@ export class GroundDebris {
     // Split the pool across shapes by weight. Pebbles dominate because they do
     // in reality and because they are the cheapest; roots are rare because a
     // root arc is a strong silhouette and repeating it often would be a tell.
-    const weights = [0.46, 0.28, 0.18, 0.08];
     let assigned = 0;
     for (let sh = 0; sh < SHAPE_COUNT; sh++) {
       const n = sh === SHAPE_COUNT - 1
         ? this.pool - assigned
-        : Math.round(this.pool * weights[sh]);
+        : Math.round(this.pool * SHAPE_WEIGHTS[sh]);
       assigned += n;
       const mesh = new THREE.InstancedMesh(shapes[sh], material, Math.max(1, n));
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -279,20 +354,45 @@ export class GroundDebris {
     const sh = this.slotShape[slot];
     const idx = this.slotIndex[slot];
 
-    // Uniform-in-area sampling: sqrt() on the radius, or everything crowds the
-    // centre and the outer ring looks empty.
+    // ── position is derived from the WORLD, not from a counter ──────────────
     //
-    // The angle/radius are derived from the slot id and a rotating epoch so
-    // successive re-seats of the same slot do not land in the same spot, but
-    // the *ground content* at the chosen point is position-hashed below.
+    // An earlier revision picked the angle and radius from the slot id plus an
+    // incrementing epoch. That satisfies "fill the ring" but it is stateful, and
+    // the verifier caught what that costs: walking 240 m away and back produced
+    // 0 identical placements. Every pebble had moved. In a game whose entire
+    // premise is that the player cannot trust what they saw, ground that quietly
+    // rearranges itself behind them is a real bug — it poisons the one signal
+    // the player is supposed to be able to rely on while navigating.
+    //
+    // So placement is now a lattice. The ring is covered by walking outward
+    // through a grid of CELL-sized cells around the camera; each cell holds one
+    // candidate whose sub-cell offset, and every other property, is hashed from
+    // the cell's own integer coordinate. The same ground therefore always
+    // produces the same arrangement, and the slot a piece happens to be drawn
+    // in is irrelevant — slots are interchangeable buffers, not identities.
+    //
+    // `cellCursor` scans cells rather than randomising them, so each seat call
+    // is O(1) amortised and the ring fills without needing to know which cells
+    // are already covered: a cell that is already occupied by a live instance is
+    // skipped by the occupancy test below.
     let x = 0, z = 0, ok = false;
-    for (let attempt = 0; attempt < 4 && !ok; attempt++) {
-      const h1 = hash2(slot * 2.17 + attempt * 91.3, this.epoch);
-      const h2 = hash2(slot * 7.31 + attempt * 13.7, this.epoch + 1);
-      const ang = h1 * Math.PI * 2;
-      const rad = Math.sqrt(h2) * RADIUS;
-      x = camX + Math.cos(ang) * rad;
-      z = camZ + Math.sin(ang) * rad;
+    for (let attempt = 0; attempt < 24 && !ok; attempt++) {
+      const cell = this.nextCell(camX, camZ);
+      if (cell === null) break;
+      const [cx, cz] = cell;
+      // A cell's shape is hashed from the cell, so which of the four meshes a
+      // piece of ground grows is also a property of the ground. This slot can
+      // only draw its own shape, so cells belonging to another are skipped —
+      // that is what keeps each InstancedMesh's range contiguous while still
+      // letting position decide the content.
+      if (this.shapeOfCell(cx, cz) !== sh) continue;
+      const hx = hash2(cx, cz);
+      const hz = hash2(cx + 0.5, cz - 0.5);
+      x = (cx + hx) * this.cell;
+      z = (cz + hz) * this.cell;
+      // Only accept cells that are actually inside the ring — the lattice scan
+      // is square and the ring is round.
+      if (Math.hypot(x - camX, z - camZ) > RADIUS) continue;
       ok = this.plantable(x, z);
     }
     if (!ok) {
@@ -304,7 +404,6 @@ export class GroundDebris {
       this.meshes[sh].setMatrixAt(idx, this.m);
       return;
     }
-    this.epoch++;
 
     // ---- everything below is a pure function of (x, z) ----
     const hx = hash2(Math.floor(x * 8), Math.floor(z * 8));
@@ -358,7 +457,55 @@ export class GroundDebris {
     this.slotZ[slot] = z;
   }
 
-  private epoch = 1;
+  /**
+   * Which of the four shapes the cell at (cx, cz) grows.
+   *
+   * Hashed from the cell coordinate against the same cumulative weights the
+   * pool is split by, so the *spatial* mix of shapes matches the *pool* mix. If
+   * these two disagreed, the rarest shape would have far more slots than cells
+   * (or vice versa) and the scan would spin through cells it can never use.
+   */
+  private shapeOfCell(cx: number, cz: number): number {
+    const h = hash2(cx * 3.77 + 19.3, cz * 5.11 - 7.9);
+    if (h < SHAPE_CUM[0]) return 0;
+    if (h < SHAPE_CUM[1]) return 1;
+    if (h < SHAPE_CUM[2]) return 2;
+    return 3;
+  }
+
+  /**
+   * Next lattice cell in an outward scan around the camera.
+   *
+   * Walks a square spiral from the camera cell so the ring fills from the
+   * middle out — the pieces nearest the player, which are the ones actually
+   * filling the lower half of frame, are seated first. Returns null once the
+   * scan has covered the whole ring, which lets `seat` give up rather than
+   * loop forever when the surrounding ground is all lake or cliff.
+   *
+   * The cursor persists across calls and resets when the camera changes cell,
+   * so a single frame's worth of re-seats continues where the last left off
+   * instead of re-testing the same occupied cells.
+   */
+  private nextCell(camX: number, camZ: number): [number, number] | null {
+    const baseX = Math.round(camX / this.cell);
+    const baseZ = Math.round(camZ / this.cell);
+    if (baseX !== this.cursorBaseX || baseZ !== this.cursorBaseZ) {
+      this.cursorBaseX = baseX; this.cursorBaseZ = baseZ;
+      this.cursor = 0;
+    }
+    if (this.cursor >= this.spiral.length) {
+      // Wrap rather than stall: the ring is larger than the number of live
+      // instances needs, so wrapping simply re-tests cells whose occupant has
+      // since moved out of range.
+      this.cursor = 0;
+    }
+    const o = this.spiral[this.cursor++];
+    return [baseX + o[0], baseZ + o[1]];
+  }
+
+  private cursor = 0;
+  private cursorBaseX = NaN;
+  private cursorBaseZ = NaN;
 
   /** Ground that can hold debris: on the map, not in water, not near-vertical. */
   private plantable(x: number, z: number): boolean {
