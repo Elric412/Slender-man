@@ -4,6 +4,7 @@ import { MaterialLibrary } from './MaterialLibrary';
 import { CollisionWorld } from '../physics/Collision';
 import { VegetationSystem, mergeGeos, patchWindMaterial } from './VegetationSystem';
 import { ScatterSystem } from './ScatterSystem';
+import { GroundDebris } from './GroundDebris';
 import { ForestAtlas } from './ForestAtlas';
 import { ZoneSystem } from './ZoneSystem';
 import { buildLandmark, LandmarkCtx, signpost, missingPoster } from './Landmarks';
@@ -23,6 +24,11 @@ export class MapGenerator {
   readonly veg: VegetationSystem;
   /** the real forest — trees, ground detail, canopy occupancy */
   readonly scatter: ScatterSystem;
+  /**
+   * Camera-following near-field debris pool. Read by `main.ts` every frame for
+   * its recycle step and on the weather curve for wetness, so it is public.
+   */
+  readonly debris: GroundDebris;
   readonly atlas: ForestAtlas;
   /**
    * Warm authored light sources. The single largest visual gap this map had:
@@ -47,6 +53,8 @@ export class MapGenerator {
     opts: {
       atlasSize?: number; anisotropy?: number; lodBias?: number;
       floorDetail?: number; densityScale?: number; practicalPool?: number;
+      /** near-field debris density; falls back to floorDetail, 0 disables */
+      debrisDetail?: number;
     } = {},
   ) {
     this.rng = new SeededRandom(seed ^ 0x9A17);
@@ -81,6 +89,30 @@ export class MapGenerator {
     // ScatterSystem owns trees now.
     this.veg = new VegetationSystem(mats, hf, seed, { trees: false });
     this.group.add(this.veg.group);
+
+    /**
+     * Near-field ground debris.
+     *
+     * Separate from `ScatterSystem`'s floor layer, and the split is deliberate.
+     * The scatterer's floor is *authored into the chunk* — planned once, merged
+     * into the chunk's vertex buffer, and therefore permanent and unbounded in
+     * count. This is the opposite: a small fixed instance pool that follows the
+     * camera and recycles, so the few metres the player is actually looking at
+     * carry dense detail without the whole 560 m world paying for it.
+     *
+     * It has to come after the forest because it reads the same zone field for
+     * density, and before the POIs so landmark dressing can sit on top of it
+     * rather than being buried by a later pass.
+     *
+     * Shares the atlas bark material: debris is wood, stone and root, which is
+     * exactly what that atlas page holds, and reusing it keeps the whole
+     * near-field layer inside the draw-call budget the atlas was designed
+     * around instead of adding a material of its own.
+     */
+    this.debris = new GroundDebris(hf, zones, this.atlas.barkMat, seed, {
+      detail: opts.debrisDetail ?? opts.floorDetail ?? 1,
+    });
+    this.group.add(this.debris.group);
 
     this.registerTrunkColliders();
     this.buildPOIs();
