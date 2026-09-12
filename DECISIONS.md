@@ -178,3 +178,27 @@ against pathological regressions, not hardware targets.
 - **Fixed tape zones, seeded forest** — tape *placement* within zones varies
   per seed, but zone identities are authored so the difficulty curve (road →
   quarry → tower) stays intentional.
+
+
+## 2026-09-12 — weather boot guard and reference lighting pass
+
+- Weather updates guard the debris layer itself. The previous `map?.debris.setWetness`
+  expression protected only the map and threw the reported boot error when that map
+  existed without debris. The per-frame detail update uses the same guard. Normal
+  `MapGenerator` construction still creates debris; this does not disable that layer.
+- Connected the existing `NightLighting` and `ShadowQuality` owners to boot, settings,
+  quality changes and gameplay. Removed the competing ambient curves. Corrected
+  double sRGB conversion in the night colors and reused the new frame inputs/results.
+- Atlas bark and foliage now consume the same wetness uniform as terrain and props.
+  Normal gameplay uses less distance blur so distant silhouettes remain legible.
+- Torch: correct camera-right offset, current aim on switch-on, shorter stable aim
+  lag, stronger hotspot/spill, less floating bounce, a smooth zero-intensity rim,
+  perspective-matched fog/dust profile, and more detailed machined viewmodel geometry.
+- Bumped the offline shell cache version. No new runtime dependency or network call.
+- Validation: the exact `setWetness` exception and two torch behavior failures were
+  reproduced before the fix. All six Node regression checks, render ownership,
+  map UI, shader lint and production build pass. The pre-existing eight type errors
+  in `src/render/ScatterSystem.ts` remain. Full Playwright execution is blocked here
+  by preview-server network-interface access; local Chromium also exits with SIGTRAP,
+  and the connected browser rejects localhost. Screenshot parity and real-GPU frame
+  times are unverified; this pass must remain a draft until gameplay visual QA.

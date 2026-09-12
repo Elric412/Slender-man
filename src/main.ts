@@ -13,6 +13,8 @@ import { EntityBrain, EntitySnapshot } from './ai/EntityBrain';
 import { RenderPipeline, StaticState } from './render/RenderPipeline';
 import { EnvironmentProbe } from './render/EnvironmentProbe';
 import { Sky } from './render/Sky';
+import { NightLighting, type NightEnvironment } from './render/NightLighting';
+import { ShadowQuality, SHADOW_BUDGETS } from './render/ShadowQuality';
 import { Player } from './game/Player';
 import { Flashlight } from './game/Flashlight';
 import { PalebarkEntity } from './entity/PalebarkEntity';
@@ -123,13 +125,6 @@ class StaticGame {
   private aiAcc = 0;
   /** Accumulated time owed to the practicals update since its last tick. */
   private practicalAcc = 0;
-  /** Accumulated time owed to the moon shadow map since its last re-render. */
-  private moonShadowAcc = 0;
-  /** Texel-snapped shadow-window centre at the last actual re-render. */
-  private moonShadowAtX = Infinity;
-  private moonShadowAtZ = Infinity;
-  /** Whether the moon shadow map has ever been rendered (first frame must not skip). */
-  private moonShadowPrimed = false;
   /** Reused perceptibility input — this is a per-frame path, so it must not allocate. */
   private perceptIn: PerceptInput = {
     beamOn: false, beamStrength: 0, staticLevel: 0, desat: 0.2, viewfinder: 0,
@@ -144,8 +139,15 @@ class StaticGame {
   private map!: MapGenerator;
   private nav!: NavWorld;
   private sky!: Sky;
+  /** Single owner for night key/fill/bounce energy. */
+  private night!: NightLighting;
+  private nightEnvironment: NightEnvironment = {
+    moonDim: 1, transmission: 1, openness: 1, wetness: 0, warmth: 0,
+  };
+  /** Single owner for moon/beam shadow geometry, bias and refresh cadence. */
+  private shadows = new ShadowQuality();
+  /** Aliases retained for existing pipeline/debug consumers; NightLighting owns them. */
   private moon!: THREE.DirectionalLight;
-  private moonTarget = new THREE.Object3D();
   private hemi!: THREE.HemisphereLight;
   private player!: Player;
   private flashlight!: Flashlight;
@@ -510,6 +512,7 @@ class StaticGame {
     this.flashlight = new Flashlight(
       this.scene, this.player, Math.min(this.spec.shadowMapSize, 1024), this.hf,
       this.spec.dustCount);
+    this.applyShadowQuality();
     this.wirePlayer();
     this.tapes = new TapeSystem(this.map, this.mats, this.scene, this.runSeed);
     this.effects = new Effects(this.scene, this.hf, this.spec.fogWisps, this.spec.particleCount);
@@ -562,23 +565,14 @@ class StaticGame {
     this.sky = new Sky();
     this.scene.add(this.sky.mesh);
 
-    // moonlight — cool, low, soft-shadowed directional
-    this.moon = new THREE.DirectionalLight(0x93a8cc, 0.55);
-    this.moon.castShadow = true;
-    this.moon.shadow.mapSize.set(this.spec.shadowMapSize, this.spec.shadowMapSize);
-    const sc = this.moon.shadow.camera;
-    sc.near = 20; sc.far = 260;
-    sc.left = -60; sc.right = 60; sc.top = 60; sc.bottom = -60;
-    this.moon.shadow.bias = -0.0015;
-    this.moon.shadow.normalBias = 0.05;
-    this.moon.target = this.moonTarget;
-    this.scene.add(this.moon, this.moonTarget);
-
-    // Faint sky/ground bounce. With an env probe active this drops right down —
-    // the IBL already supplies directional ambient, and doubling up flattens
-    // everything out.
-    this.hemi = new THREE.HemisphereLight(0x141c2a, 0x05060a, 0.32);
-    this.scene.add(this.hemi);
+    // One photometric owner. Cloud/canopy/rain are collapsed into one budget
+    // before it is split into moon key, sky fill and ground bounce.
+    this.night = new NightLighting();
+    this.night.addTo(this.scene);
+    this.night.setMoonDirection(this.sky.moonDir);
+    this.moon = this.night.moon;
+    this.hemi = this.night.hemi;
+    this.applyShadowQuality();
 
     this.scene.add(this.map.group);
   }
@@ -592,21 +586,51 @@ class StaticGame {
    */
   private captureEnvironment(): void {
     if (!this.spec.envProbe) {
-      this.hemi.intensity = 0.32;
+      this.night.setProbeActive(false);
+      this.scene.environmentIntensity = 0;
+      this.night.update(0, { moonDim: 1, transmission: 1, openness: 1, wetness: 0, warmth: 0 });
       return;
     }
     try {
       this.probe = new EnvironmentProbe(this.renderer, this.spec.tier === 'ultra' ? 256 : 128);
       this.sky.update(0);
       this.scene.environment = this.probe.capture(this.sky.mesh);
-      this.scene.environmentIntensity = 0.55;
-      // the probe carries the ambient now — back the hemisphere fill way off
-      this.hemi.intensity = 0.12;
+      this.night.setProbeActive(true);
+      const nightLevels = this.night.update(0, {
+        moonDim: 1, transmission: 1, openness: 1, wetness: 0, warmth: 0,
+      });
+      this.scene.environmentIntensity = nightLevels.fill;
       this.mats.setEnvIntensity(1);
     } catch (err) {
       console.warn('[STATIC] env probe unavailable, falling back to hemisphere fill', err);
       this.probe = null;
-      this.hemi.intensity = 0.32;
+      this.night.setProbeActive(false);
+      this.scene.environmentIntensity = 0;
+      this.night.update(0, { moonDim: 1, transmission: 1, openness: 1, wetness: 0, warmth: 0 });
+    }
+  }
+
+  /** Resolve a runtime shadow budget without trading away near-field texel density. */
+  private resolvedShadowBudget() {
+    const base = SHADOW_BUDGETS[this.spec.tier] ?? SHADOW_BUDGETS.high;
+    const requested = this.knobs?.shadowMapSize ?? base.moonSize;
+    const moonSize = Math.max(512, Math.min(base.moonSize, requested));
+    const ratio = moonSize / base.moonSize;
+    return {
+      moonSize,
+      beamSize: Math.max(512, Math.min(base.beamSize, moonSize)),
+      moonExtent: Math.max(28, base.moonExtent * ratio),
+    };
+  }
+
+  private applyShadowQuality(): void {
+    if (!this.moon) return;
+    const budget = this.resolvedShadowBudget();
+    this.shadows.configureMoon(this.moon, budget);
+    if (this.flashlight) {
+      this.shadows.configureBeam(
+        this.flashlight.light, budget.beamSize, this.flashlight.light.distance,
+      );
     }
   }
 
@@ -824,9 +848,7 @@ class StaticGame {
     if (this.pipeline && spec.tier !== this.spec.tier) {
       this.spec = spec;
       this.pipeline.setQuality(spec);
-      this.moon.shadow.mapSize.set(spec.shadowMapSize, spec.shadowMapSize);
-      if (this.moon.shadow.map) { this.moon.shadow.map.dispose(); this.moon.shadow.map = null as unknown as THREE.WebGLRenderTarget; }
-      this.flashlight.setShadowSize(Math.min(spec.shadowMapSize, 1024));
+      this.applyShadowQuality();
       this.flashlight.setDustBudget(spec.dustCount);
       this.handleResize();
     } else {
@@ -927,6 +949,7 @@ class StaticGame {
     this.flashlight.battery = 1;
     if (this.flashlight.on) this.flashlight.toggle();
     this.flashlight.warp();
+    this.shadows.invalidate();
     this.entity.respawnFar(this.player.pos);
     // Re-seed the brain's *discretionary* choices (which POI, which flank, how
     // long to hold). The world seed stays fixed so the map is unchanged; this is
@@ -1272,7 +1295,9 @@ class StaticGame {
     // Debris darkens on the same curve as the ground it sits in. Pushed here
     // rather than read inside GroundDebris so there is one authority for
     // wetness and the two cannot drift apart.
-    this.map?.debris.setWetness(wet);
+    // A map can exist before its optional detail layer is ready. Guard the
+    // layer itself, not just the map, so weather cannot abort loading.
+    this.map?.debris?.setWetness(wet);
     this.staticState.wetness = wet;
 
     // Fog thickens and hugs the ground as the air saturates — and now also
@@ -1306,7 +1331,9 @@ class StaticGame {
       // be clobbered on the next weather update.
       noise: this.settings.filmNoise,
       vignette: 0.30 + fear * 0.28 + this.vfWeight * 0.12,
-      dof: this.spec.dof ? 0.35 + this.vfWeight * 0.4 : 0,
+      // Keep trails and distant silhouettes readable in normal play; stronger
+      // defocus belongs to the deliberate viewfinder mode.
+      dof: this.spec.dof ? 0.12 + this.vfWeight * 0.4 : 0,
       dofRange: [2.4, 34 - wet * 8],
     });
 
@@ -1328,19 +1355,8 @@ class StaticGame {
         this.scene.background.copy(this.scene.fog.color).multiplyScalar(0.62);
       }
     }
-    // Zone ambient scales the IBL: a closed ravine gets less sky contribution than
-    // an open storm-fall, which is the difference between "dark" and "enclosed".
-    if (this.scene.environmentIntensity !== undefined) {
-      this.scene.environmentIntensity =
-        (0.55 - wet * 0.18) * (0.72 + atmo.ambient * 0.4);
-    }
-    // Hemisphere fill follows the same curve. Held to a narrow band: this is the
-    // term that flattens everything if it drifts up, and the one the reference
-    // frames have almost none of.
-    if (this.hemi) {
-      const base = this.spec.envProbe ? 0.12 : 0.32;
-      this.hemi.intensity = base * (0.78 + atmo.ambient * 0.34);
-    }
+    // NightLighting owns IBL fill and hemisphere bounce. Weather look owns
+    // fog/material grading only, so no second ambient curve can multiply the key.
   }
 
   // per-stage update profiling (EMA ms) — stability hunting + perf overlay
@@ -1369,76 +1385,6 @@ class StaticGame {
     const afford = this.knobs ? this.knobs.drawDistance : this.spec.drawDistance;
     const perceive = Math.max(0.62, this.percept.field.vegetation);
     return Math.round(afford * perceive);
-  }
-
-  /**
-   * Decide whether the moon's shadow map needs re-rendering this frame.
-   *
-   * Consumes `QualityKnobs.shadowRefreshHz`, which the governor produced but
-   * nothing read — so the moon cascade re-rendered the entire merged forest every
-   * frame (brief §1.6, §5.7). That is the largest single GPU line item at the top
-   * tiers, and between texel snaps its output is bit-identical to the previous
-   * frame, because the forest is static merged geometry and the shadow camera is
-   * already snapped to a texel grid.
-   *
-   * `renderer.shadowMap.autoUpdate = false` plus an explicit `needsUpdate` is the
-   * only correct way to do this in three: `autoUpdate` is global, so it is toggled
-   * per frame rather than left off, and `needsUpdate` self-clears after the render.
-   *
-   * Three conditions force a refresh regardless of the scheduled rate, and each one
-   * is a visible artefact if omitted:
-   *
-   *  1. **The snap window moved.** A stale map sampled against a shifted window
-   *     projects shadows at the wrong world offset — far worse than a stale map.
-   *  2. **A dynamic caster is close.** The entity is the one thing in this scene
-   *     that moves and casts; freezing its shadow while it walks is a tell that
-   *     reads instantly. Inside `DYNAMIC_R` we always refresh.
-   *  3. **Nothing has been rendered yet.** Otherwise frame one shows an
-   *     uninitialised map.
-   */
-  private updateMoonShadowSchedule(
-    dt: number, sx: number, sz: number, snap: EntitySnapshot,
-  ): void {
-    // Radius inside which the entity's own movement dominates the map's contents.
-    // The shadow window is 120 m across, so this is a generous fraction of it.
-    const DYNAMIC_R = 46;
-
-    const hz = this.knobs ? this.knobs.shadowRefreshHz : 30;
-    // The perceptibility field's shadow appetite scales the *scheduled* rate only;
-    // it can never suppress a forced refresh below.
-    const eff = Math.max(4, hz * Math.max(0.35, this.percept.field.shadow));
-
-    this.moonShadowAcc += dt;
-
-    const moved = Math.abs(sx - this.moonShadowAtX) > 1e-4
-               || Math.abs(sz - this.moonShadowAtZ) > 1e-4;
-    const dynamicNear = snap.distToPlayer < DYNAMIC_R;
-    const due = this.moonShadowAcc >= 1 / eff;
-
-    const refresh = !this.moonShadowPrimed || moved || dynamicNear || due;
-
-    // Opt this ONE light out of automatic refresh and drive it by hand. The
-    // per-light `shadow.autoUpdate` is the only flag that skips a single caster;
-    // the renderer-level one skips all of them (see the boot comment).
-    //
-    // `needsUpdate` is a one-shot: `WebGLShadowMap` clears it back to false the
-    // moment it renders the map, so we must assert it on every frame we want a
-    // refresh rather than latching it once.
-    //
-    // The *beam* is deliberately not driven from here: this method is only reached
-    // from the `state === 'playing'` branch of update(), whereas the flashlight is
-    // also rendered during shader warm-up and behind the title screen. The torch
-    // keeps three's default per-frame refresh, which is what a camera-rigid caster
-    // needs anyway.
-    this.moon.shadow.autoUpdate = false;
-    this.moon.shadow.needsUpdate = refresh;
-
-    if (refresh) {
-      this.moonShadowAcc = 0;
-      this.moonShadowAtX = sx;
-      this.moonShadowAtZ = sz;
-      this.moonShadowPrimed = true;
-    }
   }
 
   /**
@@ -1524,22 +1470,8 @@ class StaticGame {
       streak: k.streak,
       sharpen: k.sharpen,
     });
-    this.flashlight.setShadowSize(Math.min(k.shadowMapSize, 1024));
+    this.applyShadowQuality();
     this.flashlight.setDustBudget(Math.round(k.dustCount * this.percept.field.particles));
-    // Moon shadow map: the largest single GPU line item at the top tiers, because it
-    // re-renders the whole merged forest. Size tracks the knob; the refresh-rate knob
-    // is consumed by the pipeline's shadow scheduler.
-    if (this.moon.shadow.mapSize.x !== k.shadowMapSize) {
-      this.moon.shadow.mapSize.setScalar(k.shadowMapSize);
-      // Force three to rebuild the shadow target on the next render.
-      this.moon.shadow.map?.dispose();
-      this.moon.shadow.map = null;
-      // With autoUpdate off, a freshly allocated map is *blank* until something
-      // asks for a render. Un-prime the schedule so the next frame is forced to
-      // refresh rather than waiting up to 1/4 s for the cadence to come round —
-      // otherwise every quality change flashes a shadowless forest.
-      this.moonShadowPrimed = false;
-    }
     this.map.scatter.setLodBias(k.lodBias);
     // Merge budget: a chunk merge is a synchronous CPU transform over up to a
     // few hundred thousand vertices, so it is the single worst thing to be
@@ -1838,7 +1770,7 @@ class StaticGame {
     // Near-field debris follows the camera. Cheap: it early-outs unless the
     // player has moved 0.35 m, and even then it only touches the instances that
     // fell out of the recycle ring — a few dozen at a sprint, out of 3400.
-    this.map.debris.update(this.player.pos.x, this.player.pos.z);
+    this.map.debris?.update(this.player.pos.x, this.player.pos.z);
     // Practicals on a cadence: additive glow cards and a small real-light pool that
     // billboard against the camera. At 30 Hz the billboard error over one frame at
     // walking pace is well under a pixel, and this is pure CPU.
@@ -1859,30 +1791,26 @@ class StaticGame {
     // Runs after updatePracticals() so the warmth term reflects this frame's flicker.
     this.updateZoneAtmosphere(dt);
 
-    // ---- moon follows player (stabilized shadow window w/ texel snapping) ----
+    // ---- unified night hierarchy + moon shadow window ----
     const dim = this.sky.moonDimAt(time);
-    // Slightly stronger key so trunks/ground get a readable cool rim instead of
-    // collapsing to silhouette; cloud-cover dimming and the exposure clamp above
-    // keep the overall frame dark. Paired with the composite toe-lift.
-    // Zone transmission gates the key light: `zoneAtmo.moon` folds the zone's
-    // nominal moonlight with the *measured* canopy occlusion from ScatterSystem, so
-    // stepping out of old growth into a windthrow clearing is a real change in key
-    // rather than only a change in how many trunks are in frame. Floored at 0.3 —
-    // total loss of the key collapses the frame to flat ambient, which reads as a
-    // rendering failure rather than as darkness.
-    this.moon.intensity = 0.72 * dim
-      * (1 - this.weather.wetness * 0.45)
-      * (0.3 + this.zoneAtmo.moon * 0.85);
-    const texel = (60 * 2) / this.moon.shadow.mapSize.x;
-    const sx = Math.round(this.player.pos.x / texel) * texel;
-    const sz = Math.round(this.player.pos.z / texel) * texel;
-    this.moonTarget.position.set(sx, this.player.pos.y, sz);
-    this.moon.position.set(
-      sx + this.sky.moonDir.x * 140,
-      this.player.pos.y + this.sky.moonDir.y * 140,
-      sz + this.sky.moonDir.z * 140);
-    this.moonTarget.updateMatrixWorld();
-    this.updateMoonShadowSchedule(dt, sx, sz, snap);
+    this.night.setMoonDirection(this.sky.moonDir);
+    const nightEnvironment = this.nightEnvironment;
+    nightEnvironment.moonDim = dim;
+    nightEnvironment.transmission = this.zoneAtmo.moon;
+    nightEnvironment.openness = this.zoneAtmo.ambient;
+    nightEnvironment.wetness = this.weather.wetness;
+    nightEnvironment.warmth = this.zoneAtmo.warmth;
+    const nightLevels = this.night.update(dt, nightEnvironment);
+    if (this.scene.environment) this.scene.environmentIntensity = nightLevels.fill;
+
+    const shadowAt = this.night.followPlayer(
+      this.player.pos.x, this.player.pos.y, this.player.pos.z, this.shadows.extent,
+    );
+    const shadowHz = this.knobs ? this.knobs.shadowRefreshHz : 30;
+    const effectiveShadowHz = shadowHz * Math.max(0.35, this.percept.field.shadow);
+    this.shadows.scheduleMoon(
+      this.moon, dt, shadowAt.sx, shadowAt.sz, effectiveShadowHz, snap.distToPlayer < 46,
+    );
     this.profMark('env', p0);
 
     // ---- audio bed ----
@@ -1958,7 +1886,8 @@ class StaticGame {
       0.94
       + this.flashlight.beamStrength * 0.36
       - this.weather.wetness * 0.08
-      + this.vfWeight * 0.10);
+      + this.vfWeight * 0.10
+      + (1 - nightLevels.budget) * 0.14);
 
     // ---- HUD ----
     p0 = performance.now();
