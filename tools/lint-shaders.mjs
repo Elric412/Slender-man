@@ -89,6 +89,13 @@ for (const path of await walk(SRC)) {
 
   const shaders = extractShaderTemplates(source, file);
   shaderCount += shaders.length;
+  for (const [index, shader] of shaders.entries()) {
+    for (const match of shader.matchAll(/smoothstep\(\s*(-?\d+(?:\.\d*)?)\s*,\s*(-?\d+(?:\.\d*)?)\s*,/g)) {
+      if (Number(match[1]) >= Number(match[2])) {
+        failures.push(`${file} shader #${index + 1}: smoothstep edges must increase; use 1.0 - smoothstep(low, high, x)`);
+      }
+    }
+  }
 
   if (GLSL3_FILES.has(file)) {
     glsl3Count += shaders.length;

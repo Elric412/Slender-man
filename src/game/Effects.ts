@@ -93,9 +93,9 @@ export class Effects {
           float r = length(c) * 2.0;
           // two octaves drifting against each other so the sheet churns
           float n = noise(vUv * 5.0 + uTime * 0.05) * 0.6 + noise(vUv * 11.0 - uTime * 0.03) * 0.4;
-          float a = smoothstep(1.0, 0.15, r) * n * 0.14;
+          float a = (1.0 - smoothstep(0.15, 1.0, r)) * n * 0.14;
           // soft distance dissolve instead of the old 130 m visibility pop
-          a *= smoothstep(190.0, 95.0, vDist);
+          a *= (1.0 - smoothstep(95.0, 190.0, vDist));
           if (a < 0.002) discard;
           gl_FragColor = vec4(vec3(0.55, 0.62, 0.72) * a, a);   // premultiplied
         }`,
@@ -201,3 +201,4 @@ export class Effects {
     if (this.rain) { this.scene.remove(this.rain.lines); this.rain.dispose(); }
   }
 }
+

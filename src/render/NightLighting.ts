@@ -84,8 +84,10 @@ const AMBIENT_FLOOR = 0.35;
 /** Colour temperature of the three sources, as linear-space THREE.Colors. */
 // Three's hex constructor already converts sRGB into the working linear space.
 const KEY_COLOR = new THREE.Color(0x9fb4dc);
-const SKY_COLOR = new THREE.Color(0x2a3852);
-const GROUND_COLOR = new THREE.Color(0x14110d);
+// Hue belongs in the color; the energy budget owns brightness. Dark hex colors
+// multiplied by a dim intensity suppressed fallback lighting a second time.
+const SKY_COLOR = new THREE.Color(0xb9c8df);
+const GROUND_COLOR = new THREE.Color(0x706557);
 
 export interface NightEnvironment {
   /** 0..1 moon disc visibility (cloud crossing) */
@@ -203,8 +205,11 @@ export class NightLighting {
     // Nearly flat. Ground bounce is not an atmospheric phenomenon; the leaf
     // litter under your feet returns light whether or not there is a canopy
     // overhead, and this term existing is why boots and roots stay visible.
-    this.levels.bounce = KEY_BASE * BOUNCE_RATIO * this.hemiShare
-      * (0.80 + 0.20 * budget);
+    const groundBounce = KEY_BASE * BOUNCE_RATIO * (0.80 + 0.20 * budget);
+    const missingSkyFill = this.hemiShare === 1
+      ? KEY_BASE * FILL_RATIO * Math.min(1.05, fillAtten * openBoost)
+      : 0;
+    this.levels.bounce = groundBounce + missingSkyFill;
 
     // Warm practical spill leans the *fill* warm rather than adding a light.
     // Adding light near a campfire would double-count the practical's own
