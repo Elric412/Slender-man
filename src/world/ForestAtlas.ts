@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import {
   allocSurface, dataTexture, heightToNormalData, bakeCavityAO, packORM, setRGB,
-  registerShaderPatch, applyShaderPatch, surfaceUniforms,
+  registerShaderPatch, applyShaderPatch, wetnessPatch,
   type SurfaceBuffers,
 } from './MaterialLibrary';
 
@@ -1171,6 +1171,10 @@ export class ForestAtlas {
     const atlasSize = albedo.image.width;
     atlasPatch(this.barkMat, rects, false, atlasSize);
     atlasPatch(this.foliageMat, rects, true, atlasSize);
+    // The atlas replaces stock map chunks, so apply the shared rain response
+    // afterwards, once its roughness/normal samples have been established.
+    applyShaderPatch(this.barkMat, wetnessPatch(0.9));
+    applyShaderPatch(this.foliageMat, wetnessPatch(0.6));
 
     // Anisotropy is applied here rather than at texture creation so both
     // materials are guaranteed to agree — grazing angles on a trunk are exactly

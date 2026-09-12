@@ -193,36 +193,26 @@ export const BEAM_NORM = 1 / (1 + BEAM_K);   // makes profile(0) == 1
 export function beamProfile(rr: number): number {
   const core = Math.exp(-Math.pow(rr * BEAM_A, BEAM_P));
   const skirt = Math.pow(Math.max(0, 1 - rr), BEAM_S) * BEAM_K;
-  return (core + skirt) * BEAM_NORM;
+  const edge = Math.min(1, Math.max(0, (rr - 0.78) / 0.22));
+  return (core + skirt) * BEAM_NORM * (1 - edge * edge * (3 - 2 * edge));
 }
 
-/**
- * GLSL form of the same profile, plus a cosine-domain entry point.
- *
- * The volumetric pass has a `cos(angle)` in hand rather than the angle, because
- * that is what a dot product against the beam axis gives it, and `acos` per
- * raymarch step per pixel is not free — this shader takes up to 24 steps.
- *
- * `beamProfileFromCos` therefore converts through `acos` only once per step and
- * normalises by the cone's own half-angle, so it indexes the curve exactly as
- * the cookie's texel radius does. Reconstructing the profile directly in the
- * cosine domain would be cheaper still, but it changes shape with the cone
- * angle — and the cone angle is a runtime uniform here, so the curve would
- * drift against the baked cookie whenever the beam widened.
- */
+/** The same curve for dust and fog, using the spotlight cookie's perspective
+ * projection rather than a linear angular approximation. */
 export const GLSL_BEAM_PROFILE = /* glsl */`
 float beamProfile(float rr){
   float core = exp(-pow(rr * ${BEAM_A.toFixed(4)}, ${BEAM_P.toFixed(4)}));
   float skirt = pow(max(0.0, 1.0 - rr), ${BEAM_S.toFixed(4)}) * ${BEAM_K.toFixed(4)};
-  return (core + skirt) * ${BEAM_NORM.toFixed(8)};
+  return (core + skirt) * ${BEAM_NORM.toFixed(8)} * (1.0 - smoothstep(0.78, 1.0, rr));
 }
 
 float beamProfileFromCos(float cosA, float outerAngle){
-  float ang = acos(clamp(cosA, -1.0, 1.0));
-  float rr = ang / max(outerAngle, 1e-4);
-  // Past 1.35 the fitted skirt has fallen below the dither floor, so the branch
-  // saves the pow() calls rather than changing the result.
-  return rr < 1.35 ? beamProfile(rr) : 0.0;
+  // A spotlight cookie is perspective projected: radius is tan(angle),
+  // not angle. Match that projection so haze and surfaces share a boundary.
+  if (cosA <= cos(outerAngle)) return 0.0;
+  float c = clamp(cosA, 1e-4, 1.0);
+  float rr = sqrt(max(0.0, 1.0 - c * c)) / (c * tan(outerAngle));
+  return beamProfile(rr);
 }
 `;
 
@@ -238,3 +228,4 @@ void main(){
 export function buildFrag(body: string, chunks: string[] = []): string {
   return `precision highp float;\nprecision highp sampler2D;\nin vec2 vUv;\nout vec4 fragColor;\n${chunks.join('\n')}\n${body}`;
 }
+

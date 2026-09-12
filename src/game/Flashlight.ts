@@ -3,113 +3,17 @@ import { Player } from './Player';
 import { SeededRandom } from '../core/SeededRandom';
 import { SOFT_SPRITE_CHUNKS } from '../render/Particles';
 import {
-  BEAM_A, BEAM_P, BEAM_S, BEAM_K, BEAM_NORM, beamProfile,
+  GLSL_BEAM_PROFILE, beamProfile,
 } from '../render/ShaderChunks';
 
 /**
- * ============================================================================
- * FLASHLIGHT — a handheld LED torch, rebuilt
- * ============================================================================
- *
- * ## What was actually broken
- *
- * The previous implementation looked sophisticated and was, in several specific
- * ways, wrong. Each of these is a functional defect, not a taste call.
- *
- * ### 1. The aim spring made the torch point where the player *had been* looking
- *
- * ```
- *   stiffness = 150, damping = 2·sqrt(150)·0.92 ≈ 22.5
- *   aimVel += (dir - aim)·150·dt;  aimVel *= (1 - 22.5·dt)
- * ```
- *
- * That is a ~200 ms settling response: a normal 90°/s mouse turn left the beam
- * trailing the crosshair by **25-30 degrees**. In a game whose only affordance
- * is "look at the thing to see the thing", that is the flashlight not working.
- *
- * It was also numerically unstable. The damping factor `1 - 22.5·dt` **goes
- * negative past dt ≈ 44 ms**, inverting the velocity and kicking the beam
- * backwards. The `min(dt, 0.05)` clamp did not save it — 0.05 is already past
- * the stability limit, so every frame slower than 20 fps threw the beam.
- *
- * Replaced with a *positional* first-order follow using the exact discrete
- * solution `a += (d - a)·(1 - exp(-dt/τ))`. Unconditionally stable at any dt,
- * and at τ = 45 ms it lags a fast turn by 2-4° — present enough to read as a
- * held object, far too small to read as latency.
- *
- * ### 2. The light's target matrix was never flushed
- *
- * `target.position` was written every frame, but `Object3D.matrixWorld` is only
- * recomputed when something walks the graph. `WebGLLights` reads
- * `light.target.matrixWorld`, and `SpotLightShadow.updateMatrices` reads it
- * again for the shadow camera. Because `scene.updateMatrixWorld()` runs *inside*
- * `WebGLRenderer.render`, the main pass got lucky — but the volumetric pass
- * pulls `sl.target.getWorldPosition()` from `RenderPipeline`, which runs on the
- * previous frame's matrices. That is the beam's fog cone visibly trailing its
- * own lit geometry. Both matrices are now flushed explicitly.
- *
- * ### 3. The hand offset pushed the emitter 22 cm *forward* of the eye
- *
- * ```
- *   handPos = eye + right·0.17 + dir·0.22
- * ```
- *
- * With `shadow.camera.near = 0.25`, the shadow near plane then sat ~3 cm behind
- * the light's own origin — so anything within half a metre (the viewmodel arm,
- * grass, the rock you are standing on) was **lit but cast no shadow**, and
- * near-field grass flared. The offset is now lateral and downward only, which
- * is also where a hand actually is.
- *
- * ### 4. `decay = 1.55` deleted the distance cue
- *
- * Inverse-square is `decay = 2`. At 1.55 a trunk at 8 m and a trunk at 25 m
- * receive within a factor of 3 of each other instead of a factor of 10, so the
- * image loses its depth ordering — everything in the beam reads as the same
- * distance. Combined with `intensity = 330` the near field blew through the top
- * of the AgX curve (irradiance ≈ 330 at 1 m) while 40 m read as nothing.
- *
- * Now: true inverse-square, a photometrically-sized intensity, and the
- * near-field over-brightness handled by a finite-aperture term rather than by
- * flattening the exponent.
- *
- * ### 5. The cookie was gamma-encoded, so the mid-shoulder was crushed
- *
- * The profile is a *photometric curve*, not an image, but it was tagged
- * `SRGBColorSpace` — so three linearised it on sample and 0.5 linear intensity
- * became 0.21. That single flag is most of why the beam read as a small bright
- * core with an abrupt edge: the entire mid shoulder was squashed. Now tagged
- * `LinearSRGBColorSpace`.
- *
- * ### 6. Three edge rolloffs stacked on top of each other
- *
- * `SpotLight.map` is multiplied into `directLight.color` *after* three's own
- * `getSpotAttenuation` smoothstep. The shipped beam was therefore
- * `smoothstep(coneCos, penumbraCos, a) · cookie(uv)` with `penumbra = 0.22` —
- * two independent rolloffs — *plus* a hard `1 - smoothstep(0.94, 1.0, rr)`
- * vignette baked into the texture. That vignette was justified as stopping
- * "leaks into the corners", but `inSpotLightMap` already rejects out-of-frustum
- * directions; all it actually did was carve a hard ring just inside the rim,
- * which is exactly the "hard circular CG edge" the brief forbids.
- *
- * Now `penumbra` is a ~1.5° anti-alias band at the extreme rim, the baked
- * vignette is gone, and the whole visible profile comes from one fitted curve.
- *
- * ## The shape being built
- *
- * A real high-power handheld LED has three regimes and all three matter:
- *
- *   HOTSPOT   ~35% of the cone, near-flat. This is the "reach".
- *   SHOULDER  a smooth 2-stop rolloff. This is what makes it feel round.
- *   SPILL     a wide dim skirt that lifts the immediate foreground, so you are
- *             not walking inside a black tube with a bright disc ahead of you.
- *
- * `exp(-(r·2.15)^1.9) + 0.66·(1-r)^0.6`, normalised, reproduces that curve to
- * within 2% — and critically it reaches the rim at ~0.008 and keeps decaying
- * rather than snapping to zero, so there is no discontinuity anywhere.
+ * Handheld torch: shadowed hotspot, soft reflector shoulder and wide dim spill.
+ * The cookie, fog and dust share one projected radial profile. Aim follows the
+ * camera with a short stable lag; switching on snaps to the current direction.
  */
 
-/** Cone half-angle of the spill lobe, radians. ~26°, a typical reflector. */
-const OUTER_ANGLE = 0.455;
+/** Cone half-angle of the spill lobe, radians. ~28°, a typical reflector. */
+const OUTER_ANGLE = 0.49;
 
 // The beam profile coefficients and the `beamProfile()` curve now live in
 // `render/ShaderChunks.ts`, imported above. They moved because the volumetric
@@ -120,29 +24,10 @@ const OUTER_ANGLE = 0.455;
 /** Throw distance, metres. Past this the profile is dark anyway. */
 const RANGE = 58;
 
-/**
- * Peak luminous intensity.
- *
- * three computes `color · intensity · 1/d² · window` for a spot. Targeting a
- * hotspot that lands high on the AgX shoulder without clipping, on a
- * 0.35-albedo diffuse surface at 3 m:
- *
- *   E = I/d²  ⇒  I = E·d²,  target E ≈ 14  ⇒  I ≈ 125
- *
- * (Lambert divides by π, so surface radiance is `E·albedo/π`.) 125 puts the
- * 3 m hotspot near 205/255 post-AgX: bright, still textured, not blown.
- */
-const PEAK_INTENSITY = 125;
+/** Peak intensity in candela; inverse-square falloff preserves depth cues. */
+const PEAK_INTENSITY = 155;
 
-/**
- * Finite-aperture softening radius, metres.
- *
- * Pure 1/d² means ground 40 cm from the lens receives ~6× the 1 m value and
- * clips to white the instant you look down. Real torches do not do this because
- * the emitter is not a point — it has an aperture, which acts as a soft clamp
- * within roughly one aperture diameter. `1/(d² + r₀²)` models that for free and
- * removes the whole class of "looked at my feet, screen went white" artefacts.
- */
+/** Softening radius for the dust scattering term near the emitter. */
 const APERTURE = 0.85;
 const APERTURE2 = APERTURE * APERTURE;
 
@@ -191,8 +76,8 @@ export class Flashlight {
   private up = new THREE.Vector3(0, 1, 0);
   private aimOut = new THREE.Vector3(0, 0, -1);
 
-  /** Aim follow time constant, seconds. See header note 1. */
-  private static readonly AIM_TAU = 0.045;
+  /** Aim follow time constant, seconds. */
+  private static readonly AIM_TAU = 0.025;
   private static readonly SLAB_XZ = 7.0;
   private static readonly SLAB_Y = 3.2;
 
@@ -211,7 +96,7 @@ export class Flashlight {
 
     // ------------------------------------------------------------- main lobe
     //
-    // `penumbra = 0.06` is deliberately tiny — see header note 6. three's own
+    // `penumbra = 0.06` is deliberately tiny. three's own
     // smoothstep runs *before* the cookie is applied, so a large penumbra here
     // would stack a second rolloff on the fitted profile and wash the hotspot
     // out. At 0.06 it is only the ~1.5° anti-alias band the projected texture
@@ -273,6 +158,11 @@ export class Flashlight {
   toggle(): void {
     if (!this.on && this.battery <= 0.005) return;   // dead cell: click, nothing
     this.on = !this.on;
+    if (this.on) {
+      this.player.camera.getWorldDirection(this.aim);
+      this.flickerTarget = 1;
+      this.flickerHold = 0;
+    }
     if (!this.on) this.flickerTarget = 0;
     this.onToggle?.(this.on);
   }
@@ -389,8 +279,8 @@ export class Flashlight {
     this.pool.color.copy(this.light.color);
 
     this.light.intensity = PEAK_INTENSITY * this.strength;
-    this.spill.intensity = 3.4 * this.strength;
-    this.pool.intensity = 1.15 * this.strength;
+    this.spill.intensity = 5.0 * this.strength;
+    this.pool.intensity = 0.65 * this.strength;
     this.player.setLensGlow(active ? 2.2 * this.strength : 0);
     this.light.visible = this.spill.visible = this.pool.visible = active;
 
@@ -409,7 +299,9 @@ export class Flashlight {
     const cam = this.player.camera;
     cam.getWorldPosition(this.srcPos);
     cam.getWorldDirection(this.dir);
-    this.right.set(this.dir.z, 0, -this.dir.x).normalize();
+    // Camera-local +X stays right even when looking straight up/down.
+    this.right.setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+    this.up.setFromMatrixColumn(cam.matrixWorld, 1).normalize();
 
     // Exact discrete solution of a first-order lag. Correct at any frame rate
     // and cannot overshoot — which the previous explicit-Euler spring did,
@@ -431,9 +323,9 @@ export class Flashlight {
 
     // Hand offset: right of and *below* the eye, with **no forward component**.
     // The forward term used to be 0.22 m, which put the emitter in front of its
-    // own shadow near plane — see header note 3.
-    this.handPos.copy(this.srcPos).addScaledVector(this.right, 0.19);
-    this.handPos.y -= 0.17;
+    // own shadow near plane.
+    this.handPos.copy(this.srcPos).addScaledVector(this.right, 0.24)
+      .addScaledVector(this.up, -0.17);
 
     this.aimOut.copy(this.aim)
       .addScaledVector(this.right, swayX)
@@ -444,7 +336,7 @@ export class Flashlight {
     this.spill.position.copy(this.handPos);
     this.target.position.copy(this.handPos).addScaledVector(this.aimOut, 30);
 
-    // **Explicitly** flush both matrices — see header note 2. Relying on the
+    // **Explicitly** flush both matrices. Relying on the
     // scene-graph walk inside `renderer.render()` leaves every consumer that
     // runs earlier (notably the volumetric pass) one frame stale, which reads
     // as the beam's fog cone trailing its own lit geometry.
@@ -568,8 +460,8 @@ function kelvinToColor(kelvin: number, out: THREE.Color): THREE.Color {
  * corners"; `inSpotLightMap` already rejects those directions, so all the
  * vignette did was carve a visible hard ring just inside the rim.
  *
- * Here the profile is evaluated across the whole square and simply *continues*
- * past the inscribed radius, so there is no discontinuity in the sampled region.
+ * The shared profile rolls smoothly to zero at the inscribed radius, so the
+ * outer shadow-frustum boundary never cuts off a visibly bright shoulder.
  *
  * ## The detail that sells it
  *
@@ -692,11 +584,7 @@ function makeDustMaterial(): THREE.ShaderMaterial {
 
       // The SAME fitted profile the cookie bakes. One definition is what makes
       // the motes and the lit surfaces agree about the beam's shape.
-      float beamProfile(float rr){
-        float core = exp(-pow(rr * ${BEAM_A.toFixed(4)}, ${BEAM_P.toFixed(4)}));
-        float skirt = pow(max(0.0, 1.0 - rr), ${BEAM_S.toFixed(4)}) * ${BEAM_K.toFixed(4)};
-        return (core + skirt) * ${BEAM_NORM.toFixed(8)};
-      }
+      ${GLSL_BEAM_PROFILE}
 
       void main(){
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
@@ -711,11 +599,9 @@ function makeDustMaterial(): THREE.ShaderMaterial {
 
         // Angle from the beam axis, normalised against the cone half-angle so
         // it indexes the profile exactly as the cookie's radius does.
-        float ang = acos(clamp(dot(l, uBeamDir), -1.0, 1.0));
-        float rr = ang / max(uOuterAngle, 1e-4);
-        float cone = rr < 1.35 ? beamProfile(rr) : 0.0;
+        float cone = beamProfileFromCos(dot(l, uBeamDir), uOuterAngle);
 
-        // Finite-aperture softening, matching the surface lighting model.
+        // Finite-aperture softening for airborne scattering near the emitter.
         float atten = 1.0 / (d * d + ${APERTURE2.toFixed(6)});
 
         // scatter angle between the beam and the eye ray

@@ -82,9 +82,10 @@ const BOUNCE_RATIO = 0.10;
 const AMBIENT_FLOOR = 0.35;
 
 /** Colour temperature of the three sources, as linear-space THREE.Colors. */
-const KEY_COLOR = new THREE.Color(0x9fb4dc).convertSRGBToLinear();
-const SKY_COLOR = new THREE.Color(0x2a3852).convertSRGBToLinear();
-const GROUND_COLOR = new THREE.Color(0x14110d).convertSRGBToLinear();
+// Three's hex constructor already converts sRGB into the working linear space.
+const KEY_COLOR = new THREE.Color(0x9fb4dc);
+const SKY_COLOR = new THREE.Color(0x2a3852);
+const GROUND_COLOR = new THREE.Color(0x14110d);
 
 export interface NightEnvironment {
   /** 0..1 moon disc visibility (cloud crossing) */
@@ -121,6 +122,7 @@ export class NightLighting {
   /** Smoothed budget, so walking under a canopy is a fade and not a step. */
   private budgetSmooth = 1;
   private primed = false;
+  private shadowCentre = { sx: 0, sz: 0 };
   /** Nominal (un-modified) fill, captured so `fill` can be a pure ratio. */
   private fillNominal = 0.62;
 
@@ -238,7 +240,9 @@ export class NightLighting {
     );
     this.moonTarget.updateMatrixWorld();
     this.moon.updateMatrixWorld();
-    return { sx, sz };
+    this.shadowCentre.sx = sx;
+    this.shadowCentre.sz = sz;
+    return this.shadowCentre;
   }
 
   private dir = new THREE.Vector3(0.35, 0.62, -0.55).normalize();
@@ -249,7 +253,7 @@ export class NightLighting {
   get current(): NightLevels { return this.levels; }
 }
 
-const WARM_FILL = new THREE.Color(0x4a3a2c).convertSRGBToLinear();
-const WARM_BOUNCE = new THREE.Color(0x2a1c10).convertSRGBToLinear();
+const WARM_FILL = new THREE.Color(0x4a3a2c);
+const WARM_BOUNCE = new THREE.Color(0x2a1c10);
 
 function clamp01(v: number): number { return v < 0 ? 0 : v > 1 ? 1 : v; }

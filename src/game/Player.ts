@@ -109,13 +109,13 @@ export class Player {
 
     // ---- flashlight ----
     this.flashlightMesh = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.029, 0.17, 12), bodyMat);
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.029, 0.17, 32), bodyMat);
     body.rotation.x = Math.PI / 2;
-    const head = new THREE.Mesh(new THREE.CylinderGeometry(0.038, 0.029, 0.055, 12), bodyMat);
+    const head = new THREE.Mesh(new THREE.CylinderGeometry(0.038, 0.029, 0.055, 32), bodyMat);
     head.rotation.x = Math.PI / 2;
     head.position.z = -0.105;
     // reflector ring
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.031, 0.005, 6, 16),
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.035, 0.003, 8, 32),
       new THREE.MeshStandardMaterial({ color: 0x777d85, roughness: 0.2, metalness: 0.9 }));
     ring.position.z = -0.133;
     // tailcap button
@@ -124,10 +124,28 @@ export class Player {
     tail.position.z = 0.093;
     const lensMat = new THREE.MeshStandardMaterial({
       color: 0xfff2d0, emissive: 0xffdf9e, emissiveIntensity: 0.0, roughness: 0.1 });
-    const lens = new THREE.Mesh(new THREE.CircleGeometry(0.031, 16), lensMat);
+    const lens = new THREE.Mesh(new THREE.CircleGeometry(0.031, 32), lensMat);
     lens.position.z = -0.1335;
     lens.rotation.y = Math.PI;
     this.flashlightMesh.add(body, head, ring, tail, lens);
+    // Machined head fins and rubber grip bands catch thin highlights. These
+    // are viewmodel-only details; no extra world material or texture atlas.
+    const finGeo = new THREE.TorusGeometry(0.033, 0.002, 6, 32);
+    for (let i = 0; i < 3; i++) {
+      const fin = new THREE.Mesh(finGeo, accentMat);
+      fin.position.z = -0.087 - i * 0.012;
+      this.flashlightMesh.add(fin);
+    }
+    const bandGeo = new THREE.TorusGeometry(0.027, 0.0015, 6, 24);
+    for (let i = 0; i < 2; i++) {
+      const band = new THREE.Mesh(bandGeo, accentMat);
+      band.position.z = -0.04 + i * 0.09;
+      this.flashlightMesh.add(band);
+    }
+    const switchButton = new THREE.Mesh(new THREE.SphereGeometry(0.009, 12, 8), accentMat);
+    switchButton.scale.set(1, 0.35, 1.3);
+    switchButton.position.set(0, 0.028, -0.04);
+    this.flashlightMesh.add(switchButton);
     (this.flashlightMesh as unknown as { lensMat: THREE.MeshStandardMaterial }).lensMat = lensMat;
     this.flashlightMesh.position.set(0, 0.055, -0.075);
     this.flashlightMesh.rotation.x = 0.02; // ~matches beam tilt
