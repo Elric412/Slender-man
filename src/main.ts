@@ -1269,6 +1269,10 @@ class StaticGame {
     const wet = THREE.MathUtils.clamp(w.wetness, 0, 1);
 
     this.mats?.setWetness(wet);
+    // Debris darkens on the same curve as the ground it sits in. Pushed here
+    // rather than read inside GroundDebris so there is one authority for
+    // wetness and the two cannot drift apart.
+    this.map?.debris.setWetness(wet);
     this.staticState.wetness = wet;
 
     // Fog thickens and hugs the ground as the air saturates — and now also
@@ -1831,6 +1835,10 @@ class StaticGame {
     // Selects the LOD tier per chunk and services the amortised near-tier merge
     // queue — must run every frame, not only on chunk change, or the queue stalls.
     this.map.scatter.setViewer(this.player.pos.x, this.player.pos.z, vegDist);
+    // Near-field debris follows the camera. Cheap: it early-outs unless the
+    // player has moved 0.35 m, and even then it only touches the instances that
+    // fell out of the recycle ring — a few dozen at a sprint, out of 3400.
+    this.map.debris.update(this.player.pos.x, this.player.pos.z);
     // Practicals on a cadence: additive glow cards and a small real-light pool that
     // billboard against the camera. At 30 Hz the billboard error over one frame at
     // walking pace is well under a pixel, and this is pure CPU.
