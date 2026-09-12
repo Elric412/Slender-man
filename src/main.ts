@@ -431,7 +431,9 @@ class StaticGame {
     // drift out of agreement with what the player can see and walk through.
     this.audio.setProbe(this.col);
     this.map = new MapGenerator(this.hf, this.mats, this.col, this.zones, WORLD_SEED, {
-      atlasSize: this.spec.textureSize,
+      // Sixteen surfaces share this sheet. A 256px atlas leaves only 60px per
+      // bark/needle tile, making mobile foliage read as chunky rectangles.
+      atlasSize: Math.max(1024, this.spec.textureSize),
       anisotropy: this.spec.anisotropy,
       // Low tiers pull the LOD0 radius in and thin the ground-card layer rather
       // than reducing tree count: silhouette density is what carries the look,
@@ -1320,8 +1322,8 @@ class StaticGame {
     // the vignette in and lifts grain.
     const fear = this.fear.value;
     this.pipeline?.setGrade({
-      bloom: 0.55 + wet * 0.28,
-      streak: 0.22 + wet * 0.18,
+      bloom: 0.22 + wet * 0.16,
+      streak: 0.025 + this.vfWeight * 0.10,
       volumetric: 0.9 + wet * 0.45,
       ao: 0.85 + fear * 0.2,
       grain: 0.035 + fear * 0.09 + this.vfWeight * 0.05,
@@ -1330,7 +1332,7 @@ class StaticGame {
       // overwrites the whole grade block every frame, so a one-shot write would
       // be clobbered on the next weather update.
       noise: this.settings.filmNoise,
-      vignette: 0.30 + fear * 0.28 + this.vfWeight * 0.12,
+      vignette: 0.76 - fear * 0.18 - this.vfWeight * 0.10,
       // Keep trails and distant silhouettes readable in normal play; stronger
       // defocus belongs to the deliberate viewfinder mode.
       dof: this.spec.dof ? 0.12 + this.vfWeight * 0.4 : 0,
@@ -1877,7 +1879,8 @@ class StaticGame {
     this.vfWeight += ((inp.vfHeld ? 1 : 0) - this.vfWeight) * Math.min(1, dt * 9);
     this.pipeline.setBeam(
       this.flashlight.beamStrength > 0.002 ? this.flashlight.light : null,
-      this.flashlight.beamStrength);
+      this.flashlight.beamStrength,
+      this.flashlight.originPosition, this.flashlight.aimDirection);
     this.applyWeatherLook(dt);
 
     // Eyes adapt: a lit beam raises the target, rain gloom lowers it, and the

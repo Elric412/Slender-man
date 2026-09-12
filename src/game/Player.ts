@@ -168,6 +168,18 @@ export class Player {
     lm.emissiveIntensity = v;
   }
 
+  /** Physical emitter, ahead of the barrel. Retract it when a wall or terrain
+   * blocks the eye-to-lens segment so the light cannot appear beyond a wall. */
+  getFlashlightOrigin(out: THREE.Vector3): THREE.Vector3 {
+    this.flashlightMesh.localToWorld(out.set(0, 0, -0.14));
+    const eye = this.camera.position;
+    if (this.hf.heightAt(out.x, out.z) > out.y ||
+        !this.col.losClear(eye.x, eye.y, eye.z, out.x, out.y, out.z)) {
+      out.copy(eye);
+    }
+    return out;
+  }
+
   setBatteryGauge(level: number): void {
     const m = this.batteryGauge.material as THREE.MeshStandardMaterial;
     this.batteryGauge.scale.z = Math.max(0.05, level);
@@ -347,7 +359,8 @@ export class Player {
     const vm = this.arm;
     const sprintLower = this.sprinting ? 0.06 : 0;
     this.vmSprint += (sprintLower - this.vmSprint) * Math.min(1, dt * 5);
-    vm.position.x = 0.24 + this.vmLag.x * 0.05 + Math.cos(this.bobPhase) * 0.008 * this.bobAmount;
+    const handX = 0.24 * Math.min(1, this.camera.aspect / 0.9);
+    vm.position.x = handX + this.vmLag.x * 0.05 + Math.cos(this.bobPhase) * 0.008 * this.bobAmount;
     vm.position.y = -0.22 + this.vmSprint + this.vmLag.y * 0.05 + Math.sin(this.bobPhase * 2) * 0.01 * this.bobAmount + breathe * 0.6;
     vm.rotation.z = this.vmLag.x * 0.25 + tremX * 4;
     vm.rotation.x = this.vmLag.y * 0.2 - flinch * 0.5 + this.vmSprint * 1.4;

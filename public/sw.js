@@ -3,7 +3,7 @@
  * network-first for navigation so deploys update promptly.
  * Bump CACHE_NAME whenever the shell changes in a breaking way.
  */
-const CACHE_NAME = 'static-v3';
+const CACHE_NAME = 'static-v4';
 const CORE = ['./', './index.html', './manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {

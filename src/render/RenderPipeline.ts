@@ -1188,7 +1188,9 @@ export class RenderPipeline {
         col += g * uGrain * grainWeight * uNoise;
 
         // peripheral narrowing
-        float vig = smoothstep(1.28 - s * 0.34, 0.34, length(cc) * 1.9);
+        // GLSL smoothstep requires edge0 < edge1. Reversed edges are undefined
+        // on mobile drivers and can black out the entire periphery.
+        float vig = 1.0 - smoothstep(0.34, 1.28 - s * 0.34, length(cc) * 1.9);
         col *= mix(uVignette, 1.0, vig);
 
         // ordered dither on the final 8-bit quantisation — no banding in the dark

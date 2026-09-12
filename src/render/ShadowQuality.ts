@@ -126,11 +126,8 @@ export class ShadowQuality {
   /**
    * Configure the flashlight shadow.
    *
-   * The near plane is the headline change: pushed from 0.25 m to 0.6 m. The
-   * torch is at the player's hand and nothing the player needs shadowed is
-   * inside 60 cm, so that range was pure precision waste — and because
-   * perspective depth precision is front-loaded, reclaiming it improves the
-   * whole 3–25 m band where the beam actually does its work.
+   * Keep the near plane at the physical lens. A 60 cm near plane skipped
+   * close walls and foliage, allowing the light to pass through them.
    *
    * `focus` deliberately stays at 1: the cookie already shapes the cone, so
    * narrowing the shadow frustum inside the light cone would clip shadows off
@@ -143,15 +140,15 @@ export class ShadowQuality {
       light.shadow.map = null;
     }
     const sc = light.shadow.camera;
-    sc.near = 0.6;
+    sc.near = 0.08;
     sc.far = range;
     sc.updateProjectionMatrix();
 
     // A spot shadow's texel size varies with distance, so a single world-space
     // normalBias is a compromise. Tuned for the 4–12 m band, which is where the
     // beam's shadows are actually read.
-    light.shadow.normalBias = 0.028;
-    light.shadow.bias = -0.0004;
+    light.shadow.normalBias = 0.012;
+    light.shadow.bias = -0.00008;
     light.shadow.radius = 2.6;
     light.shadow.blurSamples = 10;
   }
@@ -203,3 +200,4 @@ export class ShadowQuality {
   /** World size of one moon shadow texel, metres — useful for debug overlays. */
   get texelSize(): number { return (this.moonExtent * 2) / this.moonSize; }
 }
+

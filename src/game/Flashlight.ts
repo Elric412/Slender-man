@@ -43,8 +43,7 @@ export class Flashlight {
   onToggle: ((on: boolean) => void) | null = null;
   onBatteryLow: (() => void) | null = null;
 
-  private spill: THREE.SpotLight;      // wide, shadowless spill lobe
-  private pool: THREE.PointLight;      // warm near-field ground bounce
+  private spill: THREE.SpotLight;      // wide, shadowed spill lobe
   private cookie: THREE.DataTexture;
 
   private dust: THREE.Points;
@@ -55,7 +54,6 @@ export class Flashlight {
   private dustCount: number;
   private dustRng: SeededRandom;
 
-  private hf: import('../world/HeightField').HeightField | null;
 
   // --- electrical / optical state -------------------------------------------
   private drive = 0;         // 0..1 driver output state
@@ -88,7 +86,6 @@ export class Flashlight {
     hf?: import('../world/HeightField').HeightField,
     dustCount = 260,
   ) {
-    this.hf = hf ?? null;
     this.dustRng = new SeededRandom(0xD057);
 
     // ---------------------------------------------------------------- cookie
@@ -105,29 +102,27 @@ export class Flashlight {
     this.light.map = this.cookie;
     this.light.castShadow = true;
     this.light.shadow.mapSize.set(shadowSize, shadowSize);
-    // Near plane at 0.6 m rather than 0.25 m. Nothing the player needs shadowed
-    // is closer, and perspective shadow depth precision is front-loaded, so
-    // reclaiming that range measurably sharpens the 3-25 m band where the beam
-    // actually does its work. (ShadowQuality re-applies this per tier.)
-    this.light.shadow.camera.near = 0.6;
+    // Near walls and foliage must still occlude the beam at the lens.
+    this.light.shadow.camera.near = 0.08;
     this.light.shadow.camera.far = RANGE;
-    this.light.shadow.bias = -0.0004;
-    this.light.shadow.normalBias = 0.028;
+    this.light.shadow.bias = -0.00008;
+    this.light.shadow.normalBias = 0.012;
     this.light.shadow.radius = 2.6;
     this.light.target = this.target;
     scene.add(this.light, this.target);
 
-    // Wide shadowless spill: light escaping the reflector and bouncing off the
-    // player's own hand and the near air. This is what kills the "torch in a
-    // void" read — without it the 4 m around you is as black as 40 m.
-    this.spill = new THREE.SpotLight(0xffd2a0, 0, 26, 1.05, 0.85, 2);
-    this.spill.castShadow = false;
+    // Broad low-energy reflector spill. It casts shadows too: an unshadowed
+    // second light would illuminate the other side of walls and tree trunks.
+    this.spill = new THREE.SpotLight(0xffd2a0, 0, 12, 0.9, 0.85, 2);
+    this.spill.castShadow = true;
+    this.spill.shadow.mapSize.set(512, 512);
+    this.spill.shadow.camera.near = 0.08;
+    this.spill.shadow.camera.far = 12;
+    this.spill.shadow.bias = -0.00008;
+    this.spill.shadow.normalBias = 0.012;
     this.spill.target = this.target;
     scene.add(this.spill);
 
-    // Near-field ground bounce, parked on the terrain a couple of metres ahead.
-    this.pool = new THREE.PointLight(0xffd0a0, 0, 8.5, 2);
-    scene.add(this.pool);
 
     // ------------------------------------------------------------------ dust
     this.dustCount = Math.max(24, dustCount | 0);
@@ -276,13 +271,11 @@ export class Flashlight {
     // Cool-neutral LED that warms slightly as the driver browns out.
     kelvinToColor(3900 + 1500 * THREE.MathUtils.clamp(this.drive, 0, 1), this.light.color);
     this.spill.color.copy(this.light.color).lerp(COOL_SPILL, 0.22);
-    this.pool.color.copy(this.light.color);
 
     this.light.intensity = PEAK_INTENSITY * this.strength;
     this.spill.intensity = 5.0 * this.strength;
-    this.pool.intensity = 0.65 * this.strength;
-    this.player.setLensGlow(active ? 2.2 * this.strength : 0);
-    this.light.visible = this.spill.visible = this.pool.visible = active;
+    this.player.setLensGlow(active ? 0.12 * this.strength : 0);
+    this.light.visible = this.spill.visible = active;
 
     // No shadow scheduling here on purpose. The beam is rigidly attached to a
     // camera that can rotate arbitrarily fast, so there is no cheap "did it
@@ -321,13 +314,12 @@ export class Flashlight {
       + Math.sin(this.swayPhase * 5.3) * 0.0019) * bob;
     const swayY = Math.sin(this.swayPhase * 2.3 + 1.1) * 0.0048 * bob;
 
-    // Hand offset: right of and *below* the eye, with **no forward component**.
-    // The forward term used to be 0.22 m, which put the emitter in front of its
-    // own shadow near plane.
-    this.handPos.copy(this.srcPos).addScaledVector(this.right, 0.24)
-      .addScaledVector(this.up, -0.17);
-
-    this.aimOut.copy(this.aim)
+    // Emit from the lens, not from behind the hand where the torch body
+    // intercepts its own light. Player retracts the origin at blocking geometry.
+    this.player.getFlashlightOrigin(this.handPos);
+    // Converge on a point in the centre of the view, retaining slight hand lag.
+    this.aimOut.copy(this.srcPos).addScaledVector(this.aim, 12)
+      .sub(this.handPos)
       .addScaledVector(this.right, swayX)
       .addScaledVector(this.up, swayY)
       .normalize();
@@ -343,16 +335,6 @@ export class Flashlight {
     this.light.updateMatrixWorld(true);
     this.target.updateMatrixWorld(true);
     this.spill.updateMatrixWorld(true);
-
-    // Ground bounce pool, on the terrain ahead of the player.
-    if (this.hf) {
-      const px = this.player.pos.x + this.aimOut.x * 2.1;
-      const pz = this.player.pos.z + this.aimOut.z * 2.1;
-      this.pool.position.set(px, this.hf.heightAt(px, pz) + 0.9, pz);
-    } else {
-      this.pool.position.copy(this.srcPos).addScaledVector(this.aimOut, 2.0);
-      this.pool.position.y -= 0.9;
-    }
 
     this.updateDust(step, time);
   }
@@ -403,13 +385,12 @@ export class Flashlight {
   }
 
   dispose(): void {
-    this.scene.remove(this.light, this.target, this.spill, this.pool, this.dust);
+    this.scene.remove(this.light, this.target, this.spill, this.dust);
     this.dustGeo.dispose();
     this.dustMat.dispose();
     this.cookie.dispose();
     this.light.dispose();
     this.spill.dispose();
-    this.pool.dispose();
   }
 }
 

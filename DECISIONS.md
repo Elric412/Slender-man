@@ -202,3 +202,27 @@ against pathological regressions, not hardware targets.
   by preview-server network-interface access; local Chromium also exits with SIGTRAP,
   and the connected browser rejects localhost. Screenshot parity and real-GPU frame
   times are unverified; this pass must remain a draft until gameplay visual QA.
+
+## 2026-09-12 — mobile readability and physical torch follow-up
+
+- The supplied portrait screenshot exposed two reproducible defects: the lens
+  projected past the viewport (NDC x about 1.05), and fallback sky energy was
+  only 0.00465 in a representative canopy. Fallback lighting now supplies the
+  missing sky fill as well as ground bounce, with color separated from intensity.
+- The held torch adapts to portrait aspect ratios. Its emitter follows the lens,
+  converges toward the viewed point, and retracts when the eye-to-lens segment is
+  blocked. Removed the floating ground point light; both reflector lobes now cast
+  shadows, with an 8 cm near plane for close walls. Reduced lens emission and
+  anamorphic streaking, and passed explicit beam vectors to the fog renderer.
+- The vignette preserves more peripheral visibility and uses ordered smoothstep
+  edges. Corrected the same undefined reversed-edge operation in fog and stars;
+  shader lint now rejects reversed numeric edges.
+- Forest atlas minimum is 1024 rather than sharing a 256px sheet among sixteen
+  surfaces. This increases texture memory/boot synthesis work in exchange for
+  finer bark and alpha silhouettes; device performance still needs measurement.
+- Replaced the unused duplicate render/ScatterSystem implementation with a
+  compatibility re-export of the world owner. Typecheck now passes.
+- Ten Node regression tests pass. Added desktop/mobile gameplay screenshot QA
+  and a read-only GitHub Actions job to run it because local browser execution
+  is unavailable here. Rendered fidelity and device frame times remain unverified
+  until those captures can be inspected.

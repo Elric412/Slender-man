@@ -70,7 +70,7 @@ export class Sky {
           float h = hash13(cell);
           if (h > 0.978 && d.y > -0.05) {
             vec3 f = fract(sp) - 0.5;
-            float star = smoothstep(0.28, 0.0, length(f)) * (h - 0.978) * 45.0;
+            float star = (1.0 - smoothstep(0.0, 0.28, length(f))) * (h - 0.978) * 45.0;
             float tw = 0.75 + 0.25 * sin(uTime * (1.0 + h * 4.0) + h * 40.0);
             col += vec3(0.9, 0.95, 1.0) * star * tw * clamp(d.y * 3.0, 0.0, 1.0);
           }
@@ -120,3 +120,4 @@ export class Sky {
     return m;
   }
 }
+
