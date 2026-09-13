@@ -75,7 +75,7 @@ const BARK_TILE_WORLD = 2.4;
 const BARK_TILE_WORLD_FINE = 0.9;
 
 /** Radial segment counts per LOD. */
-const RADIAL = [8, 6, 4];
+const RADIAL = [12, 6, 4];
 
 /** Silhouette signature resolution — 32 height bands. */
 const SIL_BINS = 32;
@@ -308,6 +308,12 @@ function limb(b: Builder, o: LimbOpts): void {
   for (let i = 0; i < n; i++) {
     const p = o.path[i], rad = rEff[i];
     const v = vAt[i];
+    const prev = Math.max(0, i - 1), next = Math.min(n - 1, i + 1);
+    const taper = (rEff[next] - rEff[prev]) / Math.max(0.001, arc[next] - arc[prev]);
+    // Broad, shallow basal grooves break the machined-cylinder silhouette.
+    // Carve inward to preserve the original collision envelope. Thin twigs
+    // and distant LODs keep their inexpensive round cross-section.
+    const flute = seg >= 8 && rMax > 0.18 ? 0.10 * Math.exp(-arc[i] / 4) : 0;
     // seg+1 verts so u can reach 1.0 — a shared seam vert would force u=0 and
     // u=1 onto one vertex and mirror the last column of bark.
     for (let j = 0; j <= seg; j++) {
@@ -316,9 +322,19 @@ function limb(b: Builder, o: LimbOpts): void {
       const nx = N[i].x * ca + B[i].x * sa;
       const ny = N[i].y * ca + B[i].y * sa;
       const nz = N[i].z * ca + B[i].z * sa;
+      const wave = 0.5 + 0.35 * Math.cos(3 * a) + 0.15 * Math.cos(5 * a + 0.7);
+      const shape = 1 - flute * wave;
+      const angularSlope = flute * (1.05 * Math.sin(3 * a) + 0.75 * Math.sin(5 * a + 0.7));
+      const longitudinalSlope = taper * shape + rad * flute * wave / 4;
+      const around = angularSlope / shape;
+      const normal = norm(v3(
+        nx - (-N[i].x * sa + B[i].x * ca) * around - tan[i].x * longitudinalSlope,
+        ny - (-N[i].y * sa + B[i].y * ca) * around - tan[i].y * longitudinalSlope,
+        nz - (-N[i].z * sa + B[i].z * ca) * around - tan[i].z * longitudinalSlope,
+      ));
       b.vert(
-        p.x + nx * rad, p.y + ny * rad, p.z + nz * rad,
-        nx, ny, nz,
+        p.x + nx * rad * shape, p.y + ny * rad * shape, p.z + nz * rad * shape,
+        normal.x, normal.y, normal.z,
         j / seg, v,
         o.r, o.g, o.b,
         o.tile, repeatsU, 1,

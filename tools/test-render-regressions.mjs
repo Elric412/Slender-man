@@ -29,11 +29,47 @@ await build({ stdin: { contents: `
   export { MapGenerator } from './world/MapGenerator';
   export { ScatterSystem } from './world/ScatterSystem';
   export { MaterialLibrary } from './world/MaterialLibrary';
+  export { buildAllTemplates, buildTree } from './world/TreeFactory';
 `, resolveDir: new URL('../src', import.meta.url).pathname, loader: 'ts' }, bundle: true,
   platform: 'node', format: 'esm', outfile: '.tmp/render-flashlight.mjs', external: ['three'] });
 const { StaticGame } = await import('../.tmp/render-game.mjs');
 const { Flashlight, Player, beamProfile, NightLighting, ForestAtlas, surfaceUniforms } =
   await import('../.tmp/render-flashlight.mjs');
+
+test('tree archetypes retain finite unit normals and valid indexed geometry at all LODs', async () => {
+  const { buildAllTemplates, buildTree } = await import('../.tmp/render-flashlight.mjs');
+  for (const lod of [0, 1, 2]) {
+    for (const tree of buildAllTemplates(42, ['healthy', 'longDead'], lod)) {
+      const geo = tree.bark;
+      assert.ok([...geo.position, ...geo.normal, ...geo.uv].every(Number.isFinite), tree.key);
+      assert.ok(geo.index.every(i => i < geo.position.length / 3), tree.key);
+      for (let i = 0; i < geo.normal.length; i += 3)
+        assert.ok(Math.abs(Math.hypot(geo.normal[i], geo.normal[i + 1], geo.normal[i + 2]) - 1) < 1e-5, tree.key);
+    }
+  }
+  const a = buildTree(42, 'matureConifer', 0, 'healthy');
+  const b = buildTree(42, 'matureConifer', 0, 'healthy');
+  assert.deepEqual(a.bark.position, b.bark.position);
+  assert.deepEqual(a.bark.normal, b.bark.normal);
+  // A near trunk ring closes both its geometric and shading seam.
+  for (let axis = 0; axis < 3; axis++) {
+    assert.ok(Math.abs(a.bark.position[axis] - a.bark.position[12 * 3 + axis]) < 1e-6);
+    assert.ok(Math.abs(a.bark.normal[axis] - a.bark.normal[12 * 3 + axis]) < 1e-6);
+  }
+});
+
+test('bark microdetail uses scaled gradients and excludes foliage', () => {
+  const atlas = ForestAtlas.build(42, { size: 64, anisotropy: 1 });
+  for (const [material, bark] of [[atlas.barkMat, true], [atlas.foliageMat, false]]) {
+    const shader = { uniforms: {}, vertexShader: THREE.ShaderLib.standard.vertexShader,
+      fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+    material.onBeforeCompile(shader, null);
+    assert.equal(shader.fragmentShader.includes('vec3 barkGrain'), bark);
+    assert.ok(shader.fragmentShader.includes('atlasDx * atlasRect.zw * frequency'));
+    assert.ok(shader.fragmentShader.includes('atlasDy * atlasRect.zw * frequency'));
+  }
+  atlas.dispose();
+});
 
 test('terrain construction retains the actual forest-floor shader patches', async () => {
   const { MapGenerator, MaterialLibrary } = await import('../.tmp/render-flashlight.mjs');

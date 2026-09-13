@@ -195,3 +195,47 @@ checklists read. Their geometry-first guidance drove this scoped integration
 pass. Support-surface sourcing remains procedural/local; no hero asset is
 claimed upgraded by this pass. Next: validate mobile captures, then rebuild
 close-range bark/branch junctions and the hand model with production art.
+
+## Tree form and bark follow-up
+
+Reference direction: broad, irregular trunk silhouettes and layered surface
+relief should carry the image before any stronger post-processing. This pass
+adds near-tree radial resolution (12 segments instead of 8), shallow inward
+basal fluting and normals that account for both taper and the fluted profile.
+The grooves stay inside the original trunk envelope. Medium/far topology,
+geography, placements, collisions and gameplay rules are preserved.
+
+Opaque bark now combines its species normal with a second, finer six-repeat
+sample. Explicit gradients scale with that frequency so the added detail is
+filtered at distance. This reuses the existing local atlas, adds one texture
+fetch per bark fragment and no new textures or draw calls. Foliage excludes
+the extra sample. This is procedural surface refinement, not a replacement
+with scanned bark or authored tree assets.
+
+Measured across all healthy structural variants at seed 42:
+
+| LOD | Bark triangles before | Bark triangles after | Foliage triangles after |
+| --- | ---: | ---: | ---: |
+| Near | 40,533 | 46,081 | 44,944 |
+| Medium | 27,573 | 27,573 | 19,416 |
+| Far | 7,934 | 7,934 | 3,120 |
+
+These are template totals, not resident scene totals or GPU timings. Near bark
+adds 13.7% triangles; total near tree triangles add 6.5%. Regression tests
+exercise all archetypes in healthy/long-dead conditions at all three LODs,
+finite unit normals, index bounds, determinism and the near trunk seam.
+All 31 rendering/material tests, typecheck, production build and shader lint
+pass. The full Playwright command still fails at browser launch.
+
+Fresh visual recovery attempts: the official Chromium download timed out,
+then the installer exited with a lock-update failure. The cloud browser could
+open the repository's deployed Vercel game, but the page reported
+`BOOT FAILURE — Error creating WebGL context.` No game scene rendered there.
+Six-scene reference acceptance and hardware profiling therefore remain
+unverified. AAA parity, a rebuilt hand model, authored landmarks and a complete
+gameplay redesign are not delivered by this follow-up.
+
+The unlazy ledger retains those failed acceptance gates explicitly. Continued
+unseen shader tuning would not establish the requested visual result; the next
+required step is a functioning WebGL capture environment and side-by-side
+review before extending this art pass.
