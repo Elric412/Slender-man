@@ -227,6 +227,20 @@ export class Practicals {
     }
   }
 
+  /** Capture tooling only: clear clock and pool history before a fixed-step seek. */
+  resetForCapture(): void {
+    this.t = 0;
+    this.relightAll();
+    for (const p of this.items) { p.slot = -1; p.ramp = 0; p.fl = 1; }
+    for (const light of this.pool) light.intensity = 0;
+  }
+
+  /** Authored source position lets QA frame the actual porch, including its seeded yaw. */
+  captureAnchor(tag: string): THREE.Vector3 | null {
+    const p = this.items.find(item => item.tag === tag);
+    return p ? new THREE.Vector3(p.x, p.y, p.z) : null;
+  }
+
   /** Is any practical tagged `tag` currently within `r` metres of (x,z)? */
   litNear(x: number, z: number, r: number, tag?: string): boolean {
     const r2 = r * r;

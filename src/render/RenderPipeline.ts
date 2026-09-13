@@ -62,7 +62,7 @@ class Pass {
       vertexShader: POST_VERT,
       fragmentShader: frag,
       uniforms, defines,
-      depthTest: false, depthWrite: false,
+      depthTest: false, depthWrite: false, toneMapped: false,
     });
     this.mesh = new THREE.Mesh(Pass.geo, this.material);
     this.mesh.frustumCulled = false;
@@ -402,6 +402,10 @@ export class RenderPipeline {
   }): void {
     const nextScale = quantiseScale(Math.min(k.renderScale, this.maxScale));
     const scaleChanged = Math.abs(nextScale - this.renderScale) > 1e-4;
+    // Recovery may enable a pass without changing resolution. Its shader and
+    // target must become live together, including quarter/half-res fog changes.
+    const targetsChanged = this.enabled.ao !== (k.aoQuality > 0)
+      || this.enabled.taa !== k.taa || this.spec.volumetric !== k.volumetric;
 
     this.spec.aoQuality = k.aoQuality;
     this.spec.volumetric = k.volumetric;
@@ -441,8 +445,9 @@ export class RenderPipeline {
     this.compositePass.define('USE_FXAA', !k.taa);
     this.compositePass.u.uSharpen.value = k.sharpen;
 
-    if (scaleChanged) {
+    if (scaleChanged || targetsChanged) {
       this.renderScale = nextScale;
+      if (targetsChanged) this.w = this.h = 0;
       this.resize(this.cw, this.ch);
     }
   }
@@ -623,9 +628,9 @@ export class RenderPipeline {
       float shadowLookup(sampler2D map, mat4 mtx, vec3 wp, float bias){
         vec4 sc = mtx * vec4(wp, 1.0);
         sc.xyz /= max(sc.w, 1e-5);
-        if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z > 1.0) return 1.0;
+        if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z < 0.0 || sc.z > 1.0) return 1.0;
         float sd = unpackRGBAToDepth(texture(map, sc.xy));
-        return step(sc.z - bias, sd);
+        return step(sc.z + bias, sd);
       }
 
       void main(){
@@ -1036,7 +1041,7 @@ export class RenderPipeline {
         float s = uStatic;
 
         // ---- camcorder optics: mild barrel + tape wobble ----
-        float barrel = 0.045 + uViewfinder * 0.05;
+        float barrel = uViewfinder * 0.05;
         uv = 0.5 + cc * (1.0 + barrel * dot(cc, cc));
 
         // tape-stop roll at extreme static
@@ -1044,7 +1049,7 @@ export class RenderPipeline {
 
         // head-switching wobble: a couple of horizontal bands that shear
         float band = smoothstep(0.92, 1.0, fract(uv.y * 3.0 - uTime * 0.35));
-        uv.x += band * (0.004 + s * 0.02) * (hash12(vec2(floor(uv.y * 180.0), floor(uTime * 24.0))) - 0.5);
+        uv.x += band * (uViewfinder * 0.002 + s * s * 0.02) * (hash12(vec2(floor(uv.y * 180.0), floor(uTime * 24.0))) - 0.5);
 
         float warp = s * s * 0.010;
         uv.x += sin(uv.y * 64.0 + uTime * 13.0) * warp;
@@ -1052,7 +1057,7 @@ export class RenderPipeline {
         uv = clamp(uv, vec2(0.0005), vec2(0.9995));
 
         // ---- chromatic aberration (lateral, grows toward the edges) ----
-        float ca = 0.0008 + s * 0.0045 + uViewfinder * 0.0012;
+        float ca = s * s * 0.003 + uViewfinder * 0.0012;
         vec2 caDir = cc * ca;
         vec3 col;
         col.r = texture(tInput, uv + caDir).r;
@@ -1065,7 +1070,7 @@ export class RenderPipeline {
         vec3 nE = texture(tInput, uv + vec2(uTexel.x, 0.0)).rgb;
         vec3 nW = texture(tInput, uv - vec2(uTexel.x, 0.0)).rgb;
 
-        #ifdef USE_FXAA
+        #if USE_FXAA
         {
           float lC = luminance(col), lN = luminance(nN), lS = luminance(nS);
           float lE = luminance(nE), lW = luminance(nW);
@@ -1086,7 +1091,7 @@ export class RenderPipeline {
         // ---- depth of field: far defocus from the veil chain ----
         float rawD = texture(tDepth, uv).x;
         float lin = linearizeDepth(rawD, uClip);
-        #ifdef USE_DOF
+        #if USE_DOF
         {
           float coc = smoothstep(uDofRange.x, uDofRange.y, lin) * uDofStrength;
           coc = max(coc, (1.0 - smoothstep(0.10, 0.42, lin)) * 0.5 * uDofStrength); // macro near blur
@@ -1095,24 +1100,24 @@ export class RenderPipeline {
         #endif
 
         // ---- ambient occlusion (scene-referred, distance-faded upstream) ----
-        #ifdef USE_AO
+        #if USE_AO
           float ao = texture(tAO, uv).r;
           col *= mix(1.0, ao, uAoStrength);
         #endif
 
         // ---- volumetric in-scattering ----
-        #ifdef USE_VOL
+        #if USE_VOL
           col += texture(tVol, uv).rgb * uVolStrength;
         #endif
 
         // ---- bloom + anamorphic streak, through a procedural dirty lens ----
-        #ifdef USE_BLOOM
+        #if USE_BLOOM
         {
           float d1 = sin(uv.x * 21.0 + 1.7) * sin(uv.y * 17.0 - 0.9);
           float d2 = sin(uv.x * 47.0 - 2.3) * sin(uv.y * 39.0 + 1.1);
           float dirt = 0.78 + 0.30 * (d1 * 0.6 + d2 * 0.4);
           col += texture(tBloom, uv).rgb * uBloomStrength * dirt;
-          #ifdef USE_STREAK
+          #if USE_STREAK
             col += texture(tStreak, uv).rgb * uStreakStrength * vec3(0.72, 0.82, 1.0);
           #endif
         }
@@ -1205,11 +1210,11 @@ export class RenderPipeline {
       uTime: { value: 0 }, uFrame: { value: 0 },
       uStatic: { value: 0 }, uGlimpse: { value: 0 }, uDesat: { value: 0.25 },
       uWetness: { value: 0 }, uViewfinder: { value: 0 },
-      uSharpen: { value: 0.3 }, uBloomStrength: { value: 0.42 },
-      uStreakStrength: { value: 0.16 }, uVolStrength: { value: 1.0 },
+      uSharpen: { value: 0.3 }, uBloomStrength: { value: 0.18 },
+      uStreakStrength: { value: 0.0 }, uVolStrength: { value: 1.0 },
       uAoStrength: { value: 0.8 },
       uDofRange: { value: new THREE.Vector2(26, 90) }, uDofStrength: { value: 0.7 },
-      uVignette: { value: 0.34 }, uGrain: { value: 0.026 },
+      uVignette: { value: 0.88 }, uGrain: { value: 0.026 },
       uNoise: { value: 1 },
     }, {
       USE_BLOOM: 1, USE_AO: 1, USE_VOL: 1, USE_DOF: 1, USE_STREAK: 1,
@@ -1447,15 +1452,10 @@ export class RenderPipeline {
           Math.cos(sl.angle * (1 - sl.penumbra)));
         u.uSpotOuter.value = sl.angle;
         u.uSpotRange.value = sl.distance > 0 ? sl.distance : 60;
-        // three's intensity is candela-like; this factor puts single-scattering
-        // in the same ballpark as the surface lighting it belongs to.
-        //
-        // Rescaled with the beam rebuild: peak intensity dropped 330 -> 125 and
-        // the cone term is now a normalised profile (peak 1.0) rather than a
-        // smoothstep that saturated to 1.0 across most of the hotspot, so the
-        // old 0.00055 would have quietly cut the shaft to ~40% of its intended
-        // strength.
-        spotI = sl.intensity * 0.00145 * this.beam.intensity;
+        // Surface intensity already includes LED drive/battery. Applying beam
+        // strength twice makes the shaft disappear before the surface light.
+        spotI = sl.intensity * 0.00145;
+        u.uSpotShadowBias.value = sl.shadow.bias;
         const smap = sl.shadow.map;
         if (smap && this.spec.volumetric >= 2) {
           u.tSpotShadow.value = smap.texture;
@@ -1475,6 +1475,7 @@ export class RenderPipeline {
         (u.uMoonDir.value as THREE.Vector3).copy(this.tmpB).sub(this.tmpA).normalize();
         (u.uMoonColor.value as THREE.Color).copy(mn.color);
         u.uMoonIntensity.value = mn.intensity * 0.055;
+        u.uMoonShadowBias.value = mn.shadow.bias;
         const msmap = mn.shadow.map;
         if (msmap && this.spec.volumetric >= 2) {
           u.tMoonShadow.value = msmap.texture;
@@ -1535,7 +1536,7 @@ export class RenderPipeline {
         u.tDepth.value = this.depthTex;
         (u.uInvViewProjJit.value as THREE.Matrix4).copy(this.invViewProjJit);
         (u.uPrevViewProj.value as THREE.Matrix4).copy(this.prevViewProj);
-        u.uAmount.value = 0.6 * this.mbStrength;
+        u.uAmount.value = 0.22 * this.mbStrength;
         this.motionPass.render(r, this.motionRT);
         srcTex = this.motionRT.texture;
         passes++;
@@ -1707,3 +1708,4 @@ export class RenderPipeline {
     this.streakPass.dispose(); this.exposurePass.dispose(); this.compositePass.dispose();
   }
 }
+

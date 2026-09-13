@@ -20,6 +20,7 @@ export class EnvironmentProbe {
   private probeScene = new THREE.Scene();
   private skyClone: THREE.Mesh | null = null;
   texture: THREE.Texture | null = null;
+  private filteredRT: THREE.WebGLRenderTarget | null = null;
 
   constructor(private renderer: THREE.WebGLRenderer, resolution = 128) {
     this.pmrem = new THREE.PMREMGenerator(renderer);
@@ -46,17 +47,22 @@ export class EnvironmentProbe {
     }
     const prevTarget = this.renderer.getRenderTarget();
     this.cubeCam.update(this.renderer, this.probeScene);
-    const prev = this.texture;
-    this.texture = this.pmrem.fromCubemap(this.cubeRT.texture).texture;
+    const prev = this.filteredRT;
+    this.filteredRT = this.pmrem.fromCubemap(this.cubeRT.texture);
+    this.texture = this.filteredRT.texture;
+    // Dispose the framebuffer as well as its texture on probe refresh.
     prev?.dispose();
     this.renderer.setRenderTarget(prevTarget);
     return this.texture;
   }
 
   dispose(): void {
-    this.texture?.dispose();
+    this.filteredRT?.dispose();
+    this.filteredRT = null;
+    this.texture = null;
     this.cubeRT.dispose();
     this.pmrem.dispose();
     this.skyClone = null;
   }
 }
+

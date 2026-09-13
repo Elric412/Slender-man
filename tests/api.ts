@@ -70,6 +70,7 @@ export interface StaticApi {
   forceFear(v: number): void;
   forceDetection(v: number): void;
   entity(): EntityView | null;
+  visualCapture(name: import('../src/debug/VisualCapture').VisualScene, on?: boolean): Promise<import('../src/debug/VisualCapture').VisualCaptureResult>;
   flashlight(on: boolean): void;
   collectAll(): void;
   positions(): {

@@ -9,7 +9,7 @@ import {
 /**
  * Handheld torch: shadowed hotspot, soft reflector shoulder and wide dim spill.
  * The cookie, fog and dust share one projected radial profile. Aim follows the
- * camera with a short stable lag; switching on snaps to the current direction.
+ * current camera transform without aim filtering; hand motion stays in the viewmodel.
  */
 
 /** Cone half-angle of the spill lobe, radians. ~28°, a typical reflector. */
@@ -25,7 +25,7 @@ const OUTER_ANGLE = 0.49;
 const RANGE = 58;
 
 /** Peak intensity in candela; inverse-square falloff preserves depth cues. */
-const PEAK_INTENSITY = 155;
+const PEAK_INTENSITY = 420;
 
 /** Softening radius for the dust scattering term near the emitter. */
 const APERTURE = 0.85;
@@ -63,19 +63,13 @@ export class Flashlight {
   private strength = 0;
 
   // --- handheld dynamics ----------------------------------------------------
-  private aim = new THREE.Vector3(0, 0, -1);
   private handPos = new THREE.Vector3();
-  private swayPhase = 0;
 
   // scratch — this class allocates nothing per frame
   private dir = new THREE.Vector3();
   private srcPos = new THREE.Vector3();
-  private right = new THREE.Vector3();
-  private up = new THREE.Vector3(0, 1, 0);
   private aimOut = new THREE.Vector3(0, 0, -1);
 
-  /** Aim follow time constant, seconds. */
-  private static readonly AIM_TAU = 0.025;
   private static readonly SLAB_XZ = 7.0;
   private static readonly SLAB_Y = 3.2;
 
@@ -154,7 +148,6 @@ export class Flashlight {
     if (!this.on && this.battery <= 0.005) return;   // dead cell: click, nothing
     this.on = !this.on;
     if (this.on) {
-      this.player.camera.getWorldDirection(this.aim);
       this.flickerTarget = 1;
       this.flickerHold = 0;
     }
@@ -203,12 +196,20 @@ export class Flashlight {
   }
 
   /** Teleport / respawn hook. */
+  resetForCapture(): void {
+    this.dustRng = new SeededRandom(0xD057);
+    this.drive = this.strength = this.flickerHold = 0;
+    this.flickerTarget = 1;
+    this.warnedLow = false;
+    this.on = false;
+    this.battery = 1;
+    this.warp();
+    this.update(0, 0);
+  }
+
   warp(): void {
     this.reseedSlab();
-    // Snap the aim rather than letting it slew across the teleport, or the beam
-    // sweeps the entire world for ~150 ms after every warp.
-    this.player.camera.getWorldDirection(this.aim);
-    this.aim.normalize();
+    this.updatePose();
   }
 
   // ==========================================================================
@@ -216,8 +217,7 @@ export class Flashlight {
   // ==========================================================================
 
   update(dt: number, time: number): void {
-    // Only needed to bound the exponential; the follow itself is stable at any
-    // dt, unlike the spring it replaced.
+    // Bound particle integration during a background-tab stall.
     const step = Math.min(dt, 0.1);
 
     // ------------------------------------------------------------- battery
@@ -261,7 +261,7 @@ export class Flashlight {
     // that a dropout glows down rather than strobing a single black frame.
     const goal = this.flickerTarget * volts;
     const rate = goal > this.drive ? 26 : 18;
-    this.drive += (goal - this.drive) * Math.min(1, rate * step);
+    this.drive += (goal - this.drive) * (1 - Math.exp(-rate * step));
     if (this.drive < 0.0015) this.drive = 0;
 
     // Near-linear, unlike tungsten: an LED at 70% drive really is ~70% bright.
@@ -273,7 +273,7 @@ export class Flashlight {
     this.spill.color.copy(this.light.color).lerp(COOL_SPILL, 0.22);
 
     this.light.intensity = PEAK_INTENSITY * this.strength;
-    this.spill.intensity = 5.0 * this.strength;
+    this.spill.intensity = 9.0 * this.strength;
     this.player.setLensGlow(active ? 0.12 * this.strength : 0);
     this.light.visible = this.spill.visible = active;
 
@@ -286,43 +286,25 @@ export class Flashlight {
     this.dust.visible = active;
     this.dustMat.uniforms.uBeamStrength.value = this.strength;
 
-    if (!active) return;
+    // Keep the pose current even when switched off; debug captures, warps and
+    // volumetric consumers must never inherit an old emitter transform.
+    this.updatePose();
+    if (active) this.updateDust(step, time);
+  }
 
-    // --------------------------------------------------- handheld placement
+  private updatePose(): void {
     const cam = this.player.camera;
+    cam.updateWorldMatrix(true, false);
     cam.getWorldPosition(this.srcPos);
     cam.getWorldDirection(this.dir);
-    // Camera-local +X stays right even when looking straight up/down.
-    this.right.setFromMatrixColumn(cam.matrixWorld, 0).normalize();
-    this.up.setFromMatrixColumn(cam.matrixWorld, 1).normalize();
-
-    // Exact discrete solution of a first-order lag. Correct at any frame rate
-    // and cannot overshoot — which the previous explicit-Euler spring did,
-    // violently, past dt ≈ 44 ms.
-    const k = 1 - Math.exp(-step / Flashlight.AIM_TAU);
-    this.aim.x += (this.dir.x - this.aim.x) * k;
-    this.aim.y += (this.dir.y - this.aim.y) * k;
-    this.aim.z += (this.dir.z - this.aim.z) * k;
-    this.aim.normalize();
-
-    // Sub-degree cadence sway so the beam breathes even standing still. Scaled
-    // by the player's own bob amount: a walking hand moves more than a still
-    // one, and the two must agree or the torch reads as detached from the body.
-    this.swayPhase += step;
-    const bob = 0.35 + 0.65 * this.player.bobAmount;
-    const swayX = (Math.sin(this.swayPhase * 1.7) * 0.0065
-      + Math.sin(this.swayPhase * 5.3) * 0.0019) * bob;
-    const swayY = Math.sin(this.swayPhase * 2.3 + 1.1) * 0.0048 * bob;
-
-    // Emit from the lens, not from behind the hand where the torch body
-    // intercepts its own light. Player retracts the origin at blocking geometry.
     this.player.getFlashlightOrigin(this.handPos);
-    // Converge on a point in the centre of the view, retaining slight hand lag.
-    this.aimOut.copy(this.srcPos).addScaledVector(this.aim, 12)
-      .sub(this.handPos)
-      .addScaledVector(this.right, swayX)
-      .addScaledVector(this.up, swayY)
-      .normalize();
+
+    // Aim at the current centre of view. The lens still follows the physical
+    // hand (including crouch, sprint and wall retraction), but a second aim lag
+    // would double the viewmodel inertia and miss during fast mouse/touch turns.
+    // A fixed convergence distance keeps near-field parallax physically honest.
+    this.aimOut.copy(this.srcPos).addScaledVector(this.dir, 12)
+      .sub(this.handPos).normalize();
 
     this.light.position.copy(this.handPos);
     this.spill.position.copy(this.handPos);
@@ -336,7 +318,6 @@ export class Flashlight {
     this.target.updateMatrixWorld(true);
     this.spill.updateMatrixWorld(true);
 
-    this.updateDust(step, time);
   }
 
   // ==========================================================================

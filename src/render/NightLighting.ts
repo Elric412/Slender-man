@@ -258,7 +258,9 @@ export class NightLighting {
   get current(): NightLevels { return this.levels; }
 }
 
-const WARM_FILL = new THREE.Color(0x4a3a2c);
-const WARM_BOUNCE = new THREE.Color(0x2a1c10);
+// Warmth changes hue without dimming the sky fill beside a practical.
+const WARM_FILL = new THREE.Color(0xddbf97);
+const WARM_BOUNCE = new THREE.Color(0x80705c);
 
 function clamp01(v: number): number { return v < 0 ? 0 : v > 1 ? 1 : v; }
+

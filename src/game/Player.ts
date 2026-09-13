@@ -371,6 +371,11 @@ export class Player {
     this.camera.getWorldDirection(this.fwd);
   }
 
+  resetViewmodelForCapture(): void {
+    this.arm.position.set(0.24 * Math.min(1, this.camera.aspect / 0.9), -0.22, -0.35);
+    this.arm.rotation.set(0, 0, 0);
+  }
+
   get forward(): THREE.Vector3 { return this.fwd; }
   get eyeY(): number { return this.pos.y + this.eyeHeight; }
 }
