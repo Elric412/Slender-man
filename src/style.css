@@ -370,7 +370,7 @@ body.cb .map-status { color: #8fdcea; }
   position: absolute; left: 50%; top: 50%; width: 48px; height: 48px; border-radius: 50%;
   background: rgba(154,165,173,0.35); transform: translate(-50%,-50%);
 }
-.touch-buttons { position: absolute; right: calc(14px + env(safe-area-inset-right)); bottom: calc(40px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(2, 64px); gap: 12px; pointer-events: auto; }
+.touch-buttons { position: absolute; right: calc(10px + env(safe-area-inset-right)); bottom: calc(20px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(2, 52px); gap: 8px; pointer-events: auto; }
 /* Sized for the four-letter TEXT labels the buttons now carry (LAMP/TAKE/CRCH/
    RUN/VIEW/MAP), not for the emoji glyphs they used to. 22px was chosen when a
    single pictogram had to fill the disc; four mono characters at 22px overflow a
@@ -381,8 +381,8 @@ body.cb .map-status { color: #8fdcea; }
    must never out-brighten the flashlight. `:active`/`.active` are the only
    states that reach for the amber accent. */
 .tbtn {
-  width: 64px; height: 64px; border-radius: 50%; border: 1px solid rgba(154,165,173,0.35);
-  background: rgba(10,13,16,0.45); color: var(--ink); font-family: var(--mono);
+  width: 52px; height: 52px; border-radius: 50%; border: 1px solid rgba(154,165,173,0.25);
+  background: rgba(10,13,16,0.24); color: var(--ink); font-family: var(--mono);
   font-size: 11px; letter-spacing: 0.06em; line-height: 1;
   text-shadow: 0 0 4px rgba(0,0,0,0.9);
   pointer-events: auto; user-select: none;

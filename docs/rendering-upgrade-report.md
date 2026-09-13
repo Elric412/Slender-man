@@ -158,3 +158,84 @@ next art-production phase on close-range bark, fern silhouettes, deadwood,
 wet trail relief and the hand/flashlight viewmodel. These are the largest
 remaining differences from the supplied gameplay references. The full AAA
 definition of done has not yet been met.
+
+## September 13 follow-up: actual terrain and scatter integration
+
+The supplied portrait gameplay screenshot exposed oversized foliage and litter,
+flat-looking terrain and excessive touch-control coverage. This pass preserves
+the map, landmark locations, lighting hierarchy and core gameplay rules.
+
+- Fixed `MapGenerator` cloning the ground with plain `Material.clone()`, which
+  discards `onBeforeCompile`. The actual terrain now retains the material
+  library's wetness, stochastic sampling, detail-normal and macro patches.
+- Changed the dense scatter fern factory (not just the secondary vegetation
+  layer) from upright crossed planes into five radial, arching fronds with
+  analytical normals. Fern dimensions are smaller and grounded. These still
+  use the local procedural atlas; they are not authored botanical models.
+- Reduced conifer needle panel size to 62% and reduced the oversized ground
+  litter cards to 18–40 cm wide, 2.5–7 cm tall.
+- Reduced portrait touch buttons to 52 CSS pixels with smaller spacing and
+  less opaque backgrounds, keeping all actions and the landscape layout.
+- Added real terrain-construction and scatter-geometry regression tests.
+
+Technical-art tradeoff: a scatter fern grows from 36 to 90 triangles; batching,
+atlas reuse and residency budgets remain unchanged. No new textures, external
+assets or draw passes are introduced. Restoring terrain shader patches increases
+the actual terrain sampling cost; GPU timing remains unmeasured.
+
+Validation: typecheck, map/render contracts, all 29 renderer/material tests,
+shader lint (47 templates, including 23 GLSL3 templates) and production build
+pass. Browser validation remains blocked by the missing Chromium executable;
+there are no verified after screenshots or measured GPU timings. Do not treat
+this pass as AAA acceptance or a completed gameplay redesign.
+
+Skill reference ledger: implementation blueprint, model recipes, render recipes,
+technical art, shader cookbook, procedural-model and performance-safe-detail
+checklists read. Their geometry-first guidance drove this scoped integration
+pass. Support-surface sourcing remains procedural/local; no hero asset is
+claimed upgraded by this pass. Next: validate mobile captures, then rebuild
+close-range bark/branch junctions and the hand model with production art.
+
+## Tree form and bark follow-up
+
+Reference direction: broad, irregular trunk silhouettes and layered surface
+relief should carry the image before any stronger post-processing. This pass
+adds near-tree radial resolution (12 segments instead of 8), shallow inward
+basal fluting and normals that account for both taper and the fluted profile.
+The grooves stay inside the original trunk envelope. Medium/far topology,
+geography, placements, collisions and gameplay rules are preserved.
+
+Opaque bark now combines its species normal with a second, finer six-repeat
+sample. Explicit gradients scale with that frequency so the added detail is
+filtered at distance. This reuses the existing local atlas, adds one texture
+fetch per bark fragment and no new textures or draw calls. Foliage excludes
+the extra sample. This is procedural surface refinement, not a replacement
+with scanned bark or authored tree assets.
+
+Measured across all healthy structural variants at seed 42:
+
+| LOD | Bark triangles before | Bark triangles after | Foliage triangles after |
+| --- | ---: | ---: | ---: |
+| Near | 40,533 | 46,081 | 44,944 |
+| Medium | 27,573 | 27,573 | 19,416 |
+| Far | 7,934 | 7,934 | 3,120 |
+
+These are template totals, not resident scene totals or GPU timings. Near bark
+adds 13.7% triangles; total near tree triangles add 6.5%. Regression tests
+exercise all archetypes in healthy/long-dead conditions at all three LODs,
+finite unit normals, index bounds, determinism and the near trunk seam.
+All 31 rendering/material tests, typecheck, production build and shader lint
+pass. The full Playwright command still fails at browser launch.
+
+Fresh visual recovery attempts: the official Chromium download timed out,
+then the installer exited with a lock-update failure. The cloud browser could
+open the repository's deployed Vercel game, but the page reported
+`BOOT FAILURE — Error creating WebGL context.` No game scene rendered there.
+Six-scene reference acceptance and hardware profiling therefore remain
+unverified. AAA parity, a rebuilt hand model, authored landmarks and a complete
+gameplay redesign are not delivered by this follow-up.
+
+The unlazy ledger retains those failed acceptance gates explicitly. Continued
+unseen shader tuning would not establish the requested visual result; the next
+required step is a functioning WebGL capture environment and side-by-side
+review before extending this art pass.

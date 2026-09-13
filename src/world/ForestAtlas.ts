@@ -1036,8 +1036,8 @@ const vec4 ATLAS_RECTS[${rects.length}] = vec4[${rects.length}](
 vec2 atlasDx, atlasDy;
 vec4 atlasRect;
 
-vec4 atlasSample(sampler2D tex) {
-  vec2 f = fract(vAtlasUv);
+vec4 atlasSampleFrequency(sampler2D tex, float frequency) {
+  vec2 f = fract(vAtlasUv * frequency);
   // Inset by half a texel of the content area: a bilinear tap can then never
   // cross into the gutter, let alone the next cell.
   vec2 inset = vec2(uAtlasTexel * 0.5) / max(atlasRect.zw, vec2(1e-5));
@@ -1045,7 +1045,10 @@ vec4 atlasSample(sampler2D tex) {
   vec2 uvA = atlasRect.xy + f * atlasRect.zw;
   // Gradients must be scaled into atlas space too, or the mip chain is picked
   // for the wrong footprint (too sharp, and distant trunks alias badly).
-  return texture2DGradEXT(tex, uvA, atlasDx * atlasRect.zw, atlasDy * atlasRect.zw);
+  return texture2DGradEXT(tex, uvA, atlasDx * atlasRect.zw * frequency, atlasDy * atlasRect.zw * frequency);
+}
+vec4 atlasSample(sampler2D tex) {
+  return atlasSampleFrequency(tex, 1.0);
 }
 ` + shader.fragmentShader
       // Establish the shared per-fragment state before any map is read. Sits at
@@ -1075,6 +1078,10 @@ vec4 atlasSample(sampler2D tex) {
         '#include <normal_fragment_maps>',
         `{
           vec3 mapN = atlasSample(normalMap).xyz * 2.0 - 1.0;
+          ${foliage ? '' : `// Reuse this bark species at a second physical scale. Explicit
+          // gradients filter the fine fissures at distance instead of sparkling.
+          vec3 barkGrain = atlasSampleFrequency(normalMap, 6.0).xyz * 2.0 - 1.0;
+          mapN.xy += barkGrain.xy * 0.24;`}
           mapN.xy *= normalScale;
           normal = normalize(tbn * mapN);
         }`,

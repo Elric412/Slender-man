@@ -909,9 +909,10 @@ export class ScatterSystem {
    * flashlight. Three spans of curvature is enough to catch a gradient across
    * the leaf and kill both tells.
    */
-  private cardGeo(tile: number, w: number, h: number, bow: number): RawGeo {
+  private cardGeo(tile: number, w: number, h: number, bow: number, rosette = false): RawGeo {
     const cols = 3, rows = 3;
-    const verts = (cols + 1) * (rows + 1) * 2;
+    const planes = rosette ? 5 : 2;
+    const verts = (cols + 1) * (rows + 1) * planes;
     const position = new Float32Array(verts * 3);
     const normal = new Float32Array(verts * 3);
     const uv = new Float32Array(verts * 2);
@@ -920,8 +921,9 @@ export class ScatterSystem {
     const tris: number[] = [];
 
     let v = 0;
-    for (let plane = 0; plane < 2; plane++) {
-      const ca = plane === 0 ? 1 : 0, sa = plane === 0 ? 0 : 1;
+    for (let plane = 0; plane < planes; plane++) {
+      const angle = rosette ? plane * 2.39996 : plane * Math.PI / 2;
+      const ca = Math.cos(angle), sa = Math.sin(angle);
       const start = v;
       for (let r = 0; r <= rows; r++) {
         const fy = r / rows;
@@ -938,6 +940,21 @@ export class ScatterSystem {
           normal[v * 3] = sa * 0.5;
           normal[v * 3 + 1] = 0.8;
           normal[v * 3 + 2] = ca * 0.5;
+          if (rosette) {
+            // Fronds rise from a common crown and arch outward. A fern is
+            // a radial plant, not a pair of human-height vertical posters.
+            const reach = fy * w * (0.46 + plane * 0.025);
+            const lateral = fx * w * 0.32 * (0.5 + 0.5 * Math.sin(fy * Math.PI));
+            position[v * 3] = ca * reach - sa * lateral;
+            position[v * 3 + 1] = Math.sin(fy * Math.PI * 0.8) * h;
+            position[v * 3 + 2] = sa * reach + ca * lateral;
+            const slope = Math.cos(fy * Math.PI * 0.8) * h * Math.PI * 0.8;
+            const radial = w * (0.46 + plane * 0.025);
+            const nl = Math.hypot(slope, radial);
+            normal[v * 3] = -ca * slope / nl;
+            normal[v * 3 + 1] = radial / nl;
+            normal[v * 3 + 2] = -sa * slope / nl;
+          }
           uv[v * 2] = fx + 0.5;
           uv[v * 2 + 1] = fy;
           // Darken toward the root — cheap contact occlusion, and it stops
@@ -1185,18 +1202,18 @@ export class ScatterSystem {
           tile = TILE.fern; w = 0.5; h = 1.15 + crng.next() * 0.7; bow = 0.28;
           family = 'reed';
         } else if (roll < reed + fern) {
-          tile = TILE.fern; w = 1.15 + crng.next() * 0.6; h = 0.5 + crng.next() * 0.45; bow = 0.18;
+          tile = TILE.fern; w = 0.65 + crng.next() * 0.45; h = 0.28 + crng.next() * 0.25; bow = 0.18;
           family = 'fern';
         } else {
           const dry = crng.next() < 0.45;
           tile = dry ? TILE.leafDry : TILE.leafBroad;
-          w = 0.75 + crng.next() * 0.55; h = 0.22 + crng.next() * 0.28; bow = 0.1;
+          w = 0.18 + crng.next() * 0.22; h = 0.025 + crng.next() * 0.045; bow = 0.025;
           family = dry ? 'leafDry' : 'leafBroad';
         }
 
         const tint = 0.78 + crng.next() * 0.34;
         out.push({
-          geo: this.cardGeo(tile, w, h, bow),
+          geo: this.cardGeo(tile, w, h, bow, family === 'fern'),
           x, y: this.hf.heightAt(x, z) - 0.04, z,
           yaw: crng.next() * Math.PI * 2,
           leanX: crng.range(-0.22, 0.22),

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { HeightField, Zone } from './HeightField';
-import { MaterialLibrary } from './MaterialLibrary';
+import { MaterialLibrary, cloneMaterial } from './MaterialLibrary';
 import { CollisionWorld } from '../physics/Collision';
 import { VegetationSystem, mergeGeos, patchWindMaterial } from './VegetationSystem';
 import { ScatterSystem } from './ScatterSystem';
@@ -170,7 +170,7 @@ export class MapGenerator {
     }
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
-    const mat = this.mats.ground.clone();
+    const mat = cloneMaterial(this.mats.ground);
     mat.vertexColors = true;
     const mesh = new THREE.Mesh(geo, mat);
     mesh.receiveShadow = true;
