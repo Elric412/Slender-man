@@ -69,6 +69,10 @@ preview also encounters restricted network-interface enumeration (explicit
 shader validation or reference-match score have been obtained. Visual acceptance
 is **pending**, not passed.
 
+GitHub visual QA run `34747073014` also failed before exposing any job steps.
+The job-log endpoint returned `BlobNotFound`; no diagnostic cause was supplied.
+This CI attempt is not a test pass and cannot establish runtime correctness.
+
 No new runtime dependencies, external assets, geometry or render passes were
 added. Material fixes add approximately four texture reads to the affected
 ground path and four sine evaluations to wet fragments. PMREM replacement now
