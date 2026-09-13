@@ -1,5 +1,34 @@
 # Horror rendering upgrade — implementation checkpoint
 
+## Third pass: first-person response and explicit acceptance gates
+
+Added `ViewmodelMotion`: bounded angular-velocity-based hand inertia with
+exponential smoothing. Equal camera turn rates now produce equal hand response
+at 30, 60 and 144 Hz; tests compare the numerical results. Camera aiming itself
+remains immediate. Sprinting lowers the model instead of lifting it into view.
+Breathing/tremor use accumulated animation time, so pausing does not advance
+them, and restart clears sway, bob, lean, sprint/FOV and flinch history.
+
+Gameplay brief: explore Pinewood, collect evidence and escape while managing
+visibility and pursuit. The intended feeling is vulnerable control. This pass
+improves visual response to looking/sprinting; it does not change movement
+physics, resource rules, encounters, landmarks, rewards or failure conditions.
+The existing junction/landmark decisions and escalation remain the level plan.
+Desktop/mobile input mappings are unchanged. No runtime allocation or dependency
+was added by the motion update.
+
+Reference ledger: gameplay-workflows.md, game-feel.md and
+checklists/game-feel.md read. The checklist is not certified: numerical response
+and time ownership are covered, but perceived readability and input-to-photon
+latency require browser execution. Arcade hitstop/pop effects are not added to
+this restrained horror presentation.
+
+`GATES.md` records acceptance using the requested unlazy workflow. Rendering
+regressions (27), typecheck and production build/shader lint pass. Spatial/core
+rule preservation passes source review. Browser execution still fails at missing
+Chromium. Reference parity and device frame-time gates remain unmet handoffs.
+This is continued implementation, not an AAA-completion certificate.
+
 ## Second pass: lighting, then models
 
 Added a single cached 512px point-light cube shadow for the first practical

@@ -25,11 +25,33 @@ await build({ stdin: { contents: `
   export { surfaceUniforms } from './world/MaterialLibrary';
   export { makeFernGeometry } from './world/FernGeometry';
   export { Practicals } from './world/Practicals';
+  export { ViewmodelMotion } from './game/ViewmodelMotion';
 `, resolveDir: new URL('../src', import.meta.url).pathname, loader: 'ts' }, bundle: true,
   platform: 'node', format: 'esm', outfile: '.tmp/render-flashlight.mjs', external: ['three'] });
 const { StaticGame } = await import('../.tmp/render-game.mjs');
 const { Flashlight, Player, beamProfile, NightLighting, ForestAtlas, surfaceUniforms } =
   await import('../.tmp/render-flashlight.mjs');
+
+test('hand response agrees across frame rates, caps spikes and resets animation time', async () => {
+  const { ViewmodelMotion } = await import('../.tmp/render-flashlight.mjs');
+  const results = [30, 60, 144].map(hz => {
+    const motion = new ViewmodelMotion();
+    for (let i = 0; i < hz; i++) motion.update(1 / hz, 1.2 / hz, -0.6 / hz, true);
+    return motion;
+  });
+  const referenceX = results[0].x, referenceLower = results[0].lower;
+  for (const m of results) {
+    assert.ok(Math.abs(m.x - referenceX) < 1e-10);
+    assert.ok(Math.abs(m.lower - referenceLower) < 1e-10);
+    assert.ok(Math.abs(m.time - 1) < 1e-10);
+    m.update(0, 100, 100, true);
+    assert.ok(Number.isFinite(m.x));
+    m.update(1 / 60, 100, -100, false);
+    assert.ok(Math.abs(m.x) <= 0.35 && Math.abs(m.y) <= 0.35);
+    m.reset();
+    assert.deepEqual([m.x, m.y, m.lower, m.time], [0, 0, 0, 0]);
+  }
+});
 
 test('moon shadow centre is snapped in light space including terrain height', () => {
   const night = new NightLighting();
