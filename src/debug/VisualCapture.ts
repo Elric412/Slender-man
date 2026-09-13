@@ -73,6 +73,7 @@ export class VisualCapture {
     const wetness = name === 'wet-rocks' ? 0.85 : 0.32;
     const spec = { ...QUALITY_SPECS[o.tier] };
     pipeline.setQuality(spec);
+    map.practicals.setShadowQuality(o.tier);
     pipeline.setPerceptibility(1, 1, 1);
     flashlight.setShadowSize(spec.shadowMapSize);
     const shot = this.view(name);

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { SeededRandom } from '../core/SeededRandom';
 import { MaterialLibrary, applyShaderPatch, registerShaderPatch, cloneMaterial } from './MaterialLibrary';
 import { HeightField } from './HeightField';
+import { makeFernGeometry } from './FernGeometry';
 
 /**
  * Procedural forest: modular trunk/branch/foliage assemblies — several genuinely different
@@ -407,12 +408,13 @@ export class VegetationSystem {
     // distance culling; per-chunk meshes restore both.
     const chunk = 70, nChunks = Math.ceil(size / chunk);
 
-    // crossed-quad fern card
-    const card = new THREE.PlaneGeometry(1.4, 1.0);
-    card.translate(0, 0.45, 0);
-    const card2 = card.clone().rotateY(Math.PI / 2);
-    const fernGeo = mergeGeos([card, card2]);
-    const fernMat = cloneMaterial(this.mats.foliageDead);
+    const fernGeo = makeFernGeometry();
+    const fernMat = cloneMaterial(this.mats.foliage);
+    fernMat.map = null;
+    fernMat.alphaMap = null;
+    fernMat.alphaTest = 0;
+    fernMat.side = THREE.DoubleSide;
+    fernMat.roughness = 0.76;
     patchWindMaterial(fernMat, 0.4);
 
     // dead grass tufts — thin vertical quads for ground texture at close range
@@ -424,12 +426,16 @@ export class VegetationSystem {
     patchWindMaterial(tuftMat, 0.3);
 
     // rocks — instanced icosahedra with noise displacement baked per-arch
-    const rockGeo = new THREE.IcosahedronGeometry(1, 1);
+    const rockGeo = new THREE.IcosahedronGeometry(1, 2);
     const posAttr = rockGeo.getAttribute('position') as THREE.BufferAttribute;
     for (let i = 0; i < posAttr.count; i++) {
       const vx = posAttr.getX(i), vy = posAttr.getY(i), vz = posAttr.getZ(i);
       const n = r.noise2(vx * 2 + 9, vz * 2 + vy) * 0.25;
-      posAttr.setXYZ(i, vx * (1 + n), vy * (1 + n * 0.6), vz * (1 + n));
+      // Coherent strata fracture the silhouette; positions shared by adjacent
+      // faces receive identical offsets, so the mesh stays watertight.
+      const strata = Math.sin(vy * 13 + vx * 2.4) * 0.045;
+      posAttr.setXYZ(i, vx * (1 + n + strata),
+        Math.max(-0.7, vy * (0.8 + n * 0.6)), vz * (1 + n - strata));
     }
     rockGeo.computeVertexNormals();
 

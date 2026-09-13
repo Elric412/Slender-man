@@ -852,6 +852,7 @@ class StaticGame {
     if (this.pipeline && spec.tier !== this.spec.tier) {
       this.spec = spec;
       this.pipeline.setQuality(spec);
+      this.map?.practicals.setShadowQuality(tier);
       this.applyShadowQuality();
       this.flashlight.setDustBudget(spec.dustCount);
       this.handleResize();

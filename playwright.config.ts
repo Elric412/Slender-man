@@ -65,7 +65,7 @@ export default defineConfig({
   retries: 0,
   reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
   use: {
-    baseURL: 'http://localhost:4173',
+    baseURL: 'http://127.0.0.1:4173',
     launchOptions: {
       // Must be passed through launchOptions.env: Playwright spawns the browser
       // from a worker process, so mutating process.env in this config file is
@@ -108,8 +108,8 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   webServer: {
-    command: 'npm run preview',
-    url: 'http://localhost:4173',
+    command: 'npm run preview -- --host 127.0.0.1',
+    url: 'http://127.0.0.1:4173',
     reuseExistingServer: true,
     timeout: 60_000,
   },

@@ -107,7 +107,14 @@ export class Practicals {
     this.glowTex = makeGlowTexture();
     for (let i = 0; i < poolSize; i++) {
       const l = new THREE.PointLight(0xffffff, 0, 10, 2);
-      l.castShadow = false;   // practicals never cast: the moon is the shadow key
+      // One cached cube shadow on desktop budgets. Six cube faces are costly,
+      // so low/medium pools retain their existing unshadowed fallback.
+      l.castShadow = i === 0 && poolSize >= 6;
+      l.shadow.mapSize.setScalar(512);
+      l.shadow.camera.near = 0.12;
+      l.shadow.bias = -0.00015;
+      l.shadow.normalBias = 0.025;
+      l.shadow.autoUpdate = false;
       this.group.add(l);
       this.pool.push(l);
     }
@@ -368,6 +375,12 @@ export class Practicals {
     for (const p of this.items) {
       if (p.slot < 0 || p.ramp <= 0) continue;
       const l = this.pool[p.slot];
+      const moved = l.position.x !== p.x || l.position.y !== p.y || l.position.z !== p.z;
+      if (l.castShadow) {
+        l.shadow.needsUpdate = moved || !l.shadow.map || Math.floor(this.t * 12) !== Math.floor((this.t - dt) * 12);
+        l.shadow.camera.far = p.range;
+        l.shadow.camera.updateProjectionMatrix();
+      }
       l.position.set(p.x, p.y, p.z);
       l.color.setHex(p.color);
       l.distance = p.range;
@@ -378,9 +391,22 @@ export class Practicals {
   }
 
   get count(): number { return this.items.length; }
+  setShadowQuality(tier: string): void {
+    const enabled = tier === 'high' || tier === 'ultra';
+    const light = this.pool[0];
+    if (!light || light.castShadow === enabled) return;
+    light.castShadow = enabled;
+    light.shadow.needsUpdate = enabled;
+    if (!enabled) {
+      light.shadow.dispose();
+      light.shadow.map = null;
+    }
+  }
+
   get poolSize(): number { return this.pool.length; }
 
   dispose(): void {
+    for (const light of this.pool) light.shadow.dispose();
     this.bulbGeo.dispose();
     this.cardGeo.dispose();
     this.glowTex.dispose();

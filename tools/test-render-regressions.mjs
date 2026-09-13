@@ -23,11 +23,63 @@ await build({ stdin: { contents: `
   export { NightLighting } from './render/NightLighting';
   export { ForestAtlas } from './world/ForestAtlas';
   export { surfaceUniforms } from './world/MaterialLibrary';
+  export { makeFernGeometry } from './world/FernGeometry';
+  export { Practicals } from './world/Practicals';
 `, resolveDir: new URL('../src', import.meta.url).pathname, loader: 'ts' }, bundle: true,
   platform: 'node', format: 'esm', outfile: '.tmp/render-flashlight.mjs', external: ['three'] });
 const { StaticGame } = await import('../.tmp/render-game.mjs');
 const { Flashlight, Player, beamProfile, NightLighting, ForestAtlas, surfaceUniforms } =
   await import('../.tmp/render-flashlight.mjs');
+
+test('moon shadow centre is snapped in light space including terrain height', () => {
+  const night = new NightLighting();
+  const dir = new THREE.Vector3(0.35, 0.62, -0.55).normalize();
+  night.setMoonDirection(dir);
+  night.moon.shadow.mapSize.setScalar(2048);
+  const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), dir).normalize();
+  const up = new THREE.Vector3().crossVectors(dir, right).normalize();
+  const texel = 104 / 2048;
+  for (const y of [-12.4, 0, 17.9]) {
+    night.followPlayer(12.314, y, -9.217, 52);
+    for (const axis of [right, up]) {
+      const cell = night.moonTarget.position.dot(axis) / texel;
+      assert.ok(Math.abs(cell - Math.round(cell)) < 1e-9);
+    }
+    assert.ok(Math.abs(night.moon.position.distanceTo(night.moonTarget.position) - 150) < 1e-9);
+  }
+});
+
+test('fern geometry has finite folded leaves within the shared instance budget', async () => {
+  const { makeFernGeometry } = await import('../.tmp/render-flashlight.mjs');
+  const geo = makeFernGeometry();
+  const p = geo.getAttribute('position'), n = geo.getAttribute('normal');
+  assert.equal(p.count / 3, 96);
+  assert.ok([...p.array, ...n.array].every(Number.isFinite));
+  assert.ok(geo.boundingSphere.radius < 1);
+  for (let i = 0; i < n.count; i++) assert.ok(Math.abs(Math.hypot(n.getX(i), n.getY(i), n.getZ(i)) - 1) < 1e-5);
+  geo.dispose();
+});
+
+test('practical shadow budget refreshes on relocation and releases maps on low quality', async () => {
+  const { Practicals } = await import('../.tmp/render-flashlight.mjs');
+  const practicals = new Practicals(6);
+  const lights = practicals.group.children.filter(o => o.isPointLight);
+  assert.equal(lights.filter(l => l.castShadow).length, 1);
+  practicals.add({ x: 2, y: 2, z: 0, color: 0xffbb66, intensity: 20, range: 12 });
+  practicals.update(1 / 60, new THREE.Vector3(), new THREE.Quaternion());
+  assert.equal(lights[0].shadow.needsUpdate, true);
+  assert.equal(lights[0].shadow.camera.far, 12);
+  let released = false;
+  lights[0].shadow.map = { dispose: () => { released = true; } };
+  practicals.setShadowQuality('low');
+  assert.equal(released, true);
+  assert.equal(lights[0].shadow.map, null);
+  assert.equal(lights[0].castShadow, false);
+  practicals.setShadowQuality('high');
+  assert.equal(lights[0].castShadow, true);
+  assert.equal(lights[0].shadow.needsUpdate, true);
+  practicals.dispose();
+});
 
 test('weather initialization tolerates a map whose detail layer is not ready', () => {
   const received = [];

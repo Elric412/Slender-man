@@ -235,12 +235,21 @@ export class NightLighting {
    */
   followPlayer(px: number, py: number, pz: number, extent: number): { sx: number; sz: number } {
     const texel = (extent * 2) / Math.max(1, this.moon.shadow.mapSize.x);
-    const sx = Math.round(px / texel) * texel;
-    const sz = Math.round(pz / texel) * texel;
-    this.moonTarget.position.set(sx, py, sz);
+    // Snap in the light's image plane. World X/Z snapping still crawls on
+    // slopes because elevation projects onto both shadow-map axes.
+    this.shadowRight.crossVectors(this.up, this.dir).normalize();
+    if (this.shadowRight.lengthSq() < 0.01) this.shadowRight.set(1, 0, 0);
+    this.shadowUp.crossVectors(this.dir, this.shadowRight).normalize();
+    this.shadowPoint.set(px, py, pz);
+    const u = this.shadowPoint.dot(this.shadowRight);
+    const v = this.shadowPoint.dot(this.shadowUp);
+    this.shadowPoint.addScaledVector(this.shadowRight, Math.round(u / texel) * texel - u);
+    this.shadowPoint.addScaledVector(this.shadowUp, Math.round(v / texel) * texel - v);
+    const { x: sx, y: sy, z: sz } = this.shadowPoint;
+    this.moonTarget.position.copy(this.shadowPoint);
     this.moon.position.set(
       sx + this.dir.x * 150,
-      py + this.dir.y * 150,
+      sy + this.dir.y * 150,
       sz + this.dir.z * 150,
     );
     this.moonTarget.updateMatrixWorld();
@@ -251,6 +260,10 @@ export class NightLighting {
   }
 
   private dir = new THREE.Vector3(0.35, 0.62, -0.55).normalize();
+  private up = new THREE.Vector3(0, 1, 0);
+  private shadowRight = new THREE.Vector3();
+  private shadowUp = new THREE.Vector3();
+  private shadowPoint = new THREE.Vector3();
 
   /** Keep the key aligned with wherever the sky shader put the moon disc. */
   setMoonDirection(v: THREE.Vector3): void { this.dir.copy(v).normalize(); }
@@ -263,4 +276,3 @@ const WARM_FILL = new THREE.Color(0xddbf97);
 const WARM_BOUNCE = new THREE.Color(0x80705c);
 
 function clamp01(v: number): number { return v < 0 ? 0 : v > 1 ? 1 : v; }
-
