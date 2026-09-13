@@ -1,5 +1,64 @@
 # Horror rendering upgrade — implementation checkpoint
 
+## Third pass: first-person response and explicit acceptance gates
+
+Added `ViewmodelMotion`: bounded angular-velocity-based hand inertia with
+exponential smoothing. Equal camera turn rates now produce equal hand response
+at 30, 60 and 144 Hz; tests compare the numerical results. Camera aiming itself
+remains immediate. Sprinting lowers the model instead of lifting it into view.
+Breathing/tremor use accumulated animation time, so pausing does not advance
+them, and restart clears sway, bob, lean, sprint/FOV and flinch history.
+
+Gameplay brief: explore Pinewood, collect evidence and escape while managing
+visibility and pursuit. The intended feeling is vulnerable control. This pass
+improves visual response to looking/sprinting; it does not change movement
+physics, resource rules, encounters, landmarks, rewards or failure conditions.
+The existing junction/landmark decisions and escalation remain the level plan.
+Desktop/mobile input mappings are unchanged. No runtime allocation or dependency
+was added by the motion update.
+
+Reference ledger: gameplay-workflows.md, game-feel.md and
+checklists/game-feel.md read. The checklist is not certified: numerical response
+and time ownership are covered, but perceived readability and input-to-photon
+latency require browser execution. Arcade hitstop/pop effects are not added to
+this restrained horror presentation.
+
+`GATES.md` records acceptance using the requested unlazy workflow. Rendering
+regressions (27), typecheck and production build/shader lint pass. Spatial/core
+rule preservation passes source review. Browser execution still fails at missing
+Chromium. Reference parity and device frame-time gates remain unmet handoffs.
+This is continued implementation, not an AAA-completion certificate.
+
+## Second pass: lighting, then models
+
+Added a single cached 512px point-light cube shadow for the first practical
+pool slot on High/Ultra. This enables local prop/wall occlusion for that light,
+with immediate refresh on reassignment and a 12 Hz refresh for moving casters.
+Other practical slots remain unshadowed. Low/Medium disable this shadow and
+release its target. This is bounded direct-light shadowing, not global illumination.
+The cube renders six faces when refreshed; real GPU cost is not yet measured.
+
+Moon shadow stabilization now snaps in light space, including terrain elevation,
+instead of snapping world X/Z. This removes a source of projected shadow crawl.
+The change is covered by a numerical light-space regression test.
+
+Replaced crossed fern cards with four curved fronds and folded geometric
+leaflets (96 triangles per instance). Existing chunk culling/instancing remain.
+Ground rocks use a higher subdivision level, coherent strata and a flattened
+base. These are targeted model improvements, not a complete asset rebuild.
+The additional fern geometry costs 92 triangles per visible instance versus
+the previous cards; alpha-card overdraw is removed for these ferns.
+
+Latest checks: typecheck, build, shader lint and 26 regression tests pass.
+The full Playwright command now starts its preview server using explicit
+loopback hosting, but stops at browser launch because Chromium is missing
+(one launch failure, 55 tests not run). No new screenshot comparison is available.
+Latest app bundle: 569.02 kB, 184.49 kB gzip.
+
+Additional files: `src/world/FernGeometry.ts`, `src/world/VegetationSystem.ts`,
+`playwright.config.ts`; updates also touch night lighting, practicals, quality
+switching, the capture harness and rendering tests. The supplied map is unchanged.
+
 ## Findings and changes
 
 The composite used `#ifdef` for numeric feature flags. A flag defined as zero

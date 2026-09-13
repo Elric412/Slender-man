@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { ViewmodelMotion } from './ViewmodelMotion';
 import { CollisionWorld } from '../physics/Collision';
 import { HeightField } from '../world/HeightField';
 import { InputFrame } from '../core/Input';
@@ -39,7 +40,7 @@ export class Player {
   private arm!: THREE.Group;
   private flashlightMesh!: THREE.Group;
   private batteryGauge!: THREE.Mesh;
-  private vmLag = new THREE.Vector2();
+  private viewMotion = new ViewmodelMotion();
   private tremor = 0;
   private flinchT = 0;
   private vmSprint = 0;
@@ -189,6 +190,10 @@ export class Player {
   }
 
   reset(x: number, z: number): void {
+    this.viewMotion.reset();
+    this.bobPhase = this.bobAmount = this.speed2D = this.fovBoost = this.flinchT = 0;
+    this.lean = this.leanTarget = this.vmSprint = 0;
+    this.sprinting = this.moving = false;
     this.pos.set(x, this.hf.heightAt(x, z), z);
     this.vel.set(0, 0, 0);
     this.yaw = Math.atan2(-(0 - x), -(0 - z)); // face map center-ish
@@ -296,9 +301,6 @@ export class Player {
     // fov boost on sprint
     this.fovBoost += ((this.sprinting ? 5 : 0) - this.fovBoost) * Math.min(1, dt * 4);
 
-    // viewmodel lag from look input
-    this.vmLag.x += (inp.lookDX * 6 - this.vmLag.x) * Math.min(1, dt * 9);
-    this.vmLag.y += (inp.lookDY * 6 - this.vmLag.y) * Math.min(1, dt * 9);
     this.tremor = fear;
     this.flinchT = Math.max(0, this.flinchT - dt * 3);
 
@@ -328,7 +330,8 @@ export class Player {
 
   private fwd = new THREE.Vector3();
   private applyCamera(dt: number, fear: number, inp: InputFrame): void {
-    const t = performance.now() / 1000;
+    this.viewMotion.update(dt, inp.lookDX, inp.lookDY, this.sprinting);
+    const t = this.viewMotion.time;
     // breathing sway
     const breathe = Math.sin(t * (1.4 + fear * 1.6)) * (0.006 + fear * 0.02);
     // head bob
@@ -357,13 +360,12 @@ export class Player {
 
     // viewmodel: lag + sway + tremor + lower on sprint
     const vm = this.arm;
-    const sprintLower = this.sprinting ? 0.06 : 0;
-    this.vmSprint += (sprintLower - this.vmSprint) * Math.min(1, dt * 5);
+    this.vmSprint = this.viewMotion.lower;
     const handX = 0.24 * Math.min(1, this.camera.aspect / 0.9);
-    vm.position.x = handX + this.vmLag.x * 0.05 + Math.cos(this.bobPhase) * 0.008 * this.bobAmount;
-    vm.position.y = -0.22 + this.vmSprint + this.vmLag.y * 0.05 + Math.sin(this.bobPhase * 2) * 0.01 * this.bobAmount + breathe * 0.6;
-    vm.rotation.z = this.vmLag.x * 0.25 + tremX * 4;
-    vm.rotation.x = this.vmLag.y * 0.2 - flinch * 0.5 + this.vmSprint * 1.4;
+    vm.position.x = handX + this.viewMotion.x * 0.05 + Math.cos(this.bobPhase) * 0.008 * this.bobAmount;
+    vm.position.y = -0.22 - this.vmSprint + this.viewMotion.y * 0.05 + Math.sin(this.bobPhase * 2) * 0.01 * this.bobAmount + breathe * 0.6;
+    vm.rotation.z = this.viewMotion.x * 0.25 + tremX * 4;
+    vm.rotation.x = this.viewMotion.y * 0.2 - flinch * 0.5 + this.vmSprint * 1.4;
     // shake scaled by fear
     vm.position.x += Math.sin(t * 31) * fear * 0.006;
     vm.position.y += Math.cos(t * 37) * fear * 0.006;
