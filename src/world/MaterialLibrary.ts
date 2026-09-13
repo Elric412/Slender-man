@@ -65,7 +65,12 @@ export function applyShaderPatch(mat: THREE.Material, key: string): void {
   ud.__patches.push(key);
   const keys = ud.__patches;
   mat.onBeforeCompile = (shader) => {
-    for (const k of keys) patchRegistry.get(k)?.(shader as unknown as ShaderLike);
+    // Sampling replacements run last so modifiers retain their include anchors.
+    // Their inserted bodies remain after the replaced stock sampling chunk.
+    for (const k of keys.filter(k => !k.startsWith('stoch:')))
+      patchRegistry.get(k)?.(shader as unknown as ShaderLike);
+    for (const k of keys.filter(k => k.startsWith('stoch:')))
+      patchRegistry.get(k)?.(shader as unknown as ShaderLike);
   };
   mat.customProgramCacheKey = () => keys.join('|');
   mat.needsUpdate = true;
@@ -310,9 +315,17 @@ export function wetnessPatch(porosity: number): string {
         // view→world without an inverse: transpose-multiply an orthonormal basis
         vec3 wetWorldN = normalize((vec4(normal, 0.0) * viewMatrix).xyz);
         float up = clamp(wetWorldN.y, 0.0, 1.0);
-        float wet = uWetness * ${porosity.toFixed(3)} * mix(0.22, 1.0, up * up);
-        diffuseColor.rgb *= mix(1.0, 0.5, wet);
-        roughnessFactor = mix(roughnessFactor, 0.08, wet);
+        // Reuse the existing roughness field as a pore/cavity proxy; the
+        // position mask adds irregular metre-scale moisture without a texture.
+        vec3 wetP = (vec4(-vViewPosition, 0.0) * viewMatrix).xyz + cameraPosition;
+        float wetPatch = 0.5 + 0.5 * sin(wetP.x * 1.37 + sin(wetP.z * 0.83))
+          * sin(wetP.z * 1.71 + wetP.y * 0.67 + sin(wetP.x * 0.59));
+        float wet = clamp(uWetness, 0.0, 1.0) * ${porosity.toFixed(3)}
+          * mix(0.22, 1.0, up * up) * mix(0.25, 1.0, smoothstep(0.25, 0.78, wetPatch));
+        float pore = clamp(roughnessFactor, 0.0, 1.0);
+        float wetRoughness = 0.20 + pore * 0.25;
+        diffuseColor.rgb *= mix(1.0, 0.76, wet);
+        roughnessFactor = mix(roughnessFactor, min(roughnessFactor, wetRoughness), wet);
       }
       #include <lights_physical_fragment>`);
   });
@@ -405,6 +418,27 @@ export function stochasticTilePatch(scale: number): string {
       mat2 rot = mat2(ca, -sa, sa, ca);
       return textureGrad(tex, rot * uv + h, rot * dx, rot * dy);
     }
+    // Return normals in the original tangent basis before blending. Rotating
+    // only UVs makes the bump slope disagree with the rotated albedo feature.
+    vec3 hexNormalTap(sampler2D tex, vec2 uv, vec2 cell, vec2 dx, vec2 dy) {
+      vec2 h = hexHash(cell);
+      float a = h.x * 6.2831853;
+      float ca = cos(a), sa = sin(a);
+      mat2 rot = mat2(ca, -sa, sa, ca);
+      vec3 n = textureGrad(tex, rot * uv + h, rot * dx, rot * dy).xyz * 2.0 - 1.0;
+      n.xy = transpose(rot) * n.xy;
+      return n;
+    }
+    vec3 hexNormalSample(sampler2D tex, vec2 uv, float cells) {
+      vec2 dx = dFdx(uv), dy = dFdy(uv);
+      vec2 c0, c1, c2; vec3 w;
+      hexCell(uv * cells, c0, c1, c2, w);
+      w = w * w * w;
+      w /= (w.x + w.y + w.z);
+      return hexNormalTap(tex, uv, c0, dx, dy) * w.x
+           + hexNormalTap(tex, uv, c1, dx, dy) * w.y
+           + hexNormalTap(tex, uv, c2, dx, dy) * w.z;
+    }
     // Three taps, blended with variance-preserving weights.
     vec4 hexSample(sampler2D tex, vec2 uv, float cells) {
       vec2 dx = dFdx(uv), dy = dFdy(uv);
@@ -435,12 +469,12 @@ export function stochasticTilePatch(scale: number): string {
       .replace('#include <normal_fragment_maps>', /* glsl */`
       #ifdef USE_NORMALMAP_TANGENTSPACE
       {
-        vec3 mapN = hexSample(normalMap, vNormalMapUv, ${S}).xyz * 2.0 - 1.0;
+        vec3 mapN = hexNormalSample(normalMap, vNormalMapUv, ${S});
         mapN.xy *= normalScale;
         normal = normalize(tbn * mapN);
       }
       #endif`)
-      // Roughness and metalness share the ORM texture, so one tap serves both.
+      // Roughness and metalness share the ORM texture and stochastic mapping.
       // Sampled at the same scale so a pebble's shading, its bump and its
       // gloss all belong to the same pebble.
       .replace('#include <roughnessmap_fragment>', /* glsl */`
@@ -452,7 +486,11 @@ export function stochasticTilePatch(scale: number): string {
       float metalnessFactor = metalness;
       #ifdef USE_METALNESSMAP
         metalnessFactor *= hexSample(metalnessMap, vMetalnessMapUv, ${S}).b;
-      #endif`);
+      #endif`)
+      // Keep Three's indirect diffuse/specular occlusion logic intact; only
+      // replace the AO lookup so cavities follow the same rotated features.
+      .replace('#include <aomap_fragment>', THREE.ShaderChunk.aomap_fragment.replace(
+        'texture2D( aoMap, vAoMapUv )', `hexSample(aoMap, vAoMapUv, ${S})`));
   });
 }
 
@@ -515,7 +553,7 @@ export function triplanarDetailPatch(scale: number, strength: number): string {
           #else
             vTriWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
           #endif
-          vTriWNrm = normalize(mat3(modelMatrix) * objectNormal);
+          vTriWNrm = inverseTransformDirection(transformedNormal, viewMatrix);
         }`);
     shader.fragmentShader = `
       uniform sampler2D uDetailNormal;
@@ -547,7 +585,10 @@ export function triplanarDetailPatch(scale: number, strength: number): string {
         vec3 d = triplanarNrm(vTriWPos, wn, ${scale.toFixed(4)})
                + triplanarNrm(vTriWPos + 13.7, wn, ${(scale * 4.3).toFixed(4)}) * 0.55;
         // perturb in view space (normal is view-space at this point in three)
-        vec3 dv = normalize((viewMatrix * vec4(d, 0.0)).xyz);
+        // Preserve the sampled amplitude: normalizing a tiny perturbation
+        // amplified quantization noise to full strength (and zero to NaN).
+        d -= wn * dot(wn, d);
+        vec3 dv = (viewMatrix * vec4(d, 0.0)).xyz;
         normal = normalize(normal + dv * ${strength.toFixed(3)});
       }`);
   });
@@ -587,7 +628,7 @@ export function layeredGrowthPatch(mossAmt: number, grimeAmt: number, heightFall
           #else
             vGrowWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
           #endif
-          vGrowWNrm = normalize(mat3(modelMatrix) * objectNormal);
+          vGrowWNrm = inverseTransformDirection(transformedNormal, viewMatrix);
         }`);
     shader.fragmentShader = `
       uniform sampler2D uMacroMask; uniform float uZoneMoss;
@@ -1056,8 +1097,8 @@ export class MaterialLibrary {
       const len = r.range(3, 9), wid = r.range(1.6, 3.4), rot = r.range(0, Math.PI);
       const cs = Math.cos(rot), sn = Math.sin(rot);
       const cr = r.range(0.22, 0.42), cg = r.range(0.16, 0.32), cb = r.range(0.08, 0.17);
-      for (let dy = -len; dy <= len; dy++) {
-        for (let dx = -len; dx <= len; dx++) {
+      for (let dy = -Math.ceil(len); dy <= Math.ceil(len); dy++) {
+        for (let dx = -Math.ceil(len); dx <= Math.ceil(len); dx++) {
           const lx = dx * cs + dy * sn, ly = -dx * sn + dy * cs;
           if ((lx * lx) / (len * len) + (ly * ly) / (wid * wid) > 1) continue;
           const px = ((cx + dx) % S + S) % S, py = ((cy + dy) % S + S) % S;
@@ -1072,8 +1113,8 @@ export class MaterialLibrary {
     const stampPebble = (cx: number, cy: number) => {
       const rad = r.range(1.2, 3.2);
       const g = r.range(0.30, 0.46);
-      for (let dy = -rad; dy <= rad; dy++) {
-        for (let dx = -rad; dx <= rad; dx++) {
+      for (let dy = -Math.ceil(rad); dy <= Math.ceil(rad); dy++) {
+        for (let dx = -Math.ceil(rad); dx <= Math.ceil(rad); dx++) {
           if (dx * dx + dy * dy > rad * rad) continue;
           const px = ((cx + dx) % S + S) % S, py = ((cy + dy) % S + S) % S;
           const i = py * S + px;
@@ -1090,9 +1131,8 @@ export class MaterialLibrary {
       color: 0x93887a, envMapIntensity: 0.45,
       normalScale: new THREE.Vector2(1.25, 1.25),
       patches: [
-        // Stochastic tiling FIRST: it replaces the map/normal/roughness fetches
-        // outright, so anything that merely modulates their result must be
-        // composed after it. The patch registry applies in array order.
+        // The registry defers stochastic sampling replacement until modifiers
+        // have attached to the stock includes, independent of this array order.
         //
         // 0.5 hex cells per UV unit, and one UV unit is one 6.22 m tile, so a
         // cell is ~12.4 m across — comfortably larger than the tile it is
@@ -1436,3 +1476,4 @@ export class MaterialLibrary {
     this.disposables.length = 0;
   }
 }
+

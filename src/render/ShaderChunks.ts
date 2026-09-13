@@ -124,7 +124,8 @@ float henyeyGreenstein(float cosT, float g){
 
 /** three.js packs shadow depth into RGBA8 — this is its inverse, verbatim. */
 export const GLSL_UNPACK_DEPTH = /* glsl */`
-const vec4 UNPACK_FACTORS = vec4(1.0 / (256.0 * 256.0 * 256.0), 1.0 / (256.0 * 256.0), 1.0 / 256.0, 1.0);
+// Three r170 packs the most significant byte in R, not A.
+const vec4 UNPACK_FACTORS = vec4(255.0 / 256.0, 255.0 / 65536.0, 255.0 / 16777216.0, 1.0 / 16777216.0);
 float unpackRGBAToDepth(vec4 v){ return dot(v, UNPACK_FACTORS); }
 `;
 
@@ -228,4 +229,5 @@ void main(){
 export function buildFrag(body: string, chunks: string[] = []): string {
   return `precision highp float;\nprecision highp sampler2D;\nin vec2 vUv;\nout vec4 fragColor;\n${chunks.join('\n')}\n${body}`;
 }
+
 

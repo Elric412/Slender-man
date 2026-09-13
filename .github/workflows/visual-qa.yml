@@ -4,13 +4,14 @@ on:
     paths:
       - 'src/**'
       - 'tests/lighting-qa.spec.ts'
+      - 'tests/visual-capture.spec.ts'
       - '.github/workflows/visual-qa.yml'
 permissions:
   contents: read
 jobs:
   screenshots:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,7 +21,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run typecheck && npm run build
-      - run: npx playwright test tests/lighting-qa.spec.ts --reporter=line
+      - run: npx playwright test tests/lighting-qa.spec.ts tests/visual-capture.spec.ts --reporter=line
       - uses: actions/upload-artifact@v4
         if: always()
         with:

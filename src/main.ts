@@ -41,6 +41,8 @@ import { PerfGovernor, type QualityKnobs } from './engine/PerfGovernor';
 import { Scheduler } from './engine/Scheduler';
 import { Perceptibility, type PerceptInput } from './engine/Perceptibility';
 
+import { VisualCapture, visualCaptureEnabled, type VisualScene } from './debug/VisualCapture';
+
 const WORLD_SEED = 0x57A71C; // fixed world seed — map is consistent & benchmarkable
 
 type GameState = 'loading' | 'title' | 'playing' | 'paused' | 'ending' | 'escaped' | 'taken';
@@ -906,7 +908,7 @@ class StaticGame {
     this.audio.init();
     this.audio.resume();
     // fresh per-run seed: tape positions & ambient variation differ per run
-    this.runSeed = (WORLD_SEED ^ ((Date.now() & 0xffff) * 2654435761)) >>> 0;
+    this.runSeed = visualCaptureEnabled() ? WORLD_SEED : (WORLD_SEED ^ ((Date.now() & 0xffff) * 2654435761)) >>> 0;
     // Every audio subsystem reseeds off this, so a fixed runSeed reproduces the
     // exact same ambience schedule and sting order — which is what makes the
     // seeded Director test in the suite meaningful.
@@ -1312,7 +1314,7 @@ class StaticGame {
     this.pipeline?.setFog({
       density: (0.020 + wet * 0.016 + this.fear.value * 0.004) * atmo.fog,
       // Ground-hugging in wet hollows, lifted on dry ridges.
-      baseHeight: 1.2 - localWet * 0.5,
+      baseHeight: (this.player?.pos.y ?? 0) + 1.2 - localWet * 0.5,
       falloff: 9 - localWet * 2.5,
       turbulence: 0.55 + this.fear.value * 0.35,
       tint: atmo.tint,
@@ -1322,20 +1324,20 @@ class StaticGame {
     // the vignette in and lifts grain.
     const fear = this.fear.value;
     this.pipeline?.setGrade({
-      bloom: 0.22 + wet * 0.16,
-      streak: 0.025 + this.vfWeight * 0.10,
+      bloom: 0.16 + wet * 0.08,
+      streak: this.vfWeight * 0.07,
       volumetric: 0.9 + wet * 0.45,
-      ao: 0.85 + fear * 0.2,
-      grain: 0.035 + fear * 0.09 + this.vfWeight * 0.05,
+      ao: 0.72 + fear * 0.12,
+      grain: 0.008 + fear * fear * 0.035 + this.vfWeight * 0.025,
       // Player-facing accessibility scale over grain/noise/scanlines/dropouts.
       // Pushed here rather than once at settings-change time because `setGrade`
       // overwrites the whole grade block every frame, so a one-shot write would
       // be clobbered on the next weather update.
       noise: this.settings.filmNoise,
-      vignette: 0.76 - fear * 0.18 - this.vfWeight * 0.10,
+      vignette: 0.88 - fear * fear * 0.16 - this.vfWeight * 0.10,
       // Keep trails and distant silhouettes readable in normal play; stronger
       // defocus belongs to the deliberate viewfinder mode.
-      dof: this.spec.dof ? 0.12 + this.vfWeight * 0.4 : 0,
+      dof: this.spec.dof ? this.vfWeight * 0.4 : 0,
       dofRange: [2.4, 34 - wet * 8],
     });
 
@@ -2014,6 +2016,24 @@ class StaticGame {
         this.player.pitch = Math.max(-1.45, Math.min(1.45, pitch));
         this.flashlight?.warp();
         this.pipeline.invalidateHistory();
+      },
+      visualCapture: async (name: VisualScene, on = true) => {
+        if (!visualCaptureEnabled()) throw new Error('Requires ?visualqa=1');
+        return new VisualCapture({
+          player: this.player, flashlight: this.flashlight, hf: this.hf, map: this.map,
+          pipeline: this.pipeline, night: this.night, shadows: this.shadows,
+          sky: this.sky, rig: this.rig, loop: this.loop, scene: this.scene,
+          renderer: this.renderer, tier: this.spec.tier, seed: WORLD_SEED,
+          prepareLook: (wetness, time) => {
+            this.fear.forceDread(0);
+            this.weather.rain = this.weather.wetness = wetness;
+            this.vfWeight = 0;
+            this.staticState.time = time;
+            this.zoneAtmoPrimed = false;
+            this.updateZoneAtmosphere(0);
+            this.applyWeatherLook(0, true);
+          },
+        }).capture(name, on);
       },
       dustStats: () => this.flashlight.dustStats(),
       player: () => ({ x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z, yaw: this.player.yaw }),

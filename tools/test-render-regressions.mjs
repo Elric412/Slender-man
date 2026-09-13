@@ -162,3 +162,34 @@ test('a blocked lens retracts the emitter and both beam lobes cast near shadows'
     assert.ok(lobe.shadow.camera.near <= 0.1);
   }
 });
+
+
+
+test('lit beam tracks current aim on the first frame of a fast turn at every frame rate', () => {
+  for (const dt of [0, 1/144, 1/60, 1/30, 0.1]) {
+    const { light, camera } = torch();
+    light.toggle(); light.update(0.1, 0);
+    for (const [yaw,pitch] of [[1.3,.7],[-2.4,-1.2],[.1,1.4]]) {
+      camera.rotation.set(pitch,yaw,0,'YXZ');
+      camera.position.y += .4;
+      light.update(dt, 1);
+      const target = camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(12).add(camera.position);
+      const expected = target.sub(light.originPosition).normalize();
+      assert.ok(light.aimDirection.dot(expected) > 1-1e-10, `lag at dt=${dt}`);
+      const actual = light.light.target.getWorldPosition(new THREE.Vector3())
+        .sub(light.light.getWorldPosition(new THREE.Vector3())).normalize();
+      assert.ok(actual.dot(expected)>1-1e-10, 'shadow and surface beam target match');
+    }
+  }
+});
+
+test('practical warmth changes fallback fill hue without collapsing luminance',()=>{
+  const night=new NightLighting(); night.setProbeActive(false);
+  const env={moonDim:.6,transmission:.3,openness:.4,wetness:.5,warmth:0};
+  night.update(0,env);
+  const luminance=c=>c.r*.2126+c.g*.7152+c.b*.0722;
+  const cool=luminance(night.hemi.color);
+  night.update(0,{...env,warmth:1});
+  assert.ok(luminance(night.hemi.color)>cool*.8);
+  assert.ok(night.hemi.color.r/night.hemi.color.b>1);
+});
