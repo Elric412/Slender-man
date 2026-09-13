@@ -158,3 +158,40 @@ next art-production phase on close-range bark, fern silhouettes, deadwood,
 wet trail relief and the hand/flashlight viewmodel. These are the largest
 remaining differences from the supplied gameplay references. The full AAA
 definition of done has not yet been met.
+
+## September 13 follow-up: actual terrain and scatter integration
+
+The supplied portrait gameplay screenshot exposed oversized foliage and litter,
+flat-looking terrain and excessive touch-control coverage. This pass preserves
+the map, landmark locations, lighting hierarchy and core gameplay rules.
+
+- Fixed `MapGenerator` cloning the ground with plain `Material.clone()`, which
+  discards `onBeforeCompile`. The actual terrain now retains the material
+  library's wetness, stochastic sampling, detail-normal and macro patches.
+- Changed the dense scatter fern factory (not just the secondary vegetation
+  layer) from upright crossed planes into five radial, arching fronds with
+  analytical normals. Fern dimensions are smaller and grounded. These still
+  use the local procedural atlas; they are not authored botanical models.
+- Reduced conifer needle panel size to 62% and reduced the oversized ground
+  litter cards to 18–40 cm wide, 2.5–7 cm tall.
+- Reduced portrait touch buttons to 52 CSS pixels with smaller spacing and
+  less opaque backgrounds, keeping all actions and the landscape layout.
+- Added real terrain-construction and scatter-geometry regression tests.
+
+Technical-art tradeoff: a scatter fern grows from 36 to 90 triangles; batching,
+atlas reuse and residency budgets remain unchanged. No new textures, external
+assets or draw passes are introduced. Restoring terrain shader patches increases
+the actual terrain sampling cost; GPU timing remains unmeasured.
+
+Validation: typecheck, map/render contracts, all 29 renderer/material tests,
+shader lint (47 templates, including 23 GLSL3 templates) and production build
+pass. Browser validation remains blocked by the missing Chromium executable;
+there are no verified after screenshots or measured GPU timings. Do not treat
+this pass as AAA acceptance or a completed gameplay redesign.
+
+Skill reference ledger: implementation blueprint, model recipes, render recipes,
+technical art, shader cookbook, procedural-model and performance-safe-detail
+checklists read. Their geometry-first guidance drove this scoped integration
+pass. Support-surface sourcing remains procedural/local; no hero asset is
+claimed upgraded by this pass. Next: validate mobile captures, then rebuild
+close-range bark/branch junctions and the hand model with production art.

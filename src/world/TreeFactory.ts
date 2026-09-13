@@ -425,7 +425,8 @@ function spray(
     const t = count === 1 ? 0.55 : 0.14 + (i / (count - 1)) * 0.82;
     // Cards shrink toward the tip; the largest sits ~40% out, which is where a
     // real conifer branch carries most of its mass.
-    const sz = width * (0.45 + Math.sin(Math.pow(t, 0.75) * Math.PI) * 0.72);
+    const needle = tile === TILE.needleDense || tile === TILE.needleSparse;
+    const sz = width * (0.45 + Math.sin(Math.pow(t, 0.75) * Math.PI) * 0.72) * (needle ? 0.62 : 1);
     const roll = t * 5.1 + rng.range(-0.5, 0.5) + i * 2.399;   // golden-ish
     const cr = Math.cos(roll), sr = Math.sin(roll);
     // axis in the plane perpendicular to d

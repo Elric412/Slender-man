@@ -26,11 +26,50 @@ await build({ stdin: { contents: `
   export { makeFernGeometry } from './world/FernGeometry';
   export { Practicals } from './world/Practicals';
   export { ViewmodelMotion } from './game/ViewmodelMotion';
+  export { MapGenerator } from './world/MapGenerator';
+  export { ScatterSystem } from './world/ScatterSystem';
+  export { MaterialLibrary } from './world/MaterialLibrary';
 `, resolveDir: new URL('../src', import.meta.url).pathname, loader: 'ts' }, bundle: true,
   platform: 'node', format: 'esm', outfile: '.tmp/render-flashlight.mjs', external: ['three'] });
 const { StaticGame } = await import('../.tmp/render-game.mjs');
 const { Flashlight, Player, beamProfile, NightLighting, ForestAtlas, surfaceUniforms } =
   await import('../.tmp/render-flashlight.mjs');
+
+test('terrain construction retains the actual forest-floor shader patches', async () => {
+  const { MapGenerator, MaterialLibrary } = await import('../.tmp/render-flashlight.mjs');
+  const mats = new MaterialLibrary(42, { size: 32 });
+  mats.buildGround();
+  const group = new THREE.Group();
+  MapGenerator.prototype.buildTerrain.call({
+    mats, group, hf: { res: 3, layout: { size: 8 }, heightAt: () => 0,
+      trailDist: () => 5, inLake: () => false },
+    zones: { sample: () => ({ groundTint: [0.3, 0.3, 0.3], mossDensity: 0.3, wetness: 0.5 }) },
+    rng: { noise2: () => 0 }, buildPuddles() {},
+  });
+  const material = group.children[0].material;
+  assert.notEqual(material, mats.ground);
+  assert.equal(material.vertexColors, true);
+  const shader = { uniforms: {}, vertexShader: THREE.ShaderLib.standard.vertexShader,
+    fragmentShader: THREE.ShaderLib.standard.fragmentShader };
+  material.onBeforeCompile(shader, null);
+  for (const feature of ['wetRoughness', 'hexNormalSample', 'uDetailNormal', 'uMacroMask'])
+    assert.ok(shader.fragmentShader.includes(feature), `terrain lost ${feature}`);
+  group.children[0].geometry.dispose(); material.dispose();
+});
+
+test('scatter ferns use bounded radial fronds with finite unit normals', async () => {
+  const { ScatterSystem } = await import('../.tmp/render-flashlight.mjs');
+  const geo = ScatterSystem.prototype.cardGeo.call({}, 13, 0.9, 0.4, 0.18, true);
+  assert.equal(geo.index.length / 3, 90);
+  assert.ok([...geo.position, ...geo.normal, ...geo.uv].every(Number.isFinite));
+  for (let i = 0; i < geo.position.length; i += 3) {
+    assert.ok(geo.position[i + 1] >= 0 && geo.position[i + 1] <= 0.4);
+    assert.ok(Math.hypot(geo.position[i], geo.position[i + 2]) < 0.55);
+    assert.ok(Math.abs(Math.hypot(...geo.normal.slice(i, i + 3)) - 1) < 1e-6);
+  }
+  assert.ok(geo.index.every(index => index < geo.position.length / 3));
+  assert.equal(ScatterSystem.prototype.cardGeo.call({}, 13, 0.9, 0.4, 0.18).index.length / 3, 36);
+});
 
 test('hand response agrees across frame rates, caps spikes and resets animation time', async () => {
   const { ViewmodelMotion } = await import('../.tmp/render-flashlight.mjs');
