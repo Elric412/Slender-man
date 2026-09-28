@@ -5,10 +5,20 @@ import { HeightField } from './HeightField';
 import { makeFernGeometry } from './FernGeometry';
 
 /**
- * Procedural forest: modular trunk/branch/foliage assemblies — several genuinely different
- * archetypes (healthy pine, leaning pine, dead husk, broadleaf skeleton), instanced in
- * chunks with per-instance scale/rotation/tilt/tint variation. Wind sway is done in a
- * vertex-shader patch so thousands of trees animate at zero CPU cost.
+ * Procedural forest + undergrowth, instanced in 70 m chunks with distance culling.
+ *
+ * Second generation:
+ *  - Wind has a slow gust envelope travelling across the map, a per-instance
+ *    phase taken from the instance origin (neighbours never move in lockstep),
+ *    and a high-frequency leaf flutter weighted by height, so ferns and
+ *    crowns flutter while trunks only lean.
+ *  - Undergrowth is ecologically placed: ferns cluster in damp hollows and
+ *    around trunks, grass tufts line trail edges, rocks gather in scree
+ *    patches and sink into the soil, fallen logs lie along the slope.
+ *    All driven by seeded fBm, so the layout is deterministic.
+ *  - Fern tint varies with wetness proxy (low ground = darker, more saturated).
+ *  - Tree archetypes gain more trunk rings and root flare.
+ *  - `dispose()` releases every geometry/material this class created.
  */
 
 export interface WindState { strength: number; dirX: number; dirZ: number; time: number; }
@@ -19,89 +29,71 @@ const windUniforms = {
   uWindDir: { value: new THREE.Vector2(0.8, 0.6) },
 };
 
-/**
- * Vertex-shader wind sway, registered as a *named, composable* patch.
- *
- * Two things this buys over assigning `onBeforeCompile` directly:
- *  1. **It composes.** Materials also carry detail-normal / wetness / macro
- *     patches from the material library; a raw assignment would clobber them.
- *  2. **It doesn't collide in the program cache.** three's default
- *     `customProgramCacheKey` is `onBeforeCompile.toString()`, which is
- *     *identical* for every amplitude — so a 0.12 trunk and a 0.55 canopy would
- *     silently share one compiled program. The key encodes the amplitude.
- *
- * Wind is a two-octave travelling wave in world space (so neighbouring trees
- * move in sympathy rather than in lockstep), scaled by a height factor so
- * trunks pivot at the base and canopies whip.
- */
-export function patchWindMaterial(mat: THREE.Material, ampMul: number): void {
+/** Shared GLSL: gust envelope + sway + flutter. `amp` is baked per program. */
+const WIND_GLSL = /* glsl */`
+  uniform float uWindTime;
+  uniform float uWindStrength;
+  uniform vec2 uWindDir;
+  vec3 windOffset(vec3 wp, vec3 origin, float weight, float amp, float flutter){
+    float phase = dot(origin.xz, vec2(0.37, 0.53));
+    // slow gust front rolling along the wind direction
+    float front = dot(wp.xz, uWindDir) * 0.045 - uWindTime * 0.35;
+    float gust = 0.55 + 0.45 * sin(front) * sin(front * 0.37 + 1.3);
+    float sway = sin(uWindTime * 1.05 + phase + wp.x * 0.13 + wp.z * 0.097)
+               + 0.45 * sin(uWindTime * 2.37 + phase * 1.7 + wp.z * 0.21);
+    float flick = sin(uWindTime * 7.3 + dot(wp, vec3(1.7, 2.3, 1.9))) * flutter;
+    float s = uWindStrength * amp * weight * gust;
+    vec3 off = vec3(uWindDir.x, 0.0, uWindDir.y) * sway * s;
+    off += vec3(0.3, 1.0, 0.25) * flick * s * 0.35;
+    off.y -= abs(sway) * s * 0.12;
+    return off;
+  }
+`;
+
+export function patchWindMaterial(mat: THREE.Material, ampMul: number, flutter = 0): void {
   const amp = ampMul.toFixed(2);
-  const key = registerShaderPatch(`wind:${amp}`, () => (shader) => {
+  const fl = flutter.toFixed(2);
+  const key = registerShaderPatch(`wind:${amp}:${fl}`, () => (shader) => {
     shader.uniforms.uWindTime = windUniforms.uWindTime;
     shader.uniforms.uWindStrength = windUniforms.uWindStrength;
     shader.uniforms.uWindDir = windUniforms.uWindDir;
-    shader.vertexShader = `
-      uniform float uWindTime; uniform float uWindStrength; uniform vec2 uWindDir;
-    ` + shader.vertexShader.replace(
+    shader.vertexShader = WIND_GLSL + shader.vertexShader.replace(
       '#include <begin_vertex>',
       `#include <begin_vertex>
       {
         #ifdef USE_INSTANCING
-          vec4 wpos = instanceMatrix * vec4(transformed, 1.0);
+          vec3 wpos = (instanceMatrix * vec4(transformed, 1.0)).xyz;
+          vec3 org = instanceMatrix[3].xyz;
         #else
-          vec4 wpos = modelMatrix * vec4(transformed, 1.0);
+          vec3 wpos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          vec3 org = modelMatrix[3].xyz;
         #endif
-        float sway = sin(uWindTime * 1.1 + wpos.x * 0.15 + wpos.z * 0.11)
-                   + 0.5 * sin(uWindTime * 2.3 + wpos.z * 0.23);
         float hFactor = clamp(position.y * 0.22, 0.0, 1.4);
-        transformed.xz += uWindDir * sway * uWindStrength * ${amp} * hFactor;
+        transformed += windOffset(wpos, org, hFactor * hFactor, ${amp}, ${fl});
       }`);
   });
   applyShaderPatch(mat, key);
 }
 
-/**
- * Wind for merged / instanced forest geometry, driven by a baked per-vertex
- * `aSway` weight rather than by `position.y`.
- *
- * Why the attribute matters: merged chunk geometry is authored in *world* space,
- * so `position.y` is an absolute elevation, not a height above the tree's own
- * base. Deriving the sway factor from it makes trees on a ridge whip while trees
- * in a hollow stand still — the amplitude tracks terrain instead of anatomy.
- * Baking the weight at build time (0 at the root, 1 at the branch tips) is both
- * correct and cheaper, and it lets a fern card and a 30 m conifer share one
- * shader.
- *
- * Two travelling octaves in world space keep neighbours in sympathy rather than
- * in lockstep, and a per-vertex phase offset folded into the weight stops a
- * whole crown from moving as one rigid block.
- */
 export function patchForestWind(mat: THREE.Material, ampMul: number): void {
   const amp = ampMul.toFixed(2);
   const key = registerShaderPatch(`fwind:${amp}`, () => (shader) => {
     shader.uniforms.uWindTime = windUniforms.uWindTime;
     shader.uniforms.uWindStrength = windUniforms.uWindStrength;
     shader.uniforms.uWindDir = windUniforms.uWindDir;
-    shader.vertexShader = `
-      attribute float aSway;
-      uniform float uWindTime; uniform float uWindStrength; uniform vec2 uWindDir;
-    ` + shader.vertexShader.replace(
+    shader.vertexShader = 'attribute float aSway;\n' + WIND_GLSL + shader.vertexShader.replace(
       '#include <begin_vertex>',
       `#include <begin_vertex>
       {
         #ifdef USE_INSTANCING
           vec3 wp = (instanceMatrix * vec4(transformed, 1.0)).xyz;
+          vec3 org = instanceMatrix[3].xyz;
         #else
           vec3 wp = transformed;
+          vec3 org = vec3(floor(transformed.x * 0.25), 0.0, floor(transformed.z * 0.25));
         #endif
-        // two octaves + a spatial phase so crowns deform instead of translating
-        float gust = sin(uWindTime * 1.05 + wp.x * 0.13 + wp.z * 0.097)
-                   + 0.45 * sin(uWindTime * 2.37 + wp.z * 0.21 - wp.x * 0.05)
-                   + 0.22 * sin(uWindTime * 4.1 + wp.x * 0.51 + wp.y * 0.3);
         float w = aSway * aSway;
-        transformed.xz += uWindDir * gust * uWindStrength * ${amp} * w;
-        // a touch of vertical bob keeps foliage from sliding like a decal
-        transformed.y -= abs(gust) * uWindStrength * ${amp} * w * 0.12;
+        transformed += windOffset(wp, org, w, ${amp}, aSway * 0.6);
       }`);
   });
   applyShaderPatch(mat, key);
@@ -113,33 +105,37 @@ export function updateWind(w: WindState): void {
   windUniforms.uWindDir.value.set(w.dirX, w.dirZ).normalize();
 }
 
-interface Archetype {
-  geo: THREE.BufferGeometry;
-  mat: THREE.MeshStandardMaterial;
-  foliage: boolean;
-}
+interface Archetype { geo: THREE.BufferGeometry; mat: THREE.MeshStandardMaterial; foliage: boolean; }
+type Placement = { arch: number; x: number; z: number; y: number; s: number; rot: number; tilt: number; tint: number };
+
+const CHUNK = 70;
 
 export class VegetationSystem {
   readonly group = new THREE.Group();
   private rng: SeededRandom;
   private meshes: THREE.InstancedMesh[] = [];
-  /** per-mesh chunk center for distance culling (parallel to meshes) */
   private meshChunkX: number[] = [];
   private meshChunkZ: number[] = [];
   /** trunk obstacle positions for collision + LOS soft blocking */
   trunkPositions: { x: number; z: number; r: number }[] = [];
   private dummy = new THREE.Object3D();
   private color = new THREE.Color();
+  private ownedGeos: THREE.BufferGeometry[] = [];
+  private ownedMats: THREE.Material[] = [];
 
-  /** record a mesh's chunk center so setDrawDistance can toggle it cheaply */
   private registerChunk(m: THREE.InstancedMesh, ck: number, nChunks: number, chunk: number, half: number): void {
     const ci = ck % nChunks, cj = Math.floor(ck / nChunks);
     this.meshChunkX[this.meshes.length] = -half + ci * chunk + chunk / 2;
     this.meshChunkZ[this.meshes.length] = -half + cj * chunk + chunk / 2;
   }
 
+  private ownGeo<T extends THREE.BufferGeometry>(g: T): T { this.ownedGeos.push(g); return g; }
+  private ownMat<T extends THREE.Material>(m: T): T { this.ownedMats.push(m); return m; }
+
   constructor(
-    private mats: MaterialLibrary, private hf: HeightField, seed: number,
+    private mats: MaterialLibrary,
+    private hf: HeightField,
+    seed: number,
     private opts: { trees?: boolean } = {},
   ) {
     this.rng = new SeededRandom(seed ^ 0xF0E57);
@@ -147,70 +143,48 @@ export class VegetationSystem {
   }
 
   private build(): void {
-    // `trees: false` — ScatterSystem owns trees now. This class's cone/sphere
-    // archetypes were the visual bottleneck: five geometries for a 420 m map,
-    // placed on a uniform jittered grid. Its *undergrowth* layer (rocks, logs,
-    // grass tufts, flappable dressing) is still wanted, so the class stays and
-    // only the tree pass is skipped.
-    if (this.opts.trees === false) {
-      this.buildUndergrowth();
-      return;
-    }
+    if (this.opts.trees === false) { this.buildUndergrowth(); return; }
+
     const archetypes: Archetype[] = [
-      { geo: this.makePine(false, 0), mat: this.mats.bark, foliage: true },
-      { geo: this.makePine(false, 1), mat: this.mats.bark, foliage: true },
-      { geo: this.makePine(true, 2), mat: this.mats.barkDead, foliage: true },   // dead husk w/ sparse foliage
-      { geo: this.makeBroadleaf(3), mat: this.mats.barkDead, foliage: true },
-      { geo: this.makeBirch(4), mat: this.mats.birchBark, foliage: true },        // pale birch — Palebark's camouflage
+      { geo: this.ownGeo(this.makePine(false, 0)), mat: this.mats.bark, foliage: true },
+      { geo: this.ownGeo(this.makePine(false, 1)), mat: this.mats.bark, foliage: true },
+      { geo: this.ownGeo(this.makePine(true, 2)), mat: this.mats.barkDead, foliage: true },
+      { geo: this.ownGeo(this.makeBroadleaf(3)), mat: this.mats.barkDead, foliage: true },
+      { geo: this.ownGeo(this.makeBirch(4)), mat: this.mats.birchBark, foliage: true },
     ];
-    // shared foliage material is baked into merged geometry groups — pine uses two-material merge
-    // Instead of geometry groups we build trunk+foliage as a single mesh with vertex colors? Simpler:
-    // each archetype geo already merged with its own material index via groups is complex for InstancedMesh.
-    // → we separate: archetype geo here is TRUNK only; foliage handled by matched foliage instanced mesh.
     const foliageGeos = [
-      this.makePineFoliage(0), this.makePineFoliage(1),
-      this.makeDeadTopFoliage(2), this.makeBroadleafFoliage(3),
-      this.makeBirchFoliage(4),
+      this.ownGeo(this.makePineFoliage(0)), this.ownGeo(this.makePineFoliage(1)),
+      this.ownGeo(this.makeDeadTopFoliage(2)), this.ownGeo(this.makeBroadleafFoliage(3)),
+      this.ownGeo(this.makeBirchFoliage(4)),
     ];
 
-    const size = this.hf.layout.size;
-    const half = size / 2;
-    const chunk = 70; // meters per chunk
-    const nChunks = Math.ceil(size / chunk);
-
-    type Placement = { arch: number; x: number; z: number; y: number; s: number; rot: number; tilt: number; tint: number };
-    // §1b: chunk-partitioned placements (70m cells) so each InstancedMesh has
-    // a tight instance-aware bounding sphere → working frustum culling AND
-    // distance culling. Before this, one InstancedMesh per archetype spanned
-    // the whole map: every vertex shaded every frame regardless of fog.
+    const size = this.hf.layout.size, half = size / 2;
+    const nChunks = Math.ceil(size / CHUNK);
     const placements: Map<number, Placement[]>[] = [];
     for (let a = 0; a < 5; a++) placements.push(new Map());
     const chunkKey = (x: number, z: number) =>
-      Math.floor((x + half) / chunk) + Math.floor((z + half) / chunk) * nChunks;
-
+      Math.floor((x + half) / CHUNK) + Math.floor((z + half) / CHUNK) * nChunks;
     const lake = this.hf.layout.lake;
+
     for (let cj = 0; cj < nChunks; cj++) {
       for (let ci = 0; ci < nChunks; ci++) {
         const crng = this.rng.fork(cj * 97 + ci * 13 + 5);
-        const cx = -half + ci * chunk, cz = -half + cj * chunk;
+        const cx = -half + ci * CHUNK, cz = -half + cj * CHUNK;
         const count = crng.int(36, 58);
         for (let k = 0; k < count; k++) {
-          const x = cx + crng.range(2, chunk - 2);
-          const z = cz + crng.range(2, chunk - 2);
-          // density rules
+          const x = cx + crng.range(2, CHUNK - 2);
+          const z = cz + crng.range(2, CHUNK - 2);
           const trailD = this.hf.trailDist(x, z);
-          if (trailD < 2.6) continue;                       // keep trail walkable
+          if (trailD < 2.6) continue;
           const zone = this.hf.zoneAt(x, z);
-          if (zone && Math.hypot(x - zone.x, z - zone.z) < zone.r * 0.82) continue; // clearings
+          if (zone && Math.hypot(x - zone.x, z - zone.z) < zone.r * 0.82) continue;
           if (Math.hypot(x - lake.x, z - lake.z) < lake.r + 4) continue;
           const density = crng.fbm2(x * 0.015, z * 0.015, 3);
-          if (density < -0.25 && trailD > 8) continue;      // organic thin patches
+          if (density < -0.25 && trailD > 8) continue;
           const y = this.hf.heightAt(x, z);
           const slope = Math.abs(this.hf.heightAt(x + 1.5, z) - y) + Math.abs(this.hf.heightAt(x, z + 1.5) - y);
-          if (slope > 2.4) continue;                        // cliffs
-          // birch clusters — pale stands that break up the pine monoculture
-          const birchNoise = crng.fbm2(x * 0.02 + 77, z * 0.02, 2);
-          const isBirch = birchNoise > 0.34;
+          if (slope > 2.4) continue;
+          const isBirch = crng.fbm2(x * 0.02 + 77, z * 0.02, 2) > 0.34;
           const dead = !isBirch && crng.next() < 0.16;
           const arch = isBirch ? 4 : dead ? (crng.next() < 0.6 ? 2 : 3) : crng.int(0, 1);
           const ck = chunkKey(x, z);
@@ -227,27 +201,19 @@ export class VegetationSystem {
       }
     }
 
-    // build instanced meshes — one (trunk, foliage) pair per archetype PER CHUNK.
-    // Materials are shared per archetype (not cloned per chunk) to keep program
-    // count and texture binds identical to before; only instance buffers split.
     for (let a = 0; a < 5; a++) {
-      const trunkMat = cloneMaterial(archetypes[a].mat);
+      const trunkMat = this.ownMat(cloneMaterial(archetypes[a].mat));
       patchWindMaterial(trunkMat, 0.12);
-      // archetypes 2/3 are dead husks and 4 is birch (retinted below)
-      const folMat = cloneMaterial(a >= 2 ? this.mats.foliageDead : this.mats.foliage);
-      if (a === 4) folMat.color = new THREE.Color(0x7d8a62); // pale sage birch leaves
-      patchWindMaterial(folMat, 0.55);
+      const folMat = this.ownMat(cloneMaterial(a >= 2 ? this.mats.foliageDead : this.mats.foliage));
+      if (a === 4) folMat.color = new THREE.Color(0x7d8a62);
+      patchWindMaterial(folMat, 0.55, 0.5);
       const folGeo = foliageGeos[a];
-
       for (const [ck, list] of placements[a]) {
         if (list.length === 0) continue;
         const trunk = new THREE.InstancedMesh(archetypes[a].geo, trunkMat, list.length);
-        trunk.castShadow = true;
-        trunk.receiveShadow = true;
+        trunk.castShadow = true; trunk.receiveShadow = true;
         const fol = new THREE.InstancedMesh(folGeo, folMat, list.length);
-        fol.castShadow = true;
-        fol.receiveShadow = false;
-
+        fol.castShadow = true; fol.receiveShadow = false;
         for (let i = 0; i < list.length; i++) {
           const p = list[i];
           this.dummy.position.set(p.x, p.y - 0.15, p.z);
@@ -261,41 +227,54 @@ export class VegetationSystem {
           fol.setColorAt(i, this.color);
           this.trunkPositions.push({ x: p.x, z: p.z, r: 0.42 * p.s });
         }
-        trunk.instanceMatrix.needsUpdate = true;
-        fol.instanceMatrix.needsUpdate = true;
-        if (trunk.instanceColor) trunk.instanceColor.needsUpdate = true;
-        if (fol.instanceColor) fol.instanceColor.needsUpdate = true;
-        // instance-aware bounding spheres so frustum culling actually works
-        trunk.computeBoundingSphere();
-        fol.computeBoundingSphere();
-        this.registerChunk(trunk, ck, nChunks, chunk, half);
-        this.registerChunk(fol, ck, nChunks, chunk, half);
-        this.group.add(trunk, fol);
-        this.meshes.push(trunk, fol);
+        this.finishMesh(trunk, ck, nChunks, half);
+        this.finishMesh(fol, ck, nChunks, half);
       }
     }
-
-    // undergrowth: ferns/brush billboards — merged static geometry in chunks for cheap culling
     this.buildUndergrowth();
   }
 
+  private finishMesh(m: THREE.InstancedMesh, ck: number, nChunks: number, half: number): void {
+    m.instanceMatrix.needsUpdate = true;
+    if (m.instanceColor) m.instanceColor.needsUpdate = true;
+    m.computeBoundingSphere();
+    this.registerChunk(m, ck, nChunks, CHUNK, half);
+    this.group.add(m);
+    this.meshes.push(m);
+  }
+
   // ---------------- archetype geometry ----------------
+
+  /** Trunk with root flare: bottom ring pushed out, lobed. */
+  private flaredTrunk(rTop: number, rBot: number, h: number, segs: number, rings: number, r: SeededRandom): THREE.BufferGeometry {
+    const g = new THREE.CylinderGeometry(rTop, rBot, h, segs, rings);
+    g.translate(0, h / 2, 0);
+    const pos = g.getAttribute('position') as THREE.BufferAttribute;
+    const lobes = r.int(3, 5), ph = r.range(0, Math.PI * 2);
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+      const flare = Math.exp(-y / 0.7) * 0.55;
+      const ang = Math.atan2(z, x);
+      const lobe = 1 + flare * (0.6 + 0.4 * Math.cos(ang * lobes + ph));
+      const wob = 1 + r.noise1(y * 0.9 + ang) * 0.04;
+      pos.setXYZ(i, x * lobe * wob, y, z * lobe * wob);
+    }
+    g.computeVertexNormals();
+    return g;
+  }
 
   private makePine(sparse: boolean, variant: number): THREE.BufferGeometry {
     const r = this.rng.fork(100 + variant);
     const geos: THREE.BufferGeometry[] = [];
     const h = r.range(11, 16);
-    const trunk = new THREE.CylinderGeometry(r.range(0.22, 0.3), r.range(0.4, 0.55), h, 7, 3);
-    trunk.translate(0, h / 2, 0);
-    geos.push(trunk);
-    // bare lower branches
-    const branches = sparse ? 4 : r.int(6, 9);
+    geos.push(this.flaredTrunk(r.range(0.2, 0.28), r.range(0.4, 0.55), h, 9, 8, r));
+    const branches = sparse ? 5 : r.int(7, 11);
     for (let i = 0; i < branches; i++) {
       const by = r.range(2, h * 0.75);
-      const len = r.range(0.8, 2.0) * (1 - by / h * 0.5);
-      const b = new THREE.CylinderGeometry(0.03, 0.07, len, 4);
+      const len = r.range(0.8, 2.0) * (1 - (by / h) * 0.5);
+      const b = new THREE.CylinderGeometry(0.02, 0.07, len, 4);
       b.translate(0, len / 2, 0);
-      b.rotateZ(r.range(1.1, 1.5));
+      b.rotateZ(r.range(1.1, 1.6));
       b.rotateY(r.range(0, Math.PI * 2));
       b.translate(0, by, 0);
       geos.push(b);
@@ -307,12 +286,22 @@ export class VegetationSystem {
     const r = this.rng.fork(200 + variant);
     const geos: THREE.BufferGeometry[] = [];
     const h = variant === 0 ? 13.5 : 12;
-    const layers = r.int(4, 6);
+    const layers = r.int(6, 8);
     for (let i = 0; i < layers; i++) {
       const t = i / layers;
-      const y = h * (0.38 + t * 0.62);
-      const rad = (1 - t) * r.range(2.4, 3.1) + 0.3;
-      const cone = new THREE.ConeGeometry(rad, r.range(2.2, 3.2), 7, 1, true);
+      const y = h * (0.36 + t * 0.64);
+      const rad = (1 - t) * r.range(2.3, 3.1) + 0.3;
+      const cone = new THREE.ConeGeometry(rad, r.range(1.8, 2.8), 9, 2, true);
+      // droop the rim so tiers read as hanging boughs, not lampshades
+      const p = cone.getAttribute('position') as THREE.BufferAttribute;
+      for (let k = 0; k < p.count; k++) {
+        const px = p.getX(k), pz = p.getZ(k);
+        const rr = Math.hypot(px, pz) / rad;
+        const jag = 1 + r.noise1(Math.atan2(pz, px) * 3 + i) * 0.18;
+        p.setXYZ(k, px * jag, p.getY(k) - rr * rr * 0.35, pz * jag);
+      }
+      cone.computeVertexNormals();
+      cone.rotateY(r.range(0, Math.PI * 2));
       cone.translate(r.range(-0.2, 0.2), y, r.range(-0.2, 0.2));
       geos.push(cone);
     }
@@ -334,12 +323,10 @@ export class VegetationSystem {
     const r = this.rng.fork(400 + variant);
     const geos: THREE.BufferGeometry[] = [];
     const h = r.range(7, 10);
-    const trunk = new THREE.CylinderGeometry(0.25, 0.45, h, 7, 2);
-    trunk.translate(0, h / 2, 0);
-    geos.push(trunk);
-    for (let i = 0; i < 5; i++) {
+    geos.push(this.flaredTrunk(0.25, 0.45, h, 8, 5, r));
+    for (let i = 0; i < 6; i++) {
       const len = r.range(2, 4.5);
-      const b = new THREE.CylinderGeometry(0.04, 0.12, len, 5);
+      const b = new THREE.CylinderGeometry(0.03, 0.12, len, 5);
       b.translate(0, len / 2, 0);
       b.rotateZ(r.range(0.5, 1.2) * r.sign());
       b.rotateY(r.range(0, Math.PI * 2));
@@ -352,8 +339,9 @@ export class VegetationSystem {
   private makeBroadleafFoliage(variant: number): THREE.BufferGeometry {
     const r = this.rng.fork(500 + variant);
     const geos: THREE.BufferGeometry[] = [];
-    for (let i = 0; i < 6; i++) {
-      const s = new THREE.SphereGeometry(r.range(0.9, 1.7), 6, 4);
+    for (let i = 0; i < 7; i++) {
+      const s = new THREE.IcosahedronGeometry(r.range(0.9, 1.7), 1);
+      s.scale(1, r.range(0.7, 1.0), 1);
       s.translate(r.range(-2, 2), r.range(6.5, 9.5), r.range(-2, 2));
       geos.push(s);
     }
@@ -364,20 +352,17 @@ export class VegetationSystem {
     const r = this.rng.fork(600 + variant);
     const geos: THREE.BufferGeometry[] = [];
     const h = r.range(8, 12);
-    // birch trunks are slim, often slightly curved — two segments with a kink
-    const lower = new THREE.CylinderGeometry(0.09, 0.14, h * 0.55, 7, 2);
+    const lower = new THREE.CylinderGeometry(0.09, 0.14, h * 0.55, 8, 3);
     lower.translate(0, h * 0.275, 0);
     geos.push(lower);
-    const kink = r.range(0.02, 0.1) * r.sign();
-    const upper = new THREE.CylinderGeometry(0.05, 0.09, h * 0.5, 7, 2);
+    const upper = new THREE.CylinderGeometry(0.05, 0.09, h * 0.5, 8, 3);
     upper.translate(0, h * 0.25, 0);
-    upper.rotateZ(kink);
+    upper.rotateZ(r.range(0.02, 0.1) * r.sign());
     upper.translate(0, h * 0.55, 0);
     geos.push(upper);
-    // sparse thin branches high up
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       const len = r.range(0.8, 1.8);
-      const b = new THREE.CylinderGeometry(0.015, 0.035, len, 4);
+      const b = new THREE.CylinderGeometry(0.012, 0.035, len, 4);
       b.translate(0, len / 2, 0);
       b.rotateZ(r.range(0.9, 1.4) * r.sign());
       b.rotateY(r.range(0, Math.PI * 2));
@@ -390,9 +375,8 @@ export class VegetationSystem {
   private makeBirchFoliage(variant: number): THREE.BufferGeometry {
     const r = this.rng.fork(700 + variant);
     const geos: THREE.BufferGeometry[] = [];
-    // drooping sparse clusters high on the trunk
-    for (let i = 0; i < 5; i++) {
-      const s = new THREE.SphereGeometry(r.range(0.5, 1.0), 5, 4);
+    for (let i = 0; i < 6; i++) {
+      const s = new THREE.IcosahedronGeometry(r.range(0.5, 1.0), 1);
       s.scale(1, r.range(1.2, 1.8), 1);
       s.translate(r.range(-1.2, 1.2), r.range(6.5, 10), r.range(-1.2, 1.2));
       geos.push(s);
@@ -400,165 +384,209 @@ export class VegetationSystem {
     return mergeGeos(geos);
   }
 
+  // ---------------- undergrowth ----------------
+
+  /** Low ground relative to a 6 m neighbourhood → 0..1 dampness proxy. */
+  private hollow(x: number, z: number): number {
+    const y = this.hf.heightAt(x, z);
+    const avg = (this.hf.heightAt(x + 6, z) + this.hf.heightAt(x - 6, z) +
+      this.hf.heightAt(x, z + 6) + this.hf.heightAt(x, z - 6)) * 0.25;
+    return THREE.MathUtils.clamp((avg - y) * 1.2 + 0.5, 0, 1);
+  }
+
   private buildUndergrowth(): void {
     const r = this.rng.fork(999);
     const size = this.hf.layout.size, half = size / 2;
-    // §1b: chunk-partitioned undergrowth (same 70m grid as trees) — a single
-    // map-spanning InstancedMesh of alpha cards defeats both frustum and
-    // distance culling; per-chunk meshes restore both.
-    const chunk = 70, nChunks = Math.ceil(size / chunk);
+    const nChunks = Math.ceil(size / CHUNK);
 
-    const fernGeo = makeFernGeometry();
-    const fernMat = cloneMaterial(this.mats.foliage);
-    fernMat.map = null;
-    fernMat.alphaMap = null;
-    fernMat.alphaTest = 0;
-    fernMat.side = THREE.DoubleSide;
-    fernMat.roughness = 0.76;
-    patchWindMaterial(fernMat, 0.4);
+    const fernGeo = this.ownGeo(makeFernGeometry());
+    const fernMat = this.ownMat(cloneMaterial(this.mats.foliage));
+    fernMat.map = null; fernMat.alphaMap = null; fernMat.alphaTest = 0;
+    fernMat.side = THREE.DoubleSide; fernMat.roughness = 0.72;
+    patchWindMaterial(fernMat, 0.4, 0.8);
 
-    // dead grass tufts — thin vertical quads for ground texture at close range
-    const tuftCard = new THREE.PlaneGeometry(0.5, 0.42);
+    const tuftCard = new THREE.PlaneGeometry(0.5, 0.42, 1, 2);
     tuftCard.translate(0, 0.2, 0);
-    const tuftGeo = mergeGeos([tuftCard, tuftCard.clone().rotateY(Math.PI / 2)]);
-    const tuftMat = cloneMaterial(this.mats.foliageDead);
+    const tuftGeo = this.ownGeo(mergeGeos([
+      tuftCard,
+      tuftCard.clone().rotateY(Math.PI / 3),
+      tuftCard.clone().rotateY(-Math.PI / 3),
+    ]));
+    tuftCard.dispose();
+    const tuftMat = this.ownMat(cloneMaterial(this.mats.foliageDead));
     tuftMat.color = new THREE.Color(0x6e6242);
-    patchWindMaterial(tuftMat, 0.3);
+    tuftMat.side = THREE.DoubleSide;
+    patchWindMaterial(tuftMat, 0.3, 1.0);
 
-    // rocks — instanced icosahedra with noise displacement baked per-arch
-    const rockGeo = new THREE.IcosahedronGeometry(1, 2);
-    const posAttr = rockGeo.getAttribute('position') as THREE.BufferAttribute;
-    for (let i = 0; i < posAttr.count; i++) {
-      const vx = posAttr.getX(i), vy = posAttr.getY(i), vz = posAttr.getZ(i);
-      const n = r.noise2(vx * 2 + 9, vz * 2 + vy) * 0.25;
-      // Coherent strata fracture the silhouette; positions shared by adjacent
-      // faces receive identical offsets, so the mesh stays watertight.
-      const strata = Math.sin(vy * 13 + vx * 2.4) * 0.045;
-      posAttr.setXYZ(i, vx * (1 + n + strata),
-        Math.max(-0.7, vy * (0.8 + n * 0.6)), vz * (1 + n - strata));
+    const rockGeo = this.ownGeo(new THREE.IcosahedronGeometry(1, 2));
+    {
+      const pa = rockGeo.getAttribute('position') as THREE.BufferAttribute;
+      for (let i = 0; i < pa.count; i++) {
+        const vx = pa.getX(i), vy = pa.getY(i), vz = pa.getZ(i);
+        const n = r.noise2(vx * 2 + 9, vz * 2 + vy) * 0.25;
+        const strata = Math.sin(vy * 13 + vx * 2.4) * 0.045;
+        // flatten the top slightly: weathered boulders sit, they don't balance
+        const top = vy > 0.4 ? 1 - (vy - 0.4) * 0.35 : 1;
+        pa.setXYZ(i, vx * (1 + n + strata), Math.max(-0.7, vy * (0.8 + n * 0.6) * top), vz * (1 + n - strata));
+      }
+      rockGeo.computeVertexNormals();
     }
-    rockGeo.computeVertexNormals();
 
-    // per-chunk targets: global totals (3200 ferns / 1400 tufts / 240 rocks)
-    // divided across the grid; same rejection rules => same local density.
-    const fernsPer = Math.ceil(3200 / (nChunks * nChunks));
-    const tuftsPer = Math.ceil(1400 / (nChunks * nChunks));
-    const rocksPer = Math.ceil(240 / (nChunks * nChunks));
+    // fallen logs: bark cylinder with broken ends
+    const logGeo = this.ownGeo(new THREE.CylinderGeometry(0.22, 0.28, 1, 8, 3, false));
+    {
+      const pa = logGeo.getAttribute('position') as THREE.BufferAttribute;
+      for (let i = 0; i < pa.count; i++) {
+        const x = pa.getX(i), y = pa.getY(i), z = pa.getZ(i);
+        const w = 1 + r.noise1(y * 4 + Math.atan2(z, x) * 2) * 0.08;
+        pa.setXYZ(i, x * w, y, z * w);
+      }
+      logGeo.computeVertexNormals();
+      logGeo.rotateZ(Math.PI / 2);
+    }
+
+    const cells = nChunks * nChunks;
+    const fernsPer = Math.ceil(3600 / cells);
+    const tuftsPer = Math.ceil(1800 / cells);
+    const rocksPer = Math.ceil(260 / cells);
+    const logsPer = Math.max(2, Math.ceil(90 / cells));
 
     for (let cj = 0; cj < nChunks; cj++) {
       for (let ci = 0; ci < nChunks; ci++) {
         const cr = r.fork(cj * 131 + ci * 17 + 3);
-        const x0 = -half + ci * chunk, z0 = -half + cj * chunk;
-        const x1 = Math.min(x0 + chunk, half), z1 = Math.min(z0 + chunk, half);
+        const x0 = -half + ci * CHUNK, z0 = -half + cj * CHUNK;
+        const x1 = Math.min(x0 + CHUNK, half), z1 = Math.min(z0 + CHUNK, half);
         const ck = ci + cj * nChunks;
+        const lox = Math.max(x0 + 2, -half + 8), loz = Math.max(z0 + 2, -half + 8);
 
-        // ferns
+        // ---- ferns: clustered, prefer hollows, avoid dry ridges ----
         const fern = new THREE.InstancedMesh(fernGeo, fernMat, fernsPer);
         fern.receiveShadow = true;
         let placed = 0;
-        for (let i = 0; i < fernsPer * 3 && placed < fernsPer; i++) {
-          const x = cr.range(Math.max(x0 + 2, -half + 8), x1 - 2);
-          const z = cr.range(Math.max(z0 + 2, -half + 8), z1 - 2);
-          if (x >= x1 - 2 || z >= z1 - 2) continue;
+        let clX = cr.range(lox, x1 - 2), clZ = cr.range(loz, z1 - 2);
+        for (let i = 0; i < fernsPer * 4 && placed < fernsPer; i++) {
+          if (i % 9 === 0) { clX = cr.range(lox, x1 - 2); clZ = cr.range(loz, z1 - 2); }
+          const ang = cr.range(0, Math.PI * 2), rad = Math.sqrt(cr.next()) * cr.range(1.5, 6);
+          const x = clX + Math.cos(ang) * rad, z = clZ + Math.sin(ang) * rad;
+          if (x < lox || z < loz || x >= x1 - 2 || z >= z1 - 2) continue;
           if (this.hf.trailDist(x, z) < 2.0) continue;
           const zn = this.hf.zoneAt(x, z);
           if (zn && Math.hypot(x - zn.x, z - zn.z) < zn.r * 0.7) continue;
           if (this.hf.inLake(x, z)) continue;
+          const damp = this.hollow(x, z);
+          const eco = cr.fbm2(x * 0.03 + 11, z * 0.03, 3) * 0.5 + 0.5;
+          if (eco * 0.6 + damp * 0.6 < cr.range(0.35, 0.8)) continue;
           const y = this.hf.heightAt(x, z);
           this.dummy.position.set(x, y - 0.05, z);
-          this.dummy.rotation.set(0, cr.range(0, Math.PI * 2), 0);
-          this.dummy.scale.setScalar(cr.range(0.5, 1.3));
+          this.dummy.rotation.set(cr.range(-0.08, 0.08), cr.range(0, Math.PI * 2), cr.range(-0.08, 0.08));
+          this.dummy.scale.setScalar(cr.range(0.5, 1.1) * (0.8 + damp * 0.5));
           this.dummy.updateMatrix();
           fern.setMatrixAt(placed, this.dummy.matrix);
-          this.color.setHSL(0.22 + cr.range(-0.05, 0.05), cr.range(0.15, 0.35), cr.range(0.25, 0.5));
+          this.color.setHSL(0.22 + cr.range(-0.04, 0.04) - damp * 0.02,
+            cr.range(0.18, 0.32) + damp * 0.08, cr.range(0.26, 0.44) - damp * 0.06);
           fern.setColorAt(placed, this.color);
           placed++;
         }
         fern.count = placed;
-        fern.instanceMatrix.needsUpdate = true;
-        if (fern.instanceColor) fern.instanceColor.needsUpdate = true;
-        fern.computeBoundingSphere();
-        this.registerChunk(fern, ck, nChunks, chunk, half);
-        this.group.add(fern);
-        this.meshes.push(fern);
+        this.finishMesh(fern, ck, nChunks, half);
 
-        // tufts
+        // ---- tufts: trail margins and open ground ----
         const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, tuftsPer);
-        let tp2 = 0;
-        for (let i = 0; i < tuftsPer * 3 && tp2 < tuftsPer; i++) {
-          const x = cr.range(Math.max(x0 + 2, -half + 8), x1 - 2);
-          const z = cr.range(Math.max(z0 + 2, -half + 8), z1 - 2);
-          if (x >= x1 - 2 || z >= z1 - 2) continue;
-          if (this.hf.trailDist(x, z) < 1.4) continue;
-          const zn2 = this.hf.zoneAt(x, z);
-          if (zn2 && Math.hypot(x - zn2.x, z - zn2.z) < zn2.r * 0.6) continue;
+        tufts.receiveShadow = true;
+        let tp = 0;
+        for (let i = 0; i < tuftsPer * 4 && tp < tuftsPer; i++) {
+          const x = cr.range(lox, x1 - 2), z = cr.range(loz, z1 - 2);
+          const td = this.hf.trailDist(x, z);
+          if (td < 1.1) continue;
+          // strong preference for the 1.1–4 m trail edge band
+          const edge = td < 4 ? 1 : 0.35;
+          if (cr.next() > edge) continue;
+          const zn = this.hf.zoneAt(x, z);
+          if (zn && Math.hypot(x - zn.x, z - zn.z) < zn.r * 0.6) continue;
           if (this.hf.inLake(x, z)) continue;
           this.dummy.position.set(x, this.hf.heightAt(x, z) - 0.03, z);
           this.dummy.rotation.set(0, cr.range(0, Math.PI * 2), 0);
-          this.dummy.scale.setScalar(cr.range(0.6, 1.4));
+          this.dummy.scale.set(cr.range(0.6, 1.4), cr.range(0.6, 1.5), cr.range(0.6, 1.4));
           this.dummy.updateMatrix();
-          tufts.setMatrixAt(tp2, this.dummy.matrix);
-          this.color.setScalar(cr.range(0.7, 1.1));
-          tufts.setColorAt(tp2, this.color);
-          tp2++;
+          tufts.setMatrixAt(tp, this.dummy.matrix);
+          const v = cr.range(0.7, 1.1);
+          this.color.setRGB(v, v * cr.range(0.95, 1.05), v * cr.range(0.85, 0.95));
+          tufts.setColorAt(tp, this.color);
+          tp++;
         }
-        tufts.count = tp2;
-        tufts.instanceMatrix.needsUpdate = true;
-        if (tufts.instanceColor) tufts.instanceColor.needsUpdate = true;
-        tufts.computeBoundingSphere();
-        this.registerChunk(tufts, ck, nChunks, chunk, half);
-        this.group.add(tufts);
-        this.meshes.push(tufts);
+        tufts.count = tp;
+        this.finishMesh(tufts, ck, nChunks, half);
 
-        // rocks
+        // ---- rocks: scree patches, sunk into soil ----
         const rocks = new THREE.InstancedMesh(rockGeo, this.mats.rock, rocksPer);
         rocks.castShadow = true; rocks.receiveShadow = true;
         let rp = 0;
-        for (let i = 0; i < rocksPer * 3 && rp < rocksPer; i++) {
+        for (let i = 0; i < rocksPer * 4 && rp < rocksPer; i++) {
           const x = cr.range(Math.max(x0 + 2, -half + 6), x1 - 2);
           const z = cr.range(Math.max(z0 + 2, -half + 6), z1 - 2);
-          if (x >= x1 - 2 || z >= z1 - 2) continue;
           if (this.hf.inLake(x, z)) continue;
+          if (cr.fbm2(x * 0.05 + 300, z * 0.05, 2) < -0.05) continue;
           const y = this.hf.heightAt(x, z);
-          this.dummy.position.set(x, y - 0.2, z);
-          this.dummy.rotation.set(cr.range(0, 3), cr.range(0, 3), cr.range(0, 3));
-          this.dummy.scale.set(cr.range(0.3, 1.6), cr.range(0.25, 1.0), cr.range(0.3, 1.6));
+          const sy = cr.range(0.25, 1.0);
+          this.dummy.position.set(x, y - sy * 0.35, z);
+          this.dummy.rotation.set(cr.range(-0.3, 0.3), cr.range(0, Math.PI * 2), cr.range(-0.3, 0.3));
+          this.dummy.scale.set(cr.range(0.3, 1.6), sy, cr.range(0.3, 1.6));
           this.dummy.updateMatrix();
           rocks.setMatrixAt(rp, this.dummy.matrix);
           rp++;
         }
         rocks.count = rp;
-        rocks.instanceMatrix.needsUpdate = true;
-        rocks.computeBoundingSphere();
-        this.registerChunk(rocks, ck, nChunks, chunk, half);
-        this.group.add(rocks);
-        this.meshes.push(rocks);
+        this.finishMesh(rocks, ck, nChunks, half);
+
+        // ---- fallen logs, aligned roughly downhill ----
+        const logs = new THREE.InstancedMesh(logGeo, this.mats.barkDead, logsPer);
+        logs.castShadow = true; logs.receiveShadow = true;
+        let lp = 0;
+        for (let i = 0; i < logsPer * 5 && lp < logsPer; i++) {
+          const x = cr.range(lox, x1 - 2), z = cr.range(loz, z1 - 2);
+          if (this.hf.trailDist(x, z) < 3) continue;
+          if (this.hf.inLake(x, z)) continue;
+          const zn = this.hf.zoneAt(x, z);
+          if (zn && Math.hypot(x - zn.x, z - zn.z) < zn.r * 0.8) continue;
+          const y = this.hf.heightAt(x, z);
+          const gx = this.hf.heightAt(x + 1, z) - this.hf.heightAt(x - 1, z);
+          const gz = this.hf.heightAt(x, z + 1) - this.hf.heightAt(x, z - 1);
+          const yaw = Math.atan2(-gz, gx) + cr.range(-0.5, 0.5);
+          const len = cr.range(2.5, 6.5), rad = cr.range(0.7, 1.3);
+          this.dummy.position.set(x, y + 0.12 * rad, z);
+          this.dummy.rotation.set(0, yaw, cr.range(-0.05, 0.05));
+          this.dummy.scale.set(len, rad, rad);
+          this.dummy.updateMatrix();
+          logs.setMatrixAt(lp, this.dummy.matrix);
+          lp++;
+        }
+        logs.count = lp;
+        this.finishMesh(logs, ck, nChunks, half);
       }
     }
   }
 
-  /**
-   * §1b distance culling at chunk granularity. A chunk is hidden when its
-   * nearest point lies beyond `dist` — with FogExp2 density 0.0155, fog at
-   * the low-tier 120m cutoff is ~96% opaque (exp2: e^-(d*0.0155)^2), and the
-   * higher tiers cull farther out (170-260m) where fog is fully opaque.
-   * Visible range is untouched — zero visual change inside the fog.
-   * Shadow safety: the moon shadow window (±60m) and flashlight far (60m)
-   * both sit well inside the smallest cutoff + chunk radius, so hidden
-   * chunks can never pop shadows in or out of the visible scene.
-   */
+  /** Chunk-granular distance culling (fog-hidden only). */
   setDrawDistance(camX: number, camZ: number, dist: number): void {
-    const chunkR = 49.5; // 70m chunk half-diagonal
-    const lim = dist + chunkR;
+    const lim = dist + 49.5;
     const lim2 = lim * lim;
     for (let i = 0; i < this.meshes.length; i++) {
       const dx = this.meshChunkX[i] - camX, dz = this.meshChunkZ[i] - camZ;
       this.meshes[i].visible = dx * dx + dz * dz < lim2;
     }
   }
+
+  dispose(): void {
+    for (const m of this.meshes) { this.group.remove(m); m.dispose(); }
+    this.meshes.length = 0;
+    for (const g of this.ownedGeos) g.dispose();
+    for (const m of this.ownedMats) m.dispose();
+    this.ownedGeos.length = 0;
+    this.ownedMats.length = 0;
+  }
 }
 
-/** minimal geometry merge (positions/normals/uvs) */
+/** minimal geometry merge (positions/normals/uvs); disposes the inputs. */
 export function mergeGeos(geos: THREE.BufferGeometry[]): THREE.BufferGeometry {
   let vTotal = 0, iTotal = 0;
   for (const g of geos) {
@@ -578,14 +606,10 @@ export function mergeGeos(geos: THREE.BufferGeometry[]): THREE.BufferGeometry {
     if (n) nrm.set(n.array as Float32Array, vOff * 3);
     if (u) uv.set(u.array as Float32Array, vOff * 2);
     const gi = g.getIndex();
-    if (gi) {
-      for (let i = 0; i < gi.count; i++) idx[iOff + i] = gi.getX(i) + vOff;
-      iOff += gi.count;
-    } else {
-      for (let i = 0; i < p.count; i++) idx[iOff + i] = i + vOff;
-      iOff += p.count;
-    }
+    if (gi) { for (let i = 0; i < gi.count; i++) idx[iOff + i] = gi.getX(i) + vOff; iOff += gi.count; }
+    else { for (let i = 0; i < p.count; i++) idx[iOff + i] = i + vOff; iOff += p.count; }
     vOff += p.count;
+    g.dispose();
   }
   const out = new THREE.BufferGeometry();
   out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
